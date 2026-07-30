@@ -1,0 +1,47 @@
+# cargo-deny config - see https://embarkstudios.github.io/cargo-deny/
+#
+# Run locally with `cargo deny check` (requires `cargo install cargo-deny`).
+
+[graph]
+# warframe-lite is a native Linux binary; that's the only target we build.
+targets = ["x86_64-unknown-linux-gnu"]
+
+[advisories]
+ignore = [
+    # Transitive via `fontdue` (font rasterization). An unmaintained-crate
+    # notice, not a vulnerability, and not something we can upgrade from here.
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained; transitive via fontdue, no vulnerability" },
+]
+
+[licenses]
+# Every license actually present in the dependency tree as of writing (see
+# `cargo deny check licenses` for the full breakdown). All permissive; nothing
+# copyleft.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Zlib",
+    "Unlicense",
+    "0BSD",
+    "MPL-2.0",
+    # webpki-roots bundles Mozilla's root certificate list under this
+    # data-oriented (not code) license.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+# "deny" would also flag our own workspace path deps (`{ path = "crates/..." }`)
+# as "wildcards"; that isn't a real risk, so this stays at the default.
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "*.md"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (native)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: step-security/dtolnay-rust-toolchain@8dd607977d06adf4ed49b190381e74c17a9dd25f # ratchet:step-security/dtolnay-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # ratchet:Swatinem/rust-cache@v2
+      # wf-overlay links libwayland-client via smithay-client-toolkit.
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev
+      - name: cargo test
+        run: cargo test --locked --workspace
+      - name: cargo clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # ratchet:taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-machete
+      - name: cargo deny check
+        run: cargo deny check
+      - name: cargo machete
+        run: cargo machete
+
+  build:
+    name: Build (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: step-security/dtolnay-rust-toolchain@8dd607977d06adf4ed49b190381e74c17a9dd25f # ratchet:step-security/dtolnay-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # ratchet:Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev
+      - name: cargo build (release)
+        run: cargo build --locked --release -p warframe-lite

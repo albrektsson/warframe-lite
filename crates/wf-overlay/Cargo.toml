@@ -1,0 +1,18 @@
+[package]
+name = "wf-overlay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wf-data.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+fontdue = "0.9"
+# default-features disabled to avoid the `xkbcommon` system dev dependency
+# (only needed for keyboard input, which a click-through overlay does not use).
+# `calloop` (pure Rust, no system lib) gives us an event loop with timers.
+smithay-client-toolkit = { version = "0.19", default-features = false, features = ["calloop"] }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
