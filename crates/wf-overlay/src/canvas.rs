@@ -1,8 +1,28 @@
 //! A tiny straight-alpha RGBA canvas with just enough drawing for the overlay
-//! panel: filled (optionally rounded) rectangles and anti-aliased text via
-//! fontdue. Kept dependency-free so the overlay pulls in no graphics stack.
+//! panel: filled (optionally rounded) rectangles, anti-aliased text via fontdue,
+//! and the bundled mastery-icon blit.
+
+use std::sync::OnceLock;
 
 use fontdue::Font;
+use image::RgbaImage;
+
+/// The Warframe `<MASTERED>` laurel-wreath icon (a game UI asset), bundled so the
+/// reward panel can mark mastered rewards. Decoded once on first use.
+fn mastery_icon() -> Option<&'static RgbaImage> {
+    static ICON: OnceLock<Option<RgbaImage>> = OnceLock::new();
+    ICON.get_or_init(|| {
+        let bytes = include_bytes!("../assets/mastered.png");
+        match image::load_from_memory(bytes) {
+            Ok(img) => Some(img.to_rgba8()),
+            Err(e) => {
+                tracing::error!("failed to decode bundled mastery icon: {e}");
+                None
+            }
+        }
+    })
+    .as_ref()
+}
 
 /// RGBA colour with straight (non-premultiplied) alpha, 0–255 per channel.
 #[derive(Debug, Clone, Copy)]
@@ -80,21 +100,23 @@ impl Canvas {
         }
     }
 
-    /// Draw a filled, anti-aliased mastery mark — a vertical diamond (the shape of
-    /// Warframe's mastery emblem) — inside the `w`×`h` box at top-left `(x, y)`.
-    /// Used to flag rewards whose prime the player has already mastered.
+    /// Draw the mastery emblem — Warframe's `<MASTERED>` **laurel wreath** icon,
+    /// bundled as a PNG — inside the `w`×`h` box at top-left `(x, y)`, tinted to
+    /// colour `c`. The source is a white shape on a transparent background, so each
+    /// source pixel's luminance × alpha becomes the paint coverage. Used to flag
+    /// rewards whose prime the player has already mastered.
     pub fn draw_mastery_mark(&mut self, x: i32, y: i32, w: u32, h: u32, c: Color) {
-        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
-        let (hw, hh) = (w as f32 / 2.0, h as f32 / 2.0);
-        let aa = hw.min(hh).max(1.0);
-        for row in 0..h as i32 {
-            for col in 0..w as i32 {
-                // Diamond metric: |dx|/hw + |dy|/hh <= 1 is inside; feather the edge.
-                let d = ((col as f32 + 0.5 - cx).abs() / hw) + ((row as f32 + 0.5 - cy).abs() / hh);
-                let coverage = ((1.0 - d) * aa + 0.5).clamp(0.0, 1.0);
-                if coverage > 0.0 {
-                    self.blend(x + col, y + row, c, coverage);
-                }
+        let Some(icon) = mastery_icon() else {
+            return; // icon failed to decode; skip the emblem rather than crash
+        };
+        // Area-filter down to the target size for a clean small emblem.
+        let scaled = image::imageops::resize(icon, w, h, image::imageops::FilterType::Triangle);
+        for (px, py, pixel) in scaled.enumerate_pixels() {
+            let [r, g, b, a] = pixel.0;
+            let luma = (r as f32 + g as f32 + b as f32) / (3.0 * 255.0);
+            let coverage = luma * (a as f32 / 255.0);
+            if coverage > 0.0 {
+                self.blend(x + px as i32, y + py as i32, c, coverage);
             }
         }
     }
@@ -234,14 +256,18 @@ mod tests {
     }
 
     #[test]
-    fn mastery_mark_fills_center_not_corner() {
-        let mut c = Canvas::new(14, 14);
-        c.draw_mastery_mark(0, 0, 14, 14, Color::rgb(130, 200, 140));
-        // Center of the diamond is solid…
-        let center = ((7 * 14 + 7) * 4) as usize;
-        assert!(c.buf[center + 3] > 200, "diamond centre should be opaque");
-        // …a corner is outside the diamond, so transparent.
-        assert_eq!(c.buf[3], 0, "corner should be untouched");
+    fn mastery_mark_draws_symmetric_wreath() {
+        let (w, h) = (20u32, 16u32);
+        let mut c = Canvas::new(w, h);
+        c.draw_mastery_mark(0, 0, w, h, Color::rgb(130, 200, 140));
+        let opaque = |x: u32, y: u32| c.buf[((y * w + x) * 4 + 3) as usize] > 0;
+        // The wreath draws a meaningful number of pixels…
+        let total = c.buf.chunks_exact(4).filter(|p| p[3] > 0).count();
+        assert!(total > 60, "wreath should cover many pixels, got {total}");
+        // …and it is left/right symmetric (branches mirror around the centre).
+        let left = (0..h).flat_map(|y| (0..w / 2).map(move |x| (x, y))).filter(|&(x, y)| opaque(x, y)).count();
+        let right = (0..h).flat_map(|y| (w / 2..w).map(move |x| (x, y))).filter(|&(x, y)| opaque(x, y)).count();
+        assert!((left as i32 - right as i32).abs() <= 6, "branches should be roughly symmetric ({left} vs {right})");
     }
 
     #[test]

@@ -160,11 +160,12 @@ const BEST_BG: Color = Color::rgba(40, 70, 45, 235);
 const PLAT: Color = Color::rgb(120, 200, 255);
 const MASTERED: Color = Color::rgb(130, 200, 140);
 
-// Mastery emblem: reserved left-column width + gap, and the drawn diamond size.
-const MARK_W: u32 = 14;
+// Mastery emblem (laurel wreath): reserved left-column width + gap, and the drawn
+// wreath size.
+const MARK_W: u32 = 20;
 const MARK_GAP: u32 = 6;
-const MARK_INNER_W: u32 = 10;
-const MARK_H: u32 = 13;
+const MARK_INNER_W: u32 = 18;
+const MARK_H: u32 = 16;
 
 /// Render the relic reward-choice result panel: each choice with its plat/ducat
 /// value, the best-plat row highlighted.

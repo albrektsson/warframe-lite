@@ -160,6 +160,12 @@ separate crates: `cargo build --release -p wf-settings -p wf-tray` →
 
 MIT — see [`LICENSE`](LICENSE).
 
+The bundled mastery icon (`crates/wf-overlay/assets/mastered.png`, the in-game
+`<MASTERED>` laurel wreath) is a *Warframe* UI asset and remains the property of
+**Digital Extremes Ltd.** It is included solely to identify mastered rewards in
+this fan companion; *Warframe* is a trademark of Digital Extremes. This project is
+unofficial and not affiliated with or endorsed by Digital Extremes.
+
 ## Design & roadmap
 
 See [`docs/PLAN.md`](docs/PLAN.md) for the feasibility analysis, architecture, and
