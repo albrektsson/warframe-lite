@@ -53,7 +53,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "fs", 
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
 directories = "5"
-toml = "0.8"
+toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
