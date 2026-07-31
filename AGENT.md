@@ -1,58 +1,10 @@
-# AGENT.md — warframe-lite: Project Vision
+# AGENT.md — warframe-lite
 
-## What this is
-
-warframe-lite is a **Linux-native, Overwolf-free** companion app for Warframe,
-targeting KDE Plasma (Wayland) with the game running under Steam Proton. It is a
-lightweight alternative to [AlecaFrame](https://alecaframe.com/) — which is an
-Overwolf app and painful to run on Linux — covering the most-used features as a
-small, robust, native binary.
-
-The guiding constraint is **native and low-risk**: everything is built on data
-sources that work cleanly on Linux without Overwolf, without reading game
-process memory, and without handling account credentials. Where AlecaFrame reads
-the game's memory for full inventory, warframe-lite deliberately stays on the
-public/observable side of that line.
-
-## Hard constraint: observe only — never touch the game process
-
-**It is STRICTLY FORBIDDEN for this project to modify, write, or send any kind of
-data to the Warframe process.** warframe-lite is *read-only and observational* by
-design, and this is a non-negotiable rule that overrides any feature request.
-
-Concretely, the app must **never**:
-
-- send input to the game — no synthetic mouse/keyboard/controller events, no
-  clicking, no automation of gameplay or menus (the overlay is even
-  input-transparent so real clicks pass straight through it);
-- write to the game's process memory, or attach to it as a debugger/tracer
-  (`ptrace`, `process_vm_writev`, `/proc/<pid>/mem`, `PTRACE_POKE*`, code
-  injection, hooking, `LD_PRELOAD` into the game, etc.);
-- send it network traffic, IPC, signals, or messages of any kind, or modify its
-  files, saves, config, or the Proton prefix;
-- alter, intercept, or spoof the game's own network traffic.
-
-The *only* interactions permitted with anything game-related are strictly
-one-directional reads that the game is unaware of: **reading `EE.log`** (a plain
-log file) and **reading the game window's pixels** via X11 `GetImage`. Even the
-optional, never-implemented "inventory via memory reading" idea in the roadmap is
-scoped as a **read** (`process_vm_readv`) — writing to the process is out of scope
-permanently. Any proposal that would send data *into* the game must be refused,
-not implemented.
-
-## The core experience
-
-- A **world-state overlay** — a `wlr-layer-shell` panel, click-through and
-  always-on-top, anchored to a corner of the game's monitor — shows live Void
-  Fissures (sorted normal → Steel Path → Storm), the Void Trader, and the
-  Cetus/Vallis/Cambion cycles, with ETAs that tick down each second.
-- An **automatic relic reward picker** — the flagship. When a Void Fissure
-  reward screen appears, the overlay automatically swaps to a ranked panel of the
-  2–4 rewards, showing each one's live warframe.market price, the **best plat
-  pick** highlighted, and a **mastery emblem** in front of rewards whose built prime the
-  player has already mastered. No keypress required.
-- Everything is driven by observing the game, never by injecting into or
-  automating it.
+For the project vision and domain vocabulary, see `CONTEXT.md`. For the
+non-negotiable "observe only, never touch the game process" rule, see
+`docs/adr/0001-observe-only-never-touch-game-process.md` — it overrides any
+feature request; any proposal that would send data *into* the game must be
+refused, not implemented.
 
 ## Architecture (crate breadth)
 
@@ -79,50 +31,25 @@ A single Cargo workspace of focused crates:
   overlay, with a menu for the app's modes.
 - **warframe-lite** (root bin `wf-lite`) — orchestration + subcommands.
 
-## How it works, conceptually
+## Implementation mechanics
 
-- Warframe's data splits into an **easy tier** and a **hard tier**. The easy tier
-  — world state, market prices, static drop data, and real-time events from
-  `EE.log` — is fully obtainable on Linux over HTTP and file reads. The hard tier
-  — full current inventory (what you own right now) — is only available by
-  reading game memory, which AlecaFrame does via Overwolf. warframe-lite covers
-  the easy tier and deliberately leaves the memory tier alone.
 - Under Steam + Proton on KDE Wayland, Warframe renders as an **Xwayland (X11)
   window**, so its pixels can be read with plain X11 `GetImage` — fast, silent,
   no portal prompt, and with none of the black-frame/DXVK problems Overwolf's
   in-game overlay hits.
-- The reward screen is a mid-mission, ~15-second, player-controlled thing (it can
-  be brought up via Tab), and Warframe flushes its log in bursts, so detection
-  does **not** treat the log as a stopwatch. A relic crack or reward-screen log
-  line opens a polling window; during it the screen is OCR-scanned every couple of
-  seconds, and the OCR itself (≥2 of the candidate slots resolving to items) is
-  what confirms the screen is up — so it is caught whenever it appears.
-- Reward cards are **centred on the screen centre with a fixed pitch**, and there
-  are 2–4 of them. Rather than assume fixed slots, a superset of candidate centres
-  (spaced at half-pitch) is scanned and the ones that resolve to catalogue items
-  are kept. Long names wrap to two lines, so each slot is OCR'd as a two-line
-  block.
-- **Mastery** comes from DE's *public* profile API (`getProfileViewingData`, no
-  auth). An item's `XPInfo` lifetime affinity crossing its rank-30 cap means it is
-  mastered (permanent, never resets on Forma); each reward *part* is mapped to the
-  built prime it belongs to before the lookup.
+- Detection does **not** treat the log as a stopwatch, because Warframe flushes
+  `EE.log` in bursts: a relic-crack or reward-screen log line opens a polling
+  window; during it the screen is OCR-scanned every couple of seconds, and the
+  OCR itself (≥2 of the candidate slots resolving to items) is what confirms the
+  screen is up — so it is caught whenever it appears.
+- Reward cards are **centred on the screen centre with a fixed pitch**. Rather
+  than assume fixed slots, a superset of candidate centres (spaced at
+  half-pitch) is scanned and the ones that resolve to catalogue items are kept.
+  Long names wrap to two lines, so each slot is OCR'd as a two-line block.
 - Network results are **cached to disk**. The item catalogue refreshes at most
-  weekly; prices carry a freshness TTL and, critically, serve the last known value
-  instantly if warframe.market is slow — so the reward panel is ready inside the
-  short selection window.
-
-## What "done" looks like
-
-A player, on KDE Wayland with Warframe under Proton, runs `wf-lite overlay` and:
-
-1. Sees the world-state panel on the game's monitor, updating live.
-2. Plays a Void Fissure. When the reward screen appears, the overlay
-   automatically shows the 2–4 rewards ranked by plat, the best pick highlighted,
-   and a mastery badge on the ones they have already mastered.
-3. Picks the reward they want — the valuable one to sell, or the one they still
-   need for mastery — and the overlay reverts to world state.
-
-No Overwolf, no memory reading, no credentials — just an observing native binary.
+  weekly; prices carry a freshness TTL and, critically, serve the last known
+  value instantly if warframe.market is slow — so the reward panel is ready
+  inside the short selection window.
 
 ## Conventions
 

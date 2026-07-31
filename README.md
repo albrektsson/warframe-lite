@@ -184,5 +184,5 @@ or endorsed by Digital Extremes.
 ## Design & roadmap
 
 See [`docs/PLAN.md`](docs/PLAN.md) for the feasibility analysis, architecture, and
-implementation status, and [`AGENT.md`](AGENT.md) for the project vision and
-contributing conventions.
+implementation status; [`CONTEXT.md`](CONTEXT.md) for the project vision and
+domain vocabulary; and [`AGENT.md`](AGENT.md) for contributing conventions.

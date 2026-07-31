@@ -83,11 +83,11 @@ warframe-lite/
 
 ## Implementation status (as of 2026-07)
 
-**Hard rule (see [`AGENT.md`](../AGENT.md)):** warframe-lite is strictly
-observe-only — it must never modify, write, or send any data to the Warframe
-process (no input injection, no memory writes, no ptrace, no IPC/network to the
-game). The only game-side interactions are one-directional reads: the `EE.log`
-file and the window's pixels.
+**Hard rule (see [ADR-0001](adr/0001-observe-only-never-touch-game-process.md)):**
+warframe-lite is strictly observe-only — it must never modify, write, or send any
+data to the Warframe process (no input injection, no memory writes, no ptrace, no
+IPC/network to the game). The only game-side interactions are one-directional
+reads: the `EE.log` file and the window's pixels.
 
 Phases 0–3 plus caching, mastery, overlay configuration, account auto-detection,
 and the tray/settings companions are **done and verified against the running
@@ -177,12 +177,19 @@ game**. Summary of what shipped:
   is read by OCR of the in-game **Void Relics** screen: opening it is
   auto-detected from `EE.log` (`ThemedProjectionManager.lua:
   PopulateInventoryGrid`), and the overlay scans the grid (parallelized per
-  card, ~1.6s/frame) as the player scrolls, skipping relics marked with the
+  card, ~3s/frame) as the player scrolls, skipping relics marked with the
   in-game "unowned" eye icon (detected by brightness-invariant template
   matching, since hovering brightens a card regardless of ownership). The owned
   set is **persisted to disk** (`~/.cache/warframe-lite/owned-relics.json`) so it
   accumulates across sessions and survives restarts. `wf-lite relics <codes…>`
   and an overlay panel (`render_relic_panel`) show the per-relic guide.
+  Scanning runs in its own task (`relic_scan_loop`), decoupled from the
+  reward-screen watcher's fixed poll interval, so it re-scans back-to-back
+  while the screen is open — the list scrolls continuously (not row-snapped),
+  so more, faster samples catch more scroll positions than fewer, slower ones;
+  a `RelicGridRegions::row_phases` knob exists for trading scan rate for
+  per-frame coverage if `wf-ocr` ever gains OCR bounding boxes to make that
+  cheap (right now, extra phases cost close to linearly, not for free).
 - **Mastery planner ✅.** `wf-relic::mastery_plan` inverts the view: for every
   unmastered prime, which owned relics (and how many of each) can still drop it,
   ranked by total relics in hand — a fissure-farming priority list. `wf-lite
@@ -190,12 +197,15 @@ game**. Summary of what shipped:
   `worldstate`) to flag which relics are actionable *right now*. Works from the
   persisted owned-relic set, so it doesn't require an active scan.
 
-**Remaining / later polish:** config-overridable reward regions; per-resolution
-calibration (currently tuned for 3440×1440); **mastery-weighted ranking** (prefer
-a slightly-cheaper *unmastered* reward, since the "best pick" is currently pure
-plat); background price pre-warm at fissure start. **Phase 4** (inventory via
-memory reading) remains optional and unstarted — and, per the hard rule above,
-strictly a *read* (`process_vm_readv`) if ever pursued.
+**Remaining / later polish** is now tracked as GitHub issues rather than a
+freeform list here:
+[config-overridable reward regions](https://github.com/albrektsson/warframe-lite/issues/6),
+[per-resolution calibration](https://github.com/albrektsson/warframe-lite/issues/7),
+[mastery-weighted ranking](https://github.com/albrektsson/warframe-lite/issues/8),
+[background price pre-warm](https://github.com/albrektsson/warframe-lite/issues/9).
+**Phase 4** (inventory via memory reading) remains optional and unstarted, and
+per the hard rule above, strictly a *read* (`process_vm_readv`) if ever pursued
+— tracked as [issue #10](https://github.com/albrektsson/warframe-lite/issues/10).
 
 ### External API notes
 
