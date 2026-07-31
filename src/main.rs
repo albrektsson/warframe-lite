@@ -1046,12 +1046,10 @@ async fn load_mastery(config: &Config, client: &reqwest::Client) -> wf_relic::Ma
 
 type RewardState = std::sync::Arc<std::sync::Mutex<Option<(std::time::Instant, Vec<wf_overlay::RewardRow>)>>>;
 type RelicState = std::sync::Arc<std::sync::Mutex<Option<(std::time::Instant, Vec<wf_overlay::RelicRow>)>>>;
-
-/// The overlay panel states the log watcher publishes into.
-struct Watchers {
-    reward: RewardState,
-    relic: RelicState,
-}
+/// Deadline the owned-relic scan should keep running until, shared between
+/// `relic_watch_loop` (which extends it from `EE.log`) and `relic_scan_loop`
+/// (which reads it every iteration to decide whether to scan or idle).
+type RelicDeadline = std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>;
 
 /// Show the live overlay as a `wlr-layer-shell` surface: world state normally,
 /// automatically swapping to the relic reward result for a few seconds when a
@@ -1176,20 +1174,42 @@ async fn run_overlay(config: Config) -> Result<()> {
                     ee_log.display()
                 );
                 let market = MarketClient::new(client.clone(), config.market_platform.clone());
+                let ocr = Arc::new(ocr);
                 let reward = reward.clone();
-                let relic = relic.clone();
+
+                // The owned-relic scan runs in its own tightly-looped task (see
+                // relic_scan_loop) so it isn't throttled by relic_watch_loop's
+                // POLL_INTERVAL or by how long a scan itself takes — the Relics
+                // list scrolls continuously, so sampling as fast as possible is
+                // what actually catches it, not waiting out a fixed interval.
+                let relic_deadline: Option<RelicDeadline> = if let Some(ridx) = relic_index.clone() {
+                    let deadline: RelicDeadline = Arc::new(Mutex::new(None));
+                    tokio::spawn(relic_scan_loop(
+                        deadline.clone(),
+                        ocr.clone(),
+                        ridx,
+                        wf_relic::RelicGridRegions::default_calibration(),
+                        market.clone(),
+                        cache.clone(),
+                        mastery.clone(),
+                        relic.clone(),
+                    ));
+                    Some(deadline)
+                } else {
+                    None
+                };
+
                 tokio::spawn(async move {
                     if let Err(e) = relic_watch_loop(
                         ee_log,
-                        Arc::new(ocr),
+                        ocr,
                         Arc::new(index),
                         market,
                         cache,
                         mastery,
-                        Watchers { reward, relic },
+                        reward,
                         wf_relic::RewardRegions::default_calibration(),
-                        relic_index,
-                        wf_relic::RelicGridRegions::default_calibration(),
+                        relic_deadline,
                     )
                     .await
                     {
@@ -1310,12 +1330,17 @@ async fn wait_for_window(timeout: Duration) -> Option<(i32, i32, u32, u32)> {
     }
 }
 
-/// Watch the EE.log and drive both screen scans:
-/// * a relic **crack** / reward-screen line opens a poll window, scanned until the
-///   4-choice screen resolves, publishing the ranked reward to `watchers.reward`;
-/// * a **Relics inventory** open (`RelicInventoryOpen`) starts an owned-relic scan
-///   that OCRs the grid every couple of seconds while the player scrolls, unioning
-///   the owned set and publishing the ranked guide to `watchers.relic`.
+/// How long a relic-inventory-open event keeps [`relic_scan_loop`] scanning
+/// (shared: `relic_watch_loop` extends the deadline, `relic_scan_loop` reads it).
+const RELIC_SCAN_WINDOW: Duration = Duration::from_secs(180);
+
+/// Watch the EE.log for a relic **crack** / reward-screen line, which opens a
+/// poll window scanned until the 4-choice screen resolves (publishing the
+/// ranked reward to `reward`). A **Relics inventory** open
+/// (`RelicInventoryOpen`) instead extends `relic_deadline` — the actual owned-
+/// relic scanning happens in the separate, tightly-looped [`relic_scan_loop`],
+/// so a slow or expensive scan never throttles reward-screen detection (and
+/// vice versa: reward-screen debounce logic never throttles the relic scan).
 #[allow(clippy::too_many_arguments)]
 async fn relic_watch_loop(
     ee_log: std::path::PathBuf,
@@ -1324,12 +1349,10 @@ async fn relic_watch_loop(
     market: MarketClient,
     cache: std::sync::Arc<wf_relic::PriceCache>,
     mastery: std::sync::Arc<wf_relic::MasterySet>,
-    watchers: Watchers,
+    reward: RewardState,
     regions: wf_relic::RewardRegions,
-    relic_index: Option<std::sync::Arc<wf_relic::RelicIndex>>,
-    relic_regions: wf_relic::RelicGridRegions,
+    relic_deadline: Option<RelicDeadline>,
 ) -> Result<()> {
-    use std::collections::HashMap;
     use std::time::Instant;
     use wf_log::Event;
 
@@ -1340,31 +1363,11 @@ async fn relic_watch_loop(
     const POLL_INTERVAL: Duration = Duration::from_secs(2);
     // Don't re-show the same 15s screen repeatedly.
     const SHOW_DEBOUNCE: Duration = Duration::from_secs(20);
-    // Owned-relic scan: end it once no new relic has been seen for this long
-    // (the player stopped scrolling / left the screen), capped at the window.
-    const RELIC_SCAN_WINDOW: Duration = Duration::from_secs(180);
-    const RELIC_SCAN_IDLE: Duration = Duration::from_secs(12);
 
     let mut tailer = wf_log::LogTailer::from_end(&ee_log);
     let mut scan_until: Option<Instant> = None;
     let mut window_open = false; // whether we've logged the current window
     let mut last_shown = Instant::now() - SHOW_DEBOUNCE;
-
-    // Owned-relic scan state. `relic_owned` is the cumulative, disk-persisted
-    // owned set — it survives restarts and Relics-screen visits, so the mastery
-    // planner (`wf-lite mastery-plan`) has data even outside a live scan. Loaded
-    // once here as the baseline; `session_seen` is scoped to the *current*
-    // continuous scan (cleared each time the screen is freshly reopened) and
-    // max-merges repeated OCR reads of the same relic to smooth transient
-    // undercounts (e.g. a dropped digit) — a relic's `relic_owned` entry is then
-    // replaced with that session's best reading, so depleted relics (used since
-    // the last scan) correctly drop rather than being stuck at an old high value.
-    let mut relic_owned: HashMap<String, u32> = wf_cache::load_blob(OWNED_RELICS_FILE)
-        .map(|s: wf_cache::Stamped<HashMap<String, u32>>| s.value)
-        .unwrap_or_default();
-    let mut session_seen: HashMap<String, u32> = HashMap::new();
-    let mut relic_until: Option<Instant> = None;
-    let mut relic_last_new = Instant::now();
 
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -1379,65 +1382,12 @@ async fn relic_watch_loop(
                         tracing::info!("relic activity — watching for the reward screen");
                     }
                 }
-                Some(Event::RelicInventoryOpen) if relic_index.is_some() => {
-                    if relic_until.is_none() {
-                        session_seen.clear();
-                        tracing::info!(
-                            "relics screen opened — scanning as you scroll ({} known from before)",
-                            relic_owned.len()
-                        );
+                Some(Event::RelicInventoryOpen) => {
+                    if let Some(d) = &relic_deadline {
+                        *d.lock().unwrap() = Some(Instant::now() + RELIC_SCAN_WINDOW);
                     }
-                    relic_until = Some(Instant::now() + RELIC_SCAN_WINDOW);
-                    relic_last_new = Instant::now();
                 }
                 _ => {}
-            }
-        }
-
-        // --- Owned-relic scan (while the Relics screen is up) --------------
-        if let (Some(deadline), Some(ridx)) = (relic_until, relic_index.as_ref()) {
-            let expired = Instant::now() >= deadline || relic_last_new.elapsed() > RELIC_SCAN_IDLE;
-            if expired {
-                relic_until = None;
-            } else {
-                let (ocr2, regions2, ridx2) = (ocr.clone(), relic_regions.clone(), ridx.clone());
-                let scanned = tokio::task::spawn_blocking(move || {
-                    wf_capture::capture_warframe(None)
-                        .map(|cap| scan_relic_grid(&cap.image, &ocr2, &regions2, &ridx2))
-                })
-                .await;
-                if let Ok(Ok(found)) = scanned {
-                    let mut changed = false;
-                    for (display, count) in found {
-                        // Smooth transient OCR undercounts within this session…
-                        let seen = session_seen.entry(display.clone()).or_insert(0);
-                        *seen = (*seen).max(count);
-                        // …then replace (not max) the persisted entry with this
-                        // session's best reading, so a depleted relic's count can
-                        // still drop from what an earlier session recorded.
-                        if relic_owned.get(&display) != Some(seen) {
-                            relic_owned.insert(display, *seen);
-                            changed = true;
-                        }
-                    }
-                    if changed {
-                        relic_last_new = Instant::now();
-                        let _ = wf_cache::save_blob(OWNED_RELICS_FILE, &relic_owned);
-                        let rows = build_relic_rows(
-                            &relic_owned, ridx, &mastery, &cache, &market, RELIC_ROWS,
-                        )
-                        .await;
-                        tracing::info!(
-                            "relic scan: {} owned; showing {}",
-                            relic_owned.len(),
-                            rows.iter()
-                                .map(|r| format!("{} ({})", r.name, r.top_reward))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        );
-                        *watchers.relic.lock().unwrap() = Some((Instant::now(), rows));
-                    }
-                }
             }
         }
 
@@ -1477,8 +1427,128 @@ async fn relic_watch_loop(
         if let Some(best) = wf_relic::best_by_plat(&evals) {
             tracing::info!("reward screen captured — best plat pick = {}", rows[best].name);
         }
-        *watchers.reward.lock().unwrap() = Some((Instant::now(), rows));
+        *reward.lock().unwrap() = Some((Instant::now(), rows));
         last_shown = Instant::now();
+    }
+}
+
+/// Scan the owned-relic grid on its own tight cadence, independent of
+/// `relic_watch_loop`'s fixed `POLL_INTERVAL`.
+///
+/// The Relics list scrolls **continuously** (not snapped to row boundaries), so
+/// any single frame's fixed grid positions only line up with the real card
+/// text some of the time (see [`wf_relic::RelicGridRegions::row_phases`] for the
+/// per-frame half of the fix). The other half is here: sampling as fast as the
+/// hardware allows — rather than waiting out a fixed poll interval on top of
+/// however long a scan itself takes — is what actually catches more of the
+/// list quickly, since each additional sample is another chance to catch cards
+/// at a favorable scroll offset.
+#[allow(clippy::too_many_arguments)]
+async fn relic_scan_loop(
+    relic_deadline: RelicDeadline,
+    ocr: std::sync::Arc<wf_ocr::Ocr>,
+    relic_index: std::sync::Arc<wf_relic::RelicIndex>,
+    relic_regions: wf_relic::RelicGridRegions,
+    market: MarketClient,
+    cache: std::sync::Arc<wf_relic::PriceCache>,
+    mastery: std::sync::Arc<wf_relic::MasterySet>,
+    relic: RelicState,
+) {
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    // End a scan once no new relic has been seen for this long (the player
+    // stopped scrolling / left the screen), capped at RELIC_SCAN_WINDOW.
+    const RELIC_SCAN_IDLE: Duration = Duration::from_secs(12);
+    // Between-scan gap while actively scanning — a scan itself already takes
+    // well over this, so it mainly just yields rather than limiting throughput.
+    const SCAN_COOLDOWN: Duration = Duration::from_millis(100);
+    // How often to check for a new deadline while idle (no need to poll fast
+    // when there's nothing to do).
+    const IDLE_POLL: Duration = Duration::from_millis(400);
+
+    // `relic_owned` is the cumulative, disk-persisted owned set — it survives
+    // restarts and Relics-screen visits, so the mastery planner (`wf-lite
+    // mastery-plan`) has data even outside a live scan. `session_seen` is
+    // scoped to the *current* continuous scan (cleared each fresh open) and
+    // max-merges repeated OCR reads of the same relic to smooth transient
+    // undercounts (e.g. a dropped digit); `relic_owned` is then *replaced* (not
+    // maxed) with that session's best reading, so a depleted relic's count can
+    // still drop from what an earlier session recorded.
+    let mut relic_owned: HashMap<String, u32> = wf_cache::load_blob(OWNED_RELICS_FILE)
+        .map(|s: wf_cache::Stamped<HashMap<String, u32>>| s.value)
+        .unwrap_or_default();
+    let mut session_seen: HashMap<String, u32> = HashMap::new();
+    let mut was_active = false;
+    // Bogus initial value (not a real deadline the watcher could ever set) so the
+    // very first observed deadline always registers as a change below.
+    let mut last_seen_deadline: Option<Instant> = Some(Instant::now() - RELIC_SCAN_IDLE * 2);
+    let mut last_new = Instant::now() - RELIC_SCAN_IDLE * 2;
+
+    loop {
+        let deadline = *relic_deadline.lock().unwrap();
+        // relic_watch_loop just (re)armed the window from a fresh EE.log event —
+        // treat that as activity so the idle check below doesn't see a `last_new`
+        // that's stale from long before the Relics screen was ever opened (this
+        // task runs for the overlay's whole lifetime, so without this, "idle"
+        // would already be true the instant a deadline first appears).
+        if deadline != last_seen_deadline {
+            last_seen_deadline = deadline;
+            if deadline.is_some() {
+                last_new = Instant::now();
+            }
+        }
+        let active = deadline.is_some_and(|t| Instant::now() < t) && last_new.elapsed() <= RELIC_SCAN_IDLE;
+
+        if !active {
+            was_active = false;
+            tokio::time::sleep(IDLE_POLL).await;
+            continue;
+        }
+        if !was_active {
+            was_active = true;
+            session_seen.clear();
+            tracing::info!(
+                "relics screen opened — scanning as you scroll ({} known from before)",
+                relic_owned.len()
+            );
+        }
+
+        let (ocr2, regions2, ridx2) = (ocr.clone(), relic_regions.clone(), relic_index.clone());
+        let scanned = tokio::task::spawn_blocking(move || {
+            wf_capture::capture_warframe(None)
+                .map(|cap| scan_relic_grid(&cap.image, &ocr2, &regions2, &ridx2))
+        })
+        .await;
+        if let Ok(Ok(found)) = scanned {
+            let mut changed = false;
+            for (display, count) in found {
+                let seen = session_seen.entry(display.clone()).or_insert(0);
+                *seen = (*seen).max(count);
+                if relic_owned.get(&display) != Some(seen) {
+                    relic_owned.insert(display, *seen);
+                    changed = true;
+                }
+            }
+            if changed {
+                last_new = Instant::now();
+                let _ = wf_cache::save_blob(OWNED_RELICS_FILE, &relic_owned);
+                let rows = build_relic_rows(
+                    &relic_owned, &relic_index, &mastery, &cache, &market, RELIC_ROWS,
+                )
+                .await;
+                tracing::info!(
+                    "relic scan: {} owned; showing {}",
+                    relic_owned.len(),
+                    rows.iter()
+                        .map(|r| format!("{} ({})", r.name, r.top_reward))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                *relic.lock().unwrap() = Some((Instant::now(), rows));
+            }
+        }
+        tokio::time::sleep(SCAN_COOLDOWN).await;
     }
 }
 

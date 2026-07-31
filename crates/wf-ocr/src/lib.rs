@@ -100,8 +100,20 @@ impl Ocr {
     }
 
     /// Recognise text in `img`, applying `pre` preprocessing and `mode` layout.
+    ///
+    /// Skips the tesseract call entirely (returning an empty string) when the
+    /// preprocessed crop has essentially no text pixels: it's a wasted
+    /// subprocess spawn, and some tesseract builds are known to crash with
+    /// SIGFPE in `--psm 7` (single-line) row-cleanup on a near-blank image —
+    /// this is a real, reproducible crash (`Textord::CleanupSingleRowResult`)
+    /// hit while scanning the Void Relics grid, where most candidate crops on
+    /// any given frame are legitimately blank (empty grid cells, or slots that
+    /// land on artwork rather than text while the list scrolls).
     pub fn recognize(&self, img: &RgbaImage, pre: Preprocess, mode: PageMode) -> Result<String> {
         let processed = preprocess(img, pre);
+        if text_fraction(&processed) < MIN_TEXT_FRACTION {
+            return Ok(String::new());
+        }
         let path = temp_png_path();
         processed
             .save(&path)
@@ -129,6 +141,19 @@ impl Ocr {
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
+}
+
+/// Below this fraction of "text" (dark, post-binarisation) pixels, a crop is
+/// treated as blank and never handed to tesseract. Calibrated well below any
+/// real (even short, e.g. a two-letter relic code) text crop's coverage, so
+/// only genuinely empty/background crops are skipped.
+const MIN_TEXT_FRACTION: f32 = 0.001;
+
+/// Fraction of pixels classified as "text" (dark) in a preprocessed image.
+fn text_fraction(img: &GrayImage) -> f32 {
+    let total = (img.width() as u64 * img.height() as u64).max(1);
+    let dark = img.pixels().filter(|p| p.0[0] == 0).count() as u64;
+    dark as f32 / total as f32
 }
 
 /// Binarise `img` for OCR: upscale, convert to luminance, and threshold so the
@@ -195,5 +220,28 @@ mod tests {
     fn psm_mapping() {
         assert_eq!(PageMode::Line.psm(), "7");
         assert_eq!(PageMode::Block.psm(), "6");
+    }
+
+    #[test]
+    fn text_fraction_distinguishes_blank_from_text() {
+        let blank = GrayImage::from_pixel(20, 20, image::Luma([255]));
+        assert!(text_fraction(&blank) < MIN_TEXT_FRACTION);
+
+        let mut some_text = GrayImage::from_pixel(20, 20, image::Luma([255]));
+        for x in 5..15 {
+            some_text.put_pixel(x, 10, image::Luma([0]));
+        }
+        assert!(text_fraction(&some_text) >= MIN_TEXT_FRACTION);
+    }
+
+    #[test]
+    fn recognize_skips_tesseract_on_blank_crop() {
+        // A blank crop must resolve to an empty string without ever invoking a
+        // `tesseract` binary — use a path that doesn't exist, so any attempt to
+        // actually run it would fail loudly rather than silently succeed.
+        let ocr = Ocr::with_bin("/nonexistent/tesseract", "eng");
+        let blank = RgbaImage::from_pixel(20, 20, image::Rgba([10, 10, 10, 255]));
+        let result = ocr.recognize(&blank, Preprocess::default(), PageMode::Line);
+        assert_eq!(result.unwrap(), "");
     }
 }

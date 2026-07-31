@@ -117,6 +117,23 @@ pub struct RelicGridRegions {
     pub eye_dy: i32,
     pub eye_w: u32,
     pub eye_h: u32,
+    /// How many vertical phases to sample per row, spaced evenly across one
+    /// `row_pitch`. The Relics list scrolls **continuously** (not snapped to row
+    /// boundaries), so at any instant the real card positions sit at an
+    /// arbitrary offset from the calibrated (scroll-at-top) row centres — a
+    /// single phase only lines up when the scroll offset happens to be a
+    /// multiple of `row_pitch`. Sampling more phases catches more scroll
+    /// offsets per frame, but each phase reruns the *whole* grid's OCR, and cost
+    /// scales close to linearly with `row_phases` — measured ~3× slower per scan
+    /// at `row_phases: 3` against real captures, even with `wf_ocr::Ocr` skipping
+    /// tesseract on textless crops (the relic orb art is bright/gold, so it
+    /// passes the same light-text threshold as real text and isn't reliably
+    /// filtered as "blank"). So the shipped default favors a higher scan **rate**
+    /// (see `relic_scan_loop` in `src/main.rs`, which re-scans back-to-back
+    /// while the Relics screen is open) over per-frame coverage: more, cheaper
+    /// attempts at catching the list at a good moment beats fewer, thorough-but-
+    /// slow ones. `1` = no interleaving.
+    pub row_phases: u32,
 }
 
 impl RelicGridRegions {
@@ -133,8 +150,8 @@ impl RelicGridRegions {
             name_cy0: 485,
             row_pitch: 272,
             name_w: 250,
-            // Generous height: the single-line name is ~30px, so a tall box
-            // tolerates small per-row vertical drift without clipping.
+            // The single-line name is ~30px; this absorbs small drift without
+            // the cost of a much taller crop (see `row_phases` on cost).
             name_h: 68,
             count_dx: -52,
             count_dy: -196,
@@ -144,13 +161,15 @@ impl RelicGridRegions {
             eye_dy: -65,
             eye_w: 100,
             eye_h: 62,
+            row_phases: 1,
         }
     }
 
-    /// Name + count rectangles for every visible card, scaled to an actual
-    /// `width`×`height` capture, in row-major order. Rectangles that fall outside
-    /// the frame are clamped; slots that resolve to nothing are dropped by the
-    /// caller.
+    /// Name + count + eye rectangles for every visible card at every sampled
+    /// vertical phase (see [`Self::row_phases`]), scaled to an actual
+    /// `width`×`height` capture. Rectangles that fall outside the frame are
+    /// clamped; slots that resolve to nothing (including phases that land on
+    /// empty space between real cards) are dropped by the caller.
     pub fn slots(&self, width: u32, height: u32) -> Vec<RelicSlot> {
         let sx = width as f32 / self.ref_width as f32;
         let sy = height as f32 / self.ref_height as f32;
@@ -160,25 +179,30 @@ impl RelicGridRegions {
             w: w.round() as u32,
             h: h.round() as u32,
         };
-        let mut out = Vec::with_capacity((self.cols * self.rows) as usize);
-        for row in 0..self.rows {
-            for col in 0..self.cols {
-                let cx = (self.col0_cx + col * self.col_pitch) as f32 * sx;
-                let ncy = (self.name_cy0 + row * self.row_pitch) as f32 * sy;
-                let name = rect_centered(cx, ncy, self.name_w as f32 * sx, self.name_h as f32 * sy);
-                let count = rect_centered(
-                    cx + self.count_dx as f32 * sx,
-                    ncy + self.count_dy as f32 * sy,
-                    self.count_w as f32 * sx,
-                    self.count_h as f32 * sy,
-                );
-                let eye = rect_centered(
-                    cx + self.eye_dx as f32 * sx,
-                    ncy + self.eye_dy as f32 * sy,
-                    self.eye_w as f32 * sx,
-                    self.eye_h as f32 * sy,
-                );
-                out.push(RelicSlot { name, count, eye });
+        let phases = self.row_phases.max(1);
+        let mut out = Vec::with_capacity((self.cols * self.rows * phases) as usize);
+        for phase in 0..phases {
+            let phase_off = self.row_pitch as f32 * phase as f32 / phases as f32;
+            for row in 0..self.rows {
+                for col in 0..self.cols {
+                    let cx = (self.col0_cx + col * self.col_pitch) as f32 * sx;
+                    let ncy = (self.name_cy0 as f32 + phase_off + (row * self.row_pitch) as f32) * sy;
+                    let name =
+                        rect_centered(cx, ncy, self.name_w as f32 * sx, self.name_h as f32 * sy);
+                    let count = rect_centered(
+                        cx + self.count_dx as f32 * sx,
+                        ncy + self.count_dy as f32 * sy,
+                        self.count_w as f32 * sx,
+                        self.count_h as f32 * sy,
+                    );
+                    let eye = rect_centered(
+                        cx + self.eye_dx as f32 * sx,
+                        ncy + self.eye_dy as f32 * sy,
+                        self.eye_w as f32 * sx,
+                        self.eye_h as f32 * sy,
+                    );
+                    out.push(RelicSlot { name, count, eye });
+                }
             }
         }
         out
@@ -193,8 +217,9 @@ mod tests {
     fn relic_grid_slots_cover_the_grid() {
         let g = RelicGridRegions::default_calibration();
         let slots = g.slots(3440, 1440);
-        assert_eq!(slots.len(), 32); // 8 × 4
-        // First card's name centred on (col0_cx, name_cy0).
+        assert_eq!(slots.len(), (g.cols * g.rows * g.row_phases.max(1)) as usize);
+        // Phase 0 (the first cols*rows slots) matches the canonical grid: first
+        // card's name centred on (col0_cx, name_cy0).
         let g0 = RelicGridRegions::default_calibration();
         let n0 = slots[0].name;
         assert_eq!(n0.x + n0.w / 2, g0.col0_cx);
@@ -204,6 +229,28 @@ mod tests {
         assert!((c0.x + c0.w / 2) < 238 && (c0.y + c0.h / 2) < 479);
         // Second column is one pitch right.
         assert_eq!(slots[1].name.x + slots[1].name.w / 2, 238 + 283);
+    }
+
+    #[test]
+    fn row_phases_are_evenly_spaced_within_one_row_pitch() {
+        // Test the interleaving math directly (independent of the shipped
+        // default, which favors scan speed over per-frame coverage — see
+        // `row_phases` doc comment).
+        let g = RelicGridRegions { row_phases: 3, ..RelicGridRegions::default_calibration() };
+        let slots = g.slots(3440, 1440);
+        let per_phase = (g.cols * g.rows) as usize;
+        assert_eq!(slots.len(), per_phase * 3);
+        // Phase 1's row-0 name sits row_pitch/3 below phase 0's — an
+        // intermediate scroll offset that phase 0 alone wouldn't catch.
+        let phase0_row0 = slots[0].name.y;
+        let phase1_row0 = slots[per_phase].name.y;
+        let expected = g.row_pitch / g.row_phases;
+        assert!(
+            (phase1_row0 as i32 - phase0_row0 as i32 - expected as i32).abs() <= 1,
+            "phase1 y={phase1_row0}, phase0 y={phase0_row0}, expected offset={expected}"
+        );
+        // Columns are unaffected by the vertical phase.
+        assert_eq!(slots[per_phase].name.x, slots[0].name.x);
     }
 
     #[test]
