@@ -1,0 +1,19 @@
+[package]
+name = "wf-tray"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "wf-tray"
+path = "src/main.rs"
+
+[dependencies]
+wf-capture.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+# StatusNotifierItem tray via DBus (KDE Plasma). ksni 0.3 is pure-Rust (zbus),
+# so it adds no system dbus/link dependency.
+ksni = "0.3"

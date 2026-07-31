@@ -160,6 +160,12 @@ const BEST_BG: Color = Color::rgba(40, 70, 45, 235);
 const PLAT: Color = Color::rgb(120, 200, 255);
 const MASTERED: Color = Color::rgb(130, 200, 140);
 
+// Mastery emblem: reserved left-column width + gap, and the drawn diamond size.
+const MARK_W: u32 = 14;
+const MARK_GAP: u32 = 6;
+const MARK_INNER_W: u32 = 10;
+const MARK_H: u32 = 13;
+
 /// Render the relic reward-choice result panel: each choice with its plat/ducat
 /// value, the best-plat row highlighted.
 pub fn render_reward_panel(rows: &[RewardRow], font: &Font) -> Canvas {
@@ -173,11 +179,11 @@ pub fn render_reward_panel(rows: &[RewardRow], font: &Font) -> Canvas {
     y += LINE_H;
 
     let charw = font.metrics('0', FONT_PX).advance_width;
-    // Right-hand columns: a mastered badge, then plat.
-    let badge = "MR"; // shown on mastered rows
-    let badge_x = WIDTH as f32 - PAD as f32 - badge.len() as f32 * charw;
-    let plat_x = badge_x - 6.0 * charw; // "NNNp"
-    let name_cols = ((plat_x - PAD as f32) / charw).floor() as usize;
+    let plat_x = WIDTH as f32 - PAD as f32 - 6.0 * charw; // "NNNNp"
+    // Reserve a left column for the mastery emblem so names stay aligned whether or
+    // not a row is mastered.
+    let name_x = PAD as f32 + MARK_W as f32 + MARK_GAP as f32;
+    let name_cols = ((plat_x - name_x) / charw).floor() as usize;
 
     for r in rows {
         // Highlight the best-plat row.
@@ -191,18 +197,19 @@ pub fn render_reward_panel(rows: &[RewardRow], font: &Font) -> Canvas {
                 BEST_BG,
             );
         }
+        // Mastery emblem in front of the name for items already mastered.
+        if r.mastered {
+            let mark_x = PAD + (MARK_W as i32 - MARK_INNER_W as i32) / 2;
+            canvas.draw_mastery_mark(mark_x, y - MARK_H as i32 + 1, MARK_INNER_W, MARK_H, MASTERED);
+        }
         let star = if r.best_plat { "* " } else { "  " };
         let label = format!("{star}{}", r.name);
         // Mastered items are dimmed (you already have them for mastery).
         let name_color = if r.mastered { DIM } else { TEXT };
-        canvas.draw_text(font, &truncate(&label, name_cols), PAD as f32, y as f32, FONT_PX, name_color);
+        canvas.draw_text(font, &truncate(&label, name_cols), name_x, y as f32, FONT_PX, name_color);
 
         let plat = r.plat.map(|p| format!("{p}p")).unwrap_or_else(|| "—".into());
         canvas.draw_text(font, &plat, plat_x, y as f32, FONT_PX, PLAT);
-        // "MR" badge marks items already mastered.
-        if r.mastered {
-            canvas.draw_text(font, badge, badge_x, y as f32, FONT_PX, MASTERED);
-        }
         y += LINE_H;
     }
     canvas

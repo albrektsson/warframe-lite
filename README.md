@@ -1,135 +1,167 @@
 # warframe-lite
 
-A standalone, **Linux-native** light variant of [AlecaFrame](https://alecaframe.com/) —
-a Warframe companion that runs without Overwolf. Built for KDE Plasma (Wayland) +
-Steam Proton, in Rust.
+A standalone, **Linux-native** companion for [Warframe](https://www.warframe.com/) —
+a light alternative to [AlecaFrame](https://alecaframe.com/) that runs **without
+Overwolf**. Built for KDE Plasma (Wayland) with the game under Steam Proton, in Rust.
 
-See [`docs/PLAN.md`](docs/PLAN.md) for the full feasibility analysis and roadmap.
+It shows a click-through overlay on top of the game with:
 
-## Status
+- **Live world state** — Void Fissures (sorted normal → Steel Path → Storm), the
+  Void Trader, and the Cetus / Vallis / Cambion day-night cycles, with ETAs that
+  tick down each second.
+- **An automatic relic reward picker** — when a Void Fissure reward screen
+  appears, the overlay swaps to the 2–4 rewards ranked by live warframe.market
+  plat price, with the best pick highlighted and a mastery emblem in front of
+  primes you have already **mastered**. No keypress needed.
 
-**Phase 0 — data plumbing: done.** Config load, Steam-Proton `EE.log`
-auto-detection, live world state (fissures / Void Trader / cycles), and
-warframe.market pricing all verified live.
+It only *observes* the game — no Overwolf, no memory reading, no account
+credentials.
 
-**Phase 1 — timers/world-state overlay: done.** A pure-Rust `wlr-layer-shell`
-overlay (top layer, click-through, anchored top-right) shows live fissures
-(sorted normal → Steel Path → Storm), Baro, and Cetus/Vallis/Cambion cycles,
-re-rendering every second so ETAs tick. Verified on-screen on KDE Plasma (KWin).
+## Install & run
 
-**Phase 2 — relic reward picker: done.** OCR (`wf-ocr`, tesseract CLI) + picker
-brain (`wf-relic`: fuzzy match to the 3.8k-item warframe.market catalogue +
-plat/ducat ranking). Handles the **variable, centred reward layout** (2–4 cards
-depending on how many squadmates cracked) by scanning a superset of candidate
-slot centres and keeping whichever OCR to items, and reads **two-line wrapped
-names**. Validated on real 3440×1440 screens — a 4-reward screen and a 3-reward
-screen with a wrapped name (*Voruna Prime Systems Blueprint*) both fully resolve.
+warframe-lite is a single self-contained binary — no runtime other than glibc, a
+`dlopen`'d `libwayland-client.so.0` (present on every Wayland desktop), and the
+`tesseract` CLI for the relic OCR feature.
 
-**Mastery tracking (`wf-relic::mastery`): done.** Using DE's **public** profile
-API (`getProfileViewingData.php`, no auth), warframe-lite marks which rewards you
-have already **mastered**. It reads `LoadOutInventory.XPInfo` and treats an item
-as mastered once its lifetime affinity passes the rank-30 cap (450k weapons /
-900k frames — verified against a real profile), maps each reward *part* to its
-built prime, and shows a green **MR** badge (and dims the name) on mastered
-items. Set your account id once (`wf-lite set-account <id>` — find it at
-`warframe.com/api/user-data`); the mastered set is cached for a day. The ducat
-column was dropped (it's clearly shown in-game during selection).
+**1. Get the binary.** Download `wf-lite` from the
+[latest release](https://github.com/albrektsson/warframe-lite/releases/latest)
+and put it on your `PATH`:
 
-**Caching (`wf-cache`): done.** The item catalogue is cached to
-`~/.cache/warframe-lite/items.json` (7-day TTL, stale-served offline) — warm
-startup is ~19× faster (0.58s → 0.03s). Prices are cached per item with a
-freshness TTL; during a relic scan all four are fetched **concurrently**, fresh
-cache is used instantly, and **if warframe.market is slow/unreachable the last
-known price is served immediately** — so the panel is ready inside the
-few-second selection window.
+```
+install -Dm755 wf-lite ~/.local/bin/wf-lite
+```
 
-**Phase 3 — automatic detection + overlay integration: done.** `wf-lite overlay`
-now shows world state normally and **automatically swaps to the ranked reward
-result when the fissure reward screen is on screen** — no keypress needed.
+Release binaries are built against **glibc 2.35** (Ubuntu 22.04), so they run on
+any current distro (Fedora 39+, Arch, Debian 12, Ubuntu 22.04+). On an older
+glibc, build from source (see [Build](#build)).
 
-Because the reward screen is a mid-mission, ~15-second thing the player controls
-(it can be brought up via Tab/progress) and Warframe flushes its log in bursts,
-we don't treat the log as a stopwatch. Instead, a relic **crack**
-(`DVRCAftermath`) or a **reward-screen** line (`ProjectionRewardChoice: Got
-rewards`) opens a ~150s **polling window**, during which the screen is OCR-scanned
-every 2s. The OCR guard (≥2 of 4 names resolve) is what confirms the screen is up,
-so it's caught whenever it appears (auto, Tab-shown, or flush-delayed). The result
-shows for ~20s, de-bounced so one screen isn't re-shown. **Confirmed working in a
-live fissure** (the ranked panel rendered with the correct best pick). The overlay
-is placed on the **monitor Warframe is on** (matched by the game window's centre
-against each output's logical geometry).
+**2. Install tesseract** (only needed for the relic reward picker):
 
-**Two hardest Linux unknowns de-risked (verified against the running game):**
+| Distro | Command |
+|---|---|
+| Fedora | `sudo dnf install tesseract tesseract-langpack-eng` |
+| Arch | `sudo pacman -S tesseract tesseract-data-eng` |
+| Debian / Ubuntu | `sudo apt install tesseract-ocr` |
+| Bazzite / atomic | `brew install tesseract` |
 
-- **EE.log parsing** (`wf-log`): line parser hits **98.1%** coverage on real
-  logs (remainder are multi-line continuations); rotation/append-aware tailer.
-  Confirmed that Warframe **buffers log output and flushes in bursts**, so relic
-  detection must offer a **manual hotkey trigger**, not rely on log timing.
-- **X11 capture** (`wf-capture`): pure-Rust `x11rb` locates the Warframe
-  Xwayland window and reads a full 3440×1440 frame via `GetImage` — real,
-  legible content, **no black-frame/DXVK issue**, no portal prompt.
+Any reachable `tesseract` works; override the path with the `WF_TESSERACT` env var.
+
+**3. Run it — the tray is the easy way.** Launch **`wf-tray`** (from a menu
+shortcut or terminal). It sits in the KDE system tray, waits for Warframe to
+start, and **auto-starts the overlay when the game window appears** (and stops it
+when the game closes). The tray menu shows/hides the overlay, opens **Settings**,
+detects your account id, and quits. Install the desktop shortcut so it appears in
+your launcher:
+
+```
+install -Dm755 wf-tray ~/.local/bin/wf-tray
+install -Dm644 packaging/warframe-lite.desktop ~/.local/share/applications/warframe-lite.desktop
+```
+
+Prefer no tray? Start the overlay directly instead — either in a terminal
+(`wf-lite overlay`) or from Warframe's **Steam launch options**:
+
+```
+wf-lite overlay & %command%
+```
+
+`wf-lite overlay` polls up to 30s for the game window, then anchors the panel to
+its top-right corner (correct in fullscreen *and* borderless-windowed).
+
+**4. (Optional) Enable mastery badges.** Detect your account id from the game log
+(scraped and verified against the public profile, so it can't pick a squadmate):
+
+```
+wf-lite detect-account
+```
+
+The id only appears in the log after some activity (a relic crack in a squad, a
+Duviri race); if detection can't find it, set it manually — find it at
+`warframe.com/api/user-data`:
+
+```
+wf-lite set-account <id>
+```
+
+### Fedora (COPR / RPM)
+
+A Fedora `.spec` builds from source with the standard Rust macros and pulls in
+`tesseract` as a dependency — see
+[`packaging/warframe-lite.spec`](packaging/warframe-lite.spec). It can also back a
+[COPR](https://copr.fedorainfracloud.org/) repo for `dnf install warframe-lite`.
+
+## Commands
 
 ```
 wf-lite                    # world-state + EE.log detection + price lookup
 wf-lite <market_slug>      # price summary, e.g. `wf-lite mirage_prime_set`
-wf-lite logstats           # parse whole EE.log history, report coverage/events
-wf-lite logwatch           # follow EE.log live, print recognized events
+wf-lite tray               # tray companion: waits for the game, runs the overlay
+wf-lite overlay            # show the live overlay (world state + relic picker)
+wf-lite settings           # open the graphical settings window (needs wf-settings)
+wf-lite toggle             # show/hide a running overlay (also: show / hide)
 wf-lite capture [out.png]  # capture the Warframe window to a PNG
-wf-lite overlay-png [p]    # render the world-state panel to a PNG (offscreen)
-wf-lite overlay            # show the live wlr-layer-shell overlay
-wf-lite ocr [x y w h]      # OCR the Warframe window (or a region) — pipeline test
-wf-lite relic [names…]     # evaluate reward names → matched item, plat, ducats
-wf-lite relic-scan         # capture the reward screen, OCR 4 names, rank them
+wf-lite relic [names…]     # evaluate reward names → matched item + plat
+wf-lite relic-scan         # capture the reward screen, OCR the names, rank them
+wf-lite detect-account     # auto-detect your account id from EE.log (verified)
 wf-lite set-account <id>   # save your account id for mastery lookup
 wf-lite mastery [id]       # report your mastered-item count
+wf-lite logstats           # parse whole EE.log history, report coverage/events
+wf-lite logwatch           # follow EE.log live, print recognized events
 ```
 
-> OCR shells out to the `tesseract` CLI (no linking). On Bazzite it was installed
-> with `brew install tesseract`; any reachable `tesseract` works (override with
-> the `WF_TESSERACT` env var).
-
-> Overlay uses `smithay-client-toolkit` with **default features off + only
-> `calloop`**, deliberately avoiding the `xkbcommon` system dev dependency. The
-> only runtime system lib is `libwayland-client` (present on any Wayland desktop).
+## Configuration
 
 Config lives at `~/.config/warframe-lite/config.toml` (created on demand); the
-`EE.log` path is auto-detected but can be overridden there.
+`EE.log` path is auto-detected from the Steam Proton prefix but can be overridden
+there. Network results (item catalogue, prices, mastered set) are cached under
+`~/.cache/warframe-lite/`.
 
-## Roadmap
+### Overlay placement
 
-- **Phase 0** — data plumbing ✅
-- **Phase 1** — timers/world-state overlay ✅
-- **Phase 2** — relic reward picker ✅ (calibrated for 3440×1440)
-- **Phase 3** — auto-detect at fissure crack + overlay integration ✅
-- **Caching** — item-catalogue + stale-serving price cache ✅
-- **Later polish** — config-overridable reward regions, per-output placement,
-  optional global hotkey, background price pre-warm at fissure start
-- **Phase 4** *(optional)* — inventory via `process_vm_readv` memory reading
+Warframe uses every screen corner for HUD and menu elements, so the overlay's
+position and visibility are configurable under `[overlay]`:
 
-## Architecture
+```toml
+[overlay]
+anchor = "top-right"   # top-left | top-right | bottom-left | bottom-right
+                       # | top | bottom | left | right | center
+margin_x = 24          # horizontal inset from the anchored edge(s), px
+margin_y = 24          # vertical inset
+world_state = true     # false = reward-only: invisible until a relic reward screen
+opacity = 1.0          # 1.0 = as-drawn, lower = more transparent (e.g. 0.7)
+```
 
-Cargo workspace:
+**Hide it on a hotkey.** The overlay is click-through and can't grab a global
+key itself, so bind a **KDE custom shortcut** (System Settings → Shortcuts →
+Add Custom → Command) to `wf-lite toggle` (or `wf-lite hide` / `wf-lite show`).
+The running overlay listens on a control socket and shows/hides instantly.
 
-- `crates/wf-config` — TOML config + Steam-Proton `EE.log` auto-detection
-- `crates/wf-data` — world-state (warframestat.us) and market (warframe.market **v2**) clients
-- `crates/wf-log` — EE.log line parser + rotation-aware tailer + event classifier
-- `crates/wf-capture` — pure-Rust X11 capture of the Warframe Xwayland window
-- `crates/wf-overlay` — dependency-light canvas/renderer + `wlr-layer-shell` display
-- `crates/wf-ocr` — Tesseract-CLI OCR with Warframe-tuned preprocessing
-- `crates/wf-relic` — item catalogue index, fuzzy OCR-name matching, plat/ducat ranking
-- `crates/wf-cache` — disk-backed caches (`~/.cache/warframe-lite/`)
-- `src/main.rs` — `wf-lite` binary (subcommands above)
+### Settings window
 
-### External API notes
-
-- **warframe.market:** use the **v2** API (`/v2/orders/item/{slug}`). The legacy
-  v1 endpoint returns **403**.
-- **warframestat.us:** fissure/cycle objects carry only an `expiry` timestamp
-  (no pre-formatted `eta`/`timeLeft`); remaining time is computed locally.
+`wf-lite settings` opens a small graphical window (`wf-settings`) to edit
+placement, opacity, and the world-state toggle, detect your account id, and help
+bind the KDE hotkey — all writing the same `config.toml`. It's a **separate
+binary** so the overlay stays dependency-light; download `wf-settings` from the
+release alongside `wf-lite`, or build it with `cargo build --release -p
+wf-settings`. Restart `wf-lite overlay` to apply placement changes.
 
 ## Build
 
 ```
-cargo build
+cargo build --release
 cargo test
 ```
+
+The overlay binary is at `target/release/wf-lite`. The optional companions are
+separate crates: `cargo build --release -p wf-settings -p wf-tray` →
+`target/release/{wf-settings,wf-tray}`.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
+
+## Design & roadmap
+
+See [`docs/PLAN.md`](docs/PLAN.md) for the feasibility analysis, architecture, and
+implementation status, and [`AGENT.md`](AGENT.md) for the project vision and
+contributing conventions.

@@ -56,11 +56,15 @@ async fn main() -> Result<()> {
         Some("capture") => return capture_window(std::env::args().nth(2)),
         Some("overlay-png") => return overlay_png(&config, std::env::args().nth(2)).await,
         Some("overlay") => return run_overlay(config).await,
+        Some(cmd @ ("toggle" | "show" | "hide")) => return overlay_control(cmd),
         Some("ocr") => return ocr_test(),
         Some("ocr-file") => return ocr_file(),
         Some("relic-file") => return relic_file(&config).await,
         Some("mastery") => return mastery_cmd(&config).await,
         Some("set-account") => return set_account_cmd(&config_path),
+        Some("detect-account") => return detect_account_cmd(&config, &config_path).await,
+        Some("settings") => return launch_companion("wf-settings"),
+        Some("tray") => return launch_companion("wf-tray"),
         Some("relic") => return relic_eval(&config).await,
         Some("relic-scan") => return relic_scan(&config).await,
         Some("reward-png") => return reward_png(&config).await,
@@ -242,6 +246,73 @@ fn set_account_cmd(config_path: &std::path::Path) -> Result<()> {
     config.save(config_path)?;
     println!("saved account_id={id} to {}", config_path.display());
     Ok(())
+}
+
+/// Launch a companion binary (`wf-settings` GUI, `wf-tray` tray) that lives in a
+/// separate crate so the overlay stays lean. Prefers a sibling of this
+/// executable, then `PATH`; if it isn't installed, say so.
+fn launch_companion(name: &str) -> Result<()> {
+    let sibling = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join(name)))
+        .filter(|p| p.is_file());
+    let bin = sibling.unwrap_or_else(|| std::path::PathBuf::from(name));
+    match std::process::Command::new(&bin).status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => anyhow::bail!("{name} exited with {status}"),
+        Err(e) => anyhow::bail!(
+            "could not launch {name} ({}): {e}. Install `{name}` alongside `wf-lite`.",
+            bin.display(),
+        ),
+    }
+}
+
+/// Auto-detect the local account id from `EE.log` and save it to config.
+///
+/// The id is scraped from the log (see `wf_log::scan_account`) and every
+/// candidate is verified against the public profile API — only an id whose
+/// `DisplayName` matches the logged-in name is accepted, so a squadmate's id can
+/// never be saved by mistake.
+async fn detect_account_cmd(config: &Config, config_path: &std::path::Path) -> Result<()> {
+    let log_path = config.resolve_ee_log()?;
+    println!("\n== Detect account id ==\n  scanning {}", log_path.display());
+    let text = std::fs::read_to_string(&log_path)
+        .with_context(|| format!("reading {}", log_path.display()))?;
+    let scan = wf_log::scan_account(&text);
+
+    let name = scan.local_name.clone().context(
+        "no `Logged in <name>` line in EE.log — log in to Warframe once, then retry",
+    )?;
+    println!("  logged-in player: {name}");
+    if scan.candidates.is_empty() {
+        anyhow::bail!(
+            "no account id found in this log. It only appears after certain activity \
+             (cracking a relic in a squad, a Duviri race). Play a bit and retry, or set it \
+             manually with `wf-lite set-account <id>`."
+        );
+    }
+
+    let client = http_client();
+    for id in &scan.candidates {
+        match wf_relic::mastery::fetch_display_name(&client, id).await {
+            Ok(Some(profile_name)) if profile_name.eq_ignore_ascii_case(&name) => {
+                let mut cfg = Config::load(config_path)?;
+                cfg.account_id = Some(id.clone());
+                cfg.save(config_path)?;
+                println!("  verified {id} → {profile_name}");
+                println!("  saved account_id to {}", config_path.display());
+                return Ok(());
+            }
+            Ok(Some(other)) => tracing::debug!("candidate {id} is {other}, not {name}"),
+            Ok(None) => tracing::debug!("candidate {id} has no profile"),
+            Err(e) => tracing::warn!("verifying {id} failed: {e:#}"),
+        }
+    }
+    anyhow::bail!(
+        "found {} candidate id(s) but none verified as {name} \
+         (network issue, or the id isn't in this log yet). Try again, or use `set-account`.",
+        scan.candidates.len()
+    )
 }
 
 /// Fetch and report the player's mastered set. `wf-lite mastery [account_id]`
@@ -492,6 +563,9 @@ const OVERLAY_W: u32 = wf_overlay::render::WIDTH;
 const OVERLAY_H: u32 = 340;
 /// How long a detected reward result stays on the overlay.
 const REWARD_DISPLAY: Duration = Duration::from_secs(20);
+/// How long the overlay polls for the game window before falling back to the
+/// compositor's default output (lets it be launched together with the game).
+const WINDOW_WAIT: Duration = Duration::from_secs(30);
 /// Item catalogue is refetched at most this often (new primes are rare).
 const CATALOGUE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 
@@ -518,6 +592,7 @@ type RewardState = std::sync::Arc<std::sync::Mutex<Option<(std::time::Instant, V
 /// automatically swapping to the relic reward result for a few seconds when a
 /// fissure reward is detected in the log.
 async fn run_overlay(config: Config) -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
 
     let font = Arc::new(wf_overlay::load_font()?);
@@ -526,19 +601,62 @@ async fn run_overlay(config: Config) -> Result<()> {
     let refresh = Duration::from_secs(config.worldstate_refresh_secs.max(15));
     let reward: RewardState = Arc::new(Mutex::new(None));
 
+    // Appearance/visibility knobs. `visible` is flipped at runtime by the control
+    // socket (see `overlay_control`); `show_world` and `opacity` come from config.
+    let visible = Arc::new(AtomicBool::new(true));
+    let show_world = config.overlay.world_state;
+    let opacity = config.overlay.opacity;
+
+    // Build one overlay frame from the current state, honoring reward-only mode,
+    // the visibility toggle, and opacity. A hidden or empty frame is a fully
+    // transparent (click-through) canvas.
+    let make_frame = {
+        let font = font.clone();
+        let reward = reward.clone();
+        move |ws: &worldstate::WorldState, shown: bool| -> wf_overlay::Canvas {
+            let mut c = if !shown {
+                wf_overlay::Canvas::new(OVERLAY_W, OVERLAY_H)
+            } else {
+                let r = reward.lock().unwrap();
+                match r.as_ref() {
+                    Some((t, rows)) if t.elapsed() < REWARD_DISPLAY => {
+                        wf_overlay::render_reward_panel(rows, &font).embed(OVERLAY_W, OVERLAY_H)
+                    }
+                    _ if show_world => {
+                        wf_overlay::render_panel(ws, &font).embed(OVERLAY_W, OVERLAY_H)
+                    }
+                    _ => wf_overlay::Canvas::new(OVERLAY_W, OVERLAY_H),
+                }
+            };
+            c.scale_alpha(opacity);
+            c
+        }
+    };
+
     println!("\n== Live overlay (Ctrl-C to stop) ==");
+    println!(
+        "  placement: {} (margin {}x{}); world panel: {}; opacity: {opacity}",
+        config.overlay.anchor,
+        config.overlay.margin_x,
+        config.overlay.margin_y,
+        if show_world { "on" } else { "reward-only" },
+    );
     let ws = worldstate::fetch(&client, &platform)
         .await
         .context("initial worldstate fetch")?;
-    let initial = wf_overlay::render_panel(&ws, &font).embed(OVERLAY_W, OVERLAY_H);
+    let initial = make_frame(&ws, visible.load(Ordering::Relaxed));
 
     let (tx, rx) = mpsc::channel();
 
-    // Renderer: world panel each second (ETAs tick), reward panel while active.
+    // Control socket: `wf-lite toggle|show|hide` flips `visible` at runtime, so a
+    // KDE global shortcut bound to those commands can hide the overlay on demand.
+    spawn_control_listener(visible.clone());
+
+    // Renderer: rebuild the frame each second (ETAs tick, reward panel expires,
+    // visibility may have toggled) and push it to the layer surface.
     {
-        let font = font.clone();
-        let reward = reward.clone();
         let client = client.clone();
+        let visible = visible.clone();
         tokio::spawn(async move {
             let mut cached = ws;
             let mut last_fetch = tokio::time::Instant::now();
@@ -551,16 +669,8 @@ async fn run_overlay(config: Config) -> Result<()> {
                     }
                     last_fetch = tokio::time::Instant::now();
                 }
-                let panel = {
-                    let r = reward.lock().unwrap();
-                    match r.as_ref() {
-                        Some((t, rows)) if t.elapsed() < REWARD_DISPLAY => {
-                            wf_overlay::render_reward_panel(rows, &font)
-                        }
-                        _ => wf_overlay::render_panel(&cached, &font),
-                    }
-                };
-                if tx.send(panel.embed(OVERLAY_W, OVERLAY_H)).is_err() {
+                let frame = make_frame(&cached, visible.load(Ordering::Relaxed));
+                if tx.send(frame).is_err() {
                     break; // overlay closed
                 }
             }
@@ -605,22 +715,111 @@ async fn run_overlay(config: Config) -> Result<()> {
         (_, Err(e)) => println!("  relic auto-detect: OFF (no EE.log: {e:#})"),
     }
 
-    // Place the overlay on the monitor Warframe is on (centre of its window).
-    let target = wf_capture::warframe_geometry()
-        .ok()
-        .map(|(x, y, w, h)| (x + w as i32 / 2, y + h as i32 / 2));
-    match target {
-        Some(p) => println!("  overlay target: game monitor (window centre {p:?})"),
+    // Place the overlay on the game's monitor, hugging its window corner. Poll
+    // briefly for the window so the overlay can be started *with* the game (e.g.
+    // from Steam launch options) before Xwayland has mapped it.
+    let window = wait_for_window(WINDOW_WAIT).await;
+    match window {
+        Some((x, y, w, h)) => println!("  overlay target: game window {w}x{h} at ({x},{y})"),
         None => println!("  overlay target: compositor default (game window not found)"),
     }
 
+    let placement = wf_overlay::layer::Placement::parse(
+        &config.overlay.anchor,
+        config.overlay.margin_x,
+        config.overlay.margin_y,
+    );
+
     // The Wayland event loop is blocking and uses non-Send types; run it on a
     // dedicated blocking thread.
-    tokio::task::spawn_blocking(move || {
-        wf_overlay::layer::run(initial, rx, wf_overlay::layer::Placement::default(), target)
-    })
-    .await
-    .context("overlay thread panicked")?
+    tokio::task::spawn_blocking(move || wf_overlay::layer::run(initial, rx, placement, window))
+        .await
+        .context("overlay thread panicked")?
+}
+
+/// Filesystem path of the overlay's control socket. Placed in the per-user
+/// runtime dir when available, falling back to the temp dir.
+fn control_socket_path() -> std::path::PathBuf {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    dir.join("warframe-lite-overlay.sock")
+}
+
+/// Listen on the control socket for `toggle` / `show` / `hide` lines and update
+/// the shared `visible` flag. A stale socket file from a previous run is removed
+/// first. Runs for the life of the overlay.
+fn spawn_control_listener(visible: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::Ordering;
+    use tokio::io::AsyncReadExt;
+
+    let path = control_socket_path();
+    let _ = std::fs::remove_file(&path);
+    let listener = match tokio::net::UnixListener::bind(&path) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!("overlay control socket unavailable ({e}); toggle disabled");
+            return;
+        }
+    };
+    println!("  control:   {} (wf-lite toggle|show|hide)", path.display());
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                continue;
+            };
+            let mut buf = String::new();
+            if stream.read_to_string(&mut buf).await.is_err() {
+                continue;
+            }
+            match buf.trim() {
+                "toggle" => {
+                    let now = !visible.fetch_xor(true, Ordering::Relaxed);
+                    tracing::info!("overlay {}", if now { "shown" } else { "hidden" });
+                }
+                "show" => visible.store(true, Ordering::Relaxed),
+                "hide" => visible.store(false, Ordering::Relaxed),
+                other => tracing::warn!("unknown overlay control command {other:?}"),
+            }
+        }
+    });
+}
+
+/// Client side of the control socket: send a single command to a running overlay.
+fn overlay_control(cmd: &str) -> Result<()> {
+    use std::io::Write;
+
+    let path = control_socket_path();
+    match std::os::unix::net::UnixStream::connect(&path) {
+        Ok(mut stream) => {
+            stream
+                .write_all(cmd.as_bytes())
+                .with_context(|| format!("sending {cmd:?} to overlay"))?;
+            println!("sent '{cmd}' to the overlay");
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+            || e.kind() == std::io::ErrorKind::ConnectionRefused =>
+        {
+            anyhow::bail!("no overlay is running (control socket {} absent)", path.display())
+        }
+        Err(e) => Err(e).with_context(|| format!("connecting to overlay at {}", path.display())),
+    }
+}
+
+/// Poll for the Warframe window up to `timeout`, returning its root-space
+/// rectangle once found (or `None` if it never appears).
+async fn wait_for_window(timeout: Duration) -> Option<(i32, i32, u32, u32)> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Ok(rect) = wf_capture::warframe_geometry() {
+            return Some(rect);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 /// Watch the EE.log for a relic crack (`DVRCAftermath`); on each, scan the

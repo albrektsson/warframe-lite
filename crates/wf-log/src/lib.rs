@@ -11,8 +11,10 @@
 //! [`Event`]s and provides a rotation-aware [`LogTailer`] for following the file
 //! while the game runs.
 
+pub mod account;
 pub mod tail;
 
+pub use account::{scan_account, AccountScan};
 pub use tail::LogTailer;
 
 /// A parsed log line (borrows from the source string).

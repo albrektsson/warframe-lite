@@ -80,6 +80,25 @@ impl Canvas {
         }
     }
 
+    /// Draw a filled, anti-aliased mastery mark — a vertical diamond (the shape of
+    /// Warframe's mastery emblem) — inside the `w`×`h` box at top-left `(x, y)`.
+    /// Used to flag rewards whose prime the player has already mastered.
+    pub fn draw_mastery_mark(&mut self, x: i32, y: i32, w: u32, h: u32, c: Color) {
+        let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+        let (hw, hh) = (w as f32 / 2.0, h as f32 / 2.0);
+        let aa = hw.min(hh).max(1.0);
+        for row in 0..h as i32 {
+            for col in 0..w as i32 {
+                // Diamond metric: |dx|/hw + |dy|/hh <= 1 is inside; feather the edge.
+                let d = ((col as f32 + 0.5 - cx).abs() / hw) + ((row as f32 + 0.5 - cy).abs() / hh);
+                let coverage = ((1.0 - d) * aa + 0.5).clamp(0.0, 1.0);
+                if coverage > 0.0 {
+                    self.blend(x + col, y + row, c, coverage);
+                }
+            }
+        }
+    }
+
     /// Draw a run of text with its baseline at `baseline_y`, returning the pen x
     /// position after the last glyph (so callers can chain coloured segments).
     pub fn draw_text(
@@ -130,6 +149,19 @@ impl Canvas {
             out.buf[dst..dst + n].copy_from_slice(&self.buf[src..src + n]);
         }
         out
+    }
+
+    /// Scale every pixel's alpha by `factor` (`0.0`–`1.0`), making the whole
+    /// canvas more transparent so it obscures less of what's behind it. A factor
+    /// of `1.0` (or more) is a no-op.
+    pub fn scale_alpha(&mut self, factor: f32) {
+        if factor >= 1.0 {
+            return;
+        }
+        let f = factor.clamp(0.0, 1.0);
+        for px in self.buf.chunks_exact_mut(4) {
+            px[3] = (px[3] as f32 * f).round() as u8;
+        }
     }
 
     /// Pack into premultiplied ARGB8888 (native-endian `0xAARRGGBB`) for wl_shm.
@@ -189,6 +221,35 @@ mod tests {
         c.blend(-1, 0, Color::rgb(255, 255, 255), 1.0);
         c.blend(5, 5, Color::rgb(255, 255, 255), 1.0);
         assert!(c.buf.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn scale_alpha_dims_opacity() {
+        let mut c = Canvas::new(1, 1);
+        c.buf.copy_from_slice(&[10, 20, 30, 200]);
+        c.scale_alpha(0.5);
+        assert_eq!(c.buf[3], 100);
+        // colour channels are untouched (straight alpha).
+        assert_eq!(&c.buf[0..3], &[10, 20, 30]);
+    }
+
+    #[test]
+    fn mastery_mark_fills_center_not_corner() {
+        let mut c = Canvas::new(14, 14);
+        c.draw_mastery_mark(0, 0, 14, 14, Color::rgb(130, 200, 140));
+        // Center of the diamond is solid…
+        let center = ((7 * 14 + 7) * 4) as usize;
+        assert!(c.buf[center + 3] > 200, "diamond centre should be opaque");
+        // …a corner is outside the diamond, so transparent.
+        assert_eq!(c.buf[3], 0, "corner should be untouched");
+    }
+
+    #[test]
+    fn scale_alpha_one_is_noop() {
+        let mut c = Canvas::new(1, 1);
+        c.buf.copy_from_slice(&[10, 20, 30, 200]);
+        c.scale_alpha(1.0);
+        assert_eq!(c.buf[3], 200);
     }
 
     #[test]

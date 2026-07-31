@@ -32,6 +32,41 @@ pub struct Config {
     /// API. Find it at <https://www.warframe.com/api/user-data> (`user_id`).
     /// `None` disables mastery indicators.
     pub account_id: Option<String>,
+    /// Overlay placement and appearance.
+    pub overlay: OverlayConfig,
+}
+
+/// Where the overlay sits and how visible it is. Warframe uses every screen
+/// corner for HUD/menu elements, so position, opacity, and whether the
+/// persistent world-state panel shows at all are all configurable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OverlayConfig {
+    /// Which corner/edge to anchor to: `top-left`, `top-right`, `bottom-left`,
+    /// `bottom-right`, `top`, `bottom`, `left`, `right`, or `center`.
+    pub anchor: String,
+    /// Horizontal inset from the anchored edge(s), in pixels.
+    pub margin_x: i32,
+    /// Vertical inset from the anchored edge(s), in pixels.
+    pub margin_y: i32,
+    /// Show the persistent world-state panel. When `false`, the overlay is
+    /// invisible until a relic reward screen is detected (reward-only mode).
+    pub world_state: bool,
+    /// Panel opacity, `0.0` (invisible) to `1.0` (as-drawn). Scales the whole
+    /// panel's alpha so it obscures less of the game behind it.
+    pub opacity: f32,
+}
+
+impl Default for OverlayConfig {
+    fn default() -> Self {
+        Self {
+            anchor: "top-right".to_string(),
+            margin_x: 24,
+            margin_y: 24,
+            world_state: true,
+            opacity: 1.0,
+        }
+    }
 }
 
 impl Default for Config {
@@ -42,6 +77,7 @@ impl Default for Config {
             market_platform: "pc".to_string(),
             worldstate_refresh_secs: 60,
             account_id: None,
+            overlay: OverlayConfig::default(),
         }
     }
 }

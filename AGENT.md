@@ -14,6 +14,32 @@ process memory, and without handling account credentials. Where AlecaFrame reads
 the game's memory for full inventory, warframe-lite deliberately stays on the
 public/observable side of that line.
 
+## Hard constraint: observe only — never touch the game process
+
+**It is STRICTLY FORBIDDEN for this project to modify, write, or send any kind of
+data to the Warframe process.** warframe-lite is *read-only and observational* by
+design, and this is a non-negotiable rule that overrides any feature request.
+
+Concretely, the app must **never**:
+
+- send input to the game — no synthetic mouse/keyboard/controller events, no
+  clicking, no automation of gameplay or menus (the overlay is even
+  input-transparent so real clicks pass straight through it);
+- write to the game's process memory, or attach to it as a debugger/tracer
+  (`ptrace`, `process_vm_writev`, `/proc/<pid>/mem`, `PTRACE_POKE*`, code
+  injection, hooking, `LD_PRELOAD` into the game, etc.);
+- send it network traffic, IPC, signals, or messages of any kind, or modify its
+  files, saves, config, or the Proton prefix;
+- alter, intercept, or spoof the game's own network traffic.
+
+The *only* interactions permitted with anything game-related are strictly
+one-directional reads that the game is unaware of: **reading `EE.log`** (a plain
+log file) and **reading the game window's pixels** via X11 `GetImage`. Even the
+optional, never-implemented "inventory via memory reading" idea in the roadmap is
+scoped as a **read** (`process_vm_readv`) — writing to the process is out of scope
+permanently. Any proposal that would send data *into* the game must be refused,
+not implemented.
+
 ## The core experience
 
 - A **world-state overlay** — a `wlr-layer-shell` panel, click-through and
@@ -23,7 +49,7 @@ public/observable side of that line.
 - An **automatic relic reward picker** — the flagship. When a Void Fissure
   reward screen appears, the overlay automatically swaps to a ranked panel of the
   2–4 rewards, showing each one's live warframe.market price, the **best plat
-  pick** highlighted, and a **mastery badge** on rewards whose built prime the
+  pick** highlighted, and a **mastery emblem** in front of rewards whose built prime the
   player has already mastered. No keypress required.
 - Everything is driven by observing the game, never by injecting into or
   automating it.
@@ -46,6 +72,11 @@ A single Cargo workspace of focused crates:
 - **wf-cache** — disk-backed caches (item catalogue + stale-serving prices).
 - **wf-overlay** — a dependency-light canvas/renderer and the `wlr-layer-shell`
   display.
+- **wf-settings** — an optional graphical settings window (`eframe`/`egui`, a
+  separate binary so the overlay stays lean) that edits the same config.
+- **wf-tray** — an optional system-tray companion (`ksni`, pure-Rust DBus
+  StatusNotifierItem; separate binary) that waits for the game and supervises the
+  overlay, with a menu for the app's modes.
 - **warframe-lite** (root bin `wf-lite`) — orchestration + subcommands.
 
 ## How it works, conceptually

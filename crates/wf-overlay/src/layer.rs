@@ -43,29 +43,57 @@ use crate::canvas::Canvas;
 #[derive(Debug, Clone, Copy)]
 pub struct Placement {
     pub anchor: Anchor,
-    pub margin: i32,
+    pub margin_x: i32,
+    pub margin_y: i32,
 }
 
 impl Default for Placement {
     fn default() -> Self {
         Self {
             anchor: Anchor::TOP.union(Anchor::RIGHT),
-            margin: 24,
+            margin_x: 24,
+            margin_y: 24,
         }
+    }
+}
+
+impl Placement {
+    /// Build a placement from a config anchor string (`top-left`, `top-right`,
+    /// `bottom-left`, `bottom-right`, `top`, `bottom`, `left`, `right`,
+    /// `center`). Unrecognised values fall back to top-right.
+    pub fn parse(anchor: &str, margin_x: i32, margin_y: i32) -> Self {
+        let a = match anchor.trim().to_lowercase().as_str() {
+            "top-left" | "top_left" | "topleft" => Anchor::TOP.union(Anchor::LEFT),
+            "top-right" | "top_right" | "topright" => Anchor::TOP.union(Anchor::RIGHT),
+            "bottom-left" | "bottom_left" | "bottomleft" => Anchor::BOTTOM.union(Anchor::LEFT),
+            "bottom-right" | "bottom_right" | "bottomright" => Anchor::BOTTOM.union(Anchor::RIGHT),
+            "top" => Anchor::TOP,
+            "bottom" => Anchor::BOTTOM,
+            "left" => Anchor::LEFT,
+            "right" => Anchor::RIGHT,
+            "center" | "centre" => Anchor::empty(),
+            other => {
+                tracing::warn!("unknown overlay anchor {other:?}, using top-right");
+                Anchor::TOP.union(Anchor::RIGHT)
+            }
+        };
+        Self { anchor: a, margin_x, margin_y }
     }
 }
 
 /// Run the overlay until the compositor closes it or the process exits.
 ///
 /// `initial` is drawn immediately; every [`Canvas`] received on `rx` thereafter
-/// replaces it on the next timer tick. `target` is a root-coordinate point (e.g.
-/// the centre of the game window) used to pick the monitor the overlay appears
-/// on; `None` lets the compositor choose.
+/// replaces it on the next timer tick. `window` is the game window's rectangle on
+/// the X root (`x, y, w, h`): its centre picks the monitor the overlay appears on,
+/// and its edges are folded into the anchor margins so the panel hugs the game
+/// window's corner even when the game is borderless-windowed rather than
+/// fullscreen. `None` lets the compositor choose the output and uses plain insets.
 pub fn run(
     initial: Canvas,
     rx: Receiver<Canvas>,
     placement: Placement,
-    target: Option<(i32, i32)>,
+    window: Option<(i32, i32, u32, u32)>,
 ) -> Result<()> {
     let conn = Connection::connect_to_env().context("connecting to Wayland ($WAYLAND_DISPLAY)")?;
     let (globals, mut event_queue) = registry_queue_init(&conn).context("registry init")?;
@@ -98,10 +126,17 @@ pub fn run(
     for _ in 0..2 {
         event_queue.roundtrip(&mut state).context("output roundtrip")?;
     }
-    let chosen = target.and_then(|(tx, ty)| pick_output(&state.output_state, tx, ty));
+    let centre = window.map(|(x, y, w, h)| (x + w as i32 / 2, y + h as i32 / 2));
+    let chosen = centre.and_then(|(tx, ty)| pick_output(&state.output_state, tx, ty));
+    let chosen_geom = chosen
+        .as_ref()
+        .and_then(|o| state.output_state.info(o))
+        .and_then(|i| Some((i.logical_position?, i.logical_size?)));
     if chosen.is_some() {
-        tracing::info!("overlay placed on the monitor containing {target:?}");
+        tracing::info!("overlay placed on the monitor containing {centre:?}");
     }
+
+    let (top, right, bottom, left) = edge_margins(placement, window, chosen_geom);
 
     let surface = compositor.create_surface(&qh);
     let layer = layer_shell.create_layer_surface(
@@ -113,7 +148,7 @@ pub fn run(
     );
     layer.set_anchor(placement.anchor);
     layer.set_size(width, height);
-    layer.set_margin(placement.margin, placement.margin, placement.margin, placement.margin);
+    layer.set_margin(top, right, bottom, left);
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
     layer.set_exclusive_zone(0); // don't reserve desktop space
 
@@ -208,6 +243,30 @@ impl State {
         surface.damage_buffer(0, 0, self.width as i32, self.height as i32);
         surface.commit();
     }
+}
+
+/// Margins (`top, right, bottom, left`) that place the panel at the placement's
+/// x/y insets from the game window's corner. Given the window rect and its
+/// output's logical geometry, each edge margin is the gap from that output edge to
+/// the matching window edge plus the inset; the compositor only applies the
+/// margins on the anchored edges, so whichever corner [`Placement`] anchors to, the
+/// panel lands the requested inset inside the game window there. Falls back to the
+/// bare insets when either rect is unknown (compositor-chosen output / fullscreen,
+/// where window edges equal output edges).
+fn edge_margins(
+    placement: Placement,
+    window: Option<(i32, i32, u32, u32)>,
+    output: Option<((i32, i32), (i32, i32))>,
+) -> (i32, i32, i32, i32) {
+    let (mx, my) = (placement.margin_x, placement.margin_y);
+    if let (Some((wx, wy, ww, wh)), Some(((lx, ly), (lw, lh)))) = (window, output) {
+        let top = (wy - ly) + my;
+        let left = (wx - lx) + mx;
+        let right = (lx + lw) - (wx + ww as i32) + mx;
+        let bottom = (ly + lh) - (wy + wh as i32) + my;
+        return (top.max(0), right.max(0), bottom.max(0), left.max(0));
+    }
+    (my, mx, my, mx)
 }
 
 /// Pick the [`wl_output`](wl_output::WlOutput) whose logical geometry contains
@@ -318,3 +377,46 @@ delegate_output!(State);
 delegate_shm!(State);
 delegate_layer!(State);
 delegate_registry!(State);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_maps_corner_strings() {
+        assert_eq!(
+            Placement::parse("bottom-left", 1, 2).anchor,
+            Anchor::BOTTOM.union(Anchor::LEFT)
+        );
+        // unknown falls back to top-right, preserving margins.
+        let p = Placement::parse("nonsense", 5, 7);
+        assert_eq!(p.anchor, Anchor::TOP.union(Anchor::RIGHT));
+        assert_eq!((p.margin_x, p.margin_y), (5, 7));
+    }
+
+    #[test]
+    fn fullscreen_window_gives_bare_insets() {
+        // Window exactly fills its output → margins are just the insets.
+        let p = Placement::parse("top-right", 24, 12);
+        let m = edge_margins(p, Some((0, 0, 3440, 1440)), Some(((0, 0), (3440, 1440))));
+        assert_eq!(m, (12, 24, 12, 24)); // top, right, bottom, left
+    }
+
+    #[test]
+    fn windowed_offset_folds_into_margins() {
+        // A 1000x800 window at (100,50) inside a 1920x1080 output.
+        let p = Placement::parse("top-right", 10, 10);
+        let (top, right, bottom, left) =
+            edge_margins(p, Some((100, 50, 1000, 800)), Some(((0, 0), (1920, 1080))));
+        assert_eq!(top, 50 + 10);
+        assert_eq!(left, 100 + 10);
+        assert_eq!(right, (1920 - 1100) + 10);
+        assert_eq!(bottom, (1080 - 850) + 10);
+    }
+
+    #[test]
+    fn unknown_geometry_uses_insets() {
+        let p = Placement::parse("top-left", 8, 4);
+        assert_eq!(edge_margins(p, None, None), (4, 8, 4, 8));
+    }
+}

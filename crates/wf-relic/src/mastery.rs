@@ -89,6 +89,33 @@ pub async fn fetch(client: &reqwest::Client, account_id: &str) -> anyhow::Result
     Ok(set)
 }
 
+/// Fetch just the public `DisplayName` for `account_id`, used to verify that a
+/// candidate account id (e.g. scraped from `EE.log`) actually belongs to the
+/// local player. Returns `None` if the profile has no name / does not exist.
+pub async fn fetch_display_name(
+    client: &reqwest::Client,
+    account_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let url = format!("{PC_ENDPOINT}?playerId={account_id}");
+    let body = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0")
+        .send()
+        .await?
+        .error_for_status()
+        .context("profile request failed")?
+        .json::<ProfileResponse>()
+        .await
+        .context("parsing profile JSON")?;
+    let name = body
+        .results
+        .into_iter()
+        .next()
+        .map(|r| r.display_name)
+        .filter(|n| !n.is_empty());
+    Ok(name)
+}
+
 /// Load the mastered set from a disk cache when fresh (younger than `ttl`),
 /// otherwise refetch. Falls back to a stale cache on network failure, and to an
 /// empty set if there is nothing cached and the fetch fails.
@@ -136,6 +163,8 @@ struct ProfileResponse {
 struct ProfileResult {
     #[serde(rename = "LoadOutInventory", default)]
     loadout: LoadOut,
+    #[serde(rename = "DisplayName", default)]
+    display_name: String,
 }
 
 #[derive(Deserialize, Default)]

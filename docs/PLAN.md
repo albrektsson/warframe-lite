@@ -81,7 +81,112 @@ warframe-lite/
 - Global hotkeys on Wayland: a KWin custom shortcut (via DBus) or `evdev`/`libinput` reader; hotkey is the reliable relic-screen trigger.
 - Memory (Phase 4): `nix::sys::uio::process_vm_readv` + `/proc/<pid>/maps` parsing.
 
+## Implementation status (as of 2026-07)
+
+**Hard rule (see [`AGENT.md`](../AGENT.md)):** warframe-lite is strictly
+observe-only — it must never modify, write, or send any data to the Warframe
+process (no input injection, no memory writes, no ptrace, no IPC/network to the
+game). The only game-side interactions are one-directional reads: the `EE.log`
+file and the window's pixels.
+
+Phases 0–3 plus caching, mastery, overlay configuration, account auto-detection,
+and the tray/settings companions are **done and verified against the running
+game**. Summary of what shipped:
+
+- **Phase 0 — data plumbing ✅.** Config load, Steam-Proton `EE.log`
+  auto-detection (appid 230410 via `libraryfolders.vdf`), live world state, and
+  warframe.market pricing, all verified live.
+- **Phase 1 — world-state overlay ✅.** A pure-Rust `wlr-layer-shell` panel (top
+  layer, click-through) shows fissures (normal → Steel Path → Storm), Baro, and
+  the Cetus/Vallis/Cambion cycles, re-rendering every second so ETAs tick.
+- **Phase 2 — relic reward picker ✅.** OCR (`wf-ocr`, tesseract CLI) + picker
+  brain (`wf-relic`: fuzzy match to the ~3.8k-item warframe.market catalogue +
+  plat ranking). Handles the **variable, centred reward layout** (2–4 cards
+  depending on how many squadmates cracked) by scanning a superset of candidate
+  slot centres and keeping whichever OCR to items, and reads **two-line wrapped
+  names**. Validated on real 3440×1440 screens (a 4-reward screen and a 3-reward
+  screen with a wrapped *Voruna Prime Systems Blueprint*).
+- **Mastery tracking ✅.** DE's **public** profile API
+  (`getProfileViewingData.php`, no auth): reads `LoadOutInventory.XPInfo` and
+  treats an item as mastered once lifetime affinity passes the rank-30 cap (450k
+  weapons / 900k frames — verified against a real profile), maps each reward
+  *part* to its built prime, and shows a green mastery emblem in front of the
+  name (and dims it). Account id set once
+  (`wf-lite set-account <id>`); mastered set cached for a day. The ducat column
+  was dropped (it is clearly shown in-game during selection).
+- **Caching ✅.** Item catalogue cached to `~/.cache/warframe-lite/items.json`
+  (7-day TTL, stale-served offline; warm startup ~19× faster). Prices cached per
+  item with a freshness TTL; during a scan all are fetched **concurrently**, and
+  **if warframe.market is slow/unreachable the last known price is served
+  immediately** — so the panel is ready inside the few-second selection window.
+- **Phase 3 — automatic detection + overlay integration ✅.** `wf-lite overlay`
+  shows world state and **automatically swaps to the ranked reward result when the
+  reward screen is on-screen** — no keypress. Because the reward screen is a
+  mid-mission, ~15s, player-controlled thing (Tab-showable) and Warframe flushes
+  its log in bursts, detection does **not** treat the log as a stopwatch: a relic
+  **crack** (`DVRCAftermath`) or **reward-screen** line
+  (`ProjectionRewardChoice: Got rewards`) opens a ~150s polling window during
+  which the screen is OCR-scanned every 2s, and the OCR guard (≥2 names resolve)
+  confirms the screen is up. Result shows ~20s, de-bounced. Confirmed in a live
+  fissure.
+- **Overlay placement ✅.** Anchors to the monitor Warframe is on (game window
+  centre matched against each output's logical geometry) and hugs the game window
+  corner in fullscreen **and** borderless-windowed (window offset folded into the
+  layer-shell margins). Polls up to 30s for the window so it can be launched
+  *with* the game (`wf-lite overlay & %command%` in Steam launch options).
+- **Overlay configuration / anti-overlap ✅.** Since Warframe uses every screen
+  corner for HUD/menu, an `[overlay]` config controls `anchor`, `margin_x/y`,
+  `opacity`, and `world_state` (`false` = reward-only: invisible until a reward
+  screen). Show/hide at runtime goes through a Unix control socket (`wf-lite
+  toggle|show|hide`) — because a click-through Wayland surface can't grab a global
+  key, the user binds `wf-lite toggle` as a KDE custom shortcut and the compositor
+  owns the hotkey.
+- **Account-id auto-detection ✅.** `wf-lite detect-account` scrapes the local
+  account id from `EE.log` (situational lines: Duviri races, void-projection
+  relaying) and **verifies every candidate against the public profile API** — only
+  an id whose `DisplayName` matches the logged-in name is saved, so a squadmate's
+  id can never be picked. Verified live.
+- **Companion binaries ✅.** Kept as separate crates so the overlay stays lean:
+  **wf-settings** (a graphical `eframe`/`egui` settings window) and **wf-tray** (a
+  pure-Rust `ksni` StatusNotifierItem tray that waits for the game, auto-starts and
+  supervises the overlay, and exposes the app's modes via its menu). `wf-lite
+  settings` / `wf-lite tray` launch them; a `.desktop` file makes the tray a
+  launcher entry.
+- **Distribution ✅.** The overlay is a single self-contained binary (no external
+  link-time deps: libwayland is dlopen'd, x11rb is pure Rust, rustls uses `ring`);
+  the one runtime piece is the `tesseract` CLI for the relic OCR. Releases build
+  against an older glibc (Ubuntu 22.04) for broad compatibility and attach all
+  three binaries; a Fedora COPR/RPM spec and per-distro tesseract notes are
+  provided. musl-static is unsuitable (the overlay dlopens libwayland).
+
+**Two hardest Linux unknowns de-risked (verified against the running game):**
+
+- **EE.log parsing** (`wf-log`): line parser hits ~98% coverage on real logs
+  (remainder are multi-line continuations); rotation/append-aware tailer.
+  Confirmed Warframe **buffers log output and flushes in bursts**, which is why
+  detection uses a polling window rather than log timing.
+- **X11 capture** (`wf-capture`): pure-Rust `x11rb` locates the Warframe Xwayland
+  window and reads a full 3440×1440 frame via `GetImage` — legible content, **no
+  black-frame/DXVK issue**, no portal prompt.
+
+**Remaining / later polish:** config-overridable reward regions; per-resolution
+calibration (currently tuned for 3440×1440); **mastery-weighted ranking** (prefer
+a slightly-cheaper *unmastered* reward, since the "best pick" is currently pure
+plat); background price pre-warm at fissure start. **Phase 4** (inventory via
+memory reading) remains optional and unstarted — and, per the hard rule above,
+strictly a *read* (`process_vm_readv`) if ever pursued.
+
+### External API notes
+
+- **warframe.market:** use the **v2** API (`/v2/orders/item/{slug}`). The legacy
+  v1 endpoint returns **403**.
+- **warframestat.us:** fissure/cycle objects carry only an `expiry` timestamp (no
+  pre-formatted `eta`/`timeLeft`); remaining time is computed locally.
+
 ## Phased implementation plan (with effort)
+
+> Historical — the plan the build followed. See **Implementation status** above
+> for what actually shipped.
 
 **Phase 0 — Scaffolding & data layer (S, ~1–2 days)**
 - Cargo workspace; config (TOML) with auto-detected EE.log/prefix paths for the
