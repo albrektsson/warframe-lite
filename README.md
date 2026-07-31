@@ -13,6 +13,10 @@ It shows a click-through overlay on top of the game with:
   appears, the overlay swaps to the 2–4 rewards ranked by live warframe.market
   plat price, with the best pick highlighted and a mastery emblem in front of
   primes you have already **mastered**. No keypress needed.
+- **An owned-relic mastery guide** — open the in-game **Void Relics** screen and
+  the overlay automatically scans your relics as you scroll, then shows which of
+  the ones you own can still drop a prime you **haven't mastered**, ranked by
+  relic price. Also `wf-lite relics <codes…>` from the CLI.
 
 It only *observes* the game — no Overwolf, no memory reading, no account
 credentials.
@@ -93,8 +97,10 @@ A Fedora `.spec` builds from source with the standard Rust macros and pulls in
 ## Commands
 
 ```
-wf-lite                    # world-state + EE.log detection + price lookup
-wf-lite <market_slug>      # price summary, e.g. `wf-lite mirage_prime_set`
+wf-lite                    # (no command) show this list of commands
+wf-lite status             # live world state (fissures, Baro, cycles)
+wf-lite <market_slug>      # price an item, e.g. `wf-lite mirage_prime_set`
+wf-lite relics <codes…>    # owned-relic guide: unmastered rewards + prices
 wf-lite tray               # tray companion: waits for the game, runs the overlay
 wf-lite overlay            # show the live overlay (world state + relic picker)
 wf-lite settings           # open the graphical settings window (needs wf-settings)
@@ -152,19 +158,22 @@ cargo build --release
 cargo test
 ```
 
-The overlay binary is at `target/release/wf-lite`. The optional companions are
-separate crates: `cargo build --release -p wf-settings -p wf-tray` →
-`target/release/{wf-settings,wf-tray}`.
+This builds all three binaries into `target/release/`: `wf-lite` (the overlay/CLI)
+plus the `wf-tray` and `wf-settings` companions. `wf-lite tray` / `wf-lite settings`
+expect the companion binaries next to `wf-lite`, so keep them together when you
+install (e.g. all into `~/.local/bin`).
 
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
 
-The bundled mastery icon (`crates/wf-overlay/assets/mastered.png`, the in-game
-`<MASTERED>` laurel wreath) is a *Warframe* UI asset and remains the property of
-**Digital Extremes Ltd.** It is included solely to identify mastered rewards in
-this fan companion; *Warframe* is a trademark of Digital Extremes. This project is
-unofficial and not affiliated with or endorsed by Digital Extremes.
+The bundled *Warframe* UI assets — the mastery laurel
+(`crates/wf-overlay/assets/mastered.png`, shown on mastered rewards) and the
+"unowned" eye icon (`assets/relic-unowned-eye.png`, used only to detect which
+relics you don't own) — remain the property of **Digital Extremes Ltd.** They are
+included solely to identify game state in this fan companion; *Warframe* is a
+trademark of Digital Extremes. This project is unofficial and not affiliated with
+or endorsed by Digital Extremes.
 
 ## Design & roadmap
 

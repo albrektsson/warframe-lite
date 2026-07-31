@@ -12,6 +12,21 @@ members = [
     "crates/wf-settings",
     "crates/wf-tray",
 ]
+# Build/test everything by default so a bare `cargo build --release` produces all
+# three binaries (wf-lite + the wf-tray/wf-settings companions), not just wf-lite.
+default-members = [
+    ".",
+    "crates/wf-config",
+    "crates/wf-data",
+    "crates/wf-log",
+    "crates/wf-capture",
+    "crates/wf-overlay",
+    "crates/wf-ocr",
+    "crates/wf-relic",
+    "crates/wf-cache",
+    "crates/wf-settings",
+    "crates/wf-tray",
+]
 
 [workspace.package]
 version = "0.0.1"

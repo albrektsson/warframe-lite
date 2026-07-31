@@ -9,4 +9,6 @@ pub mod layer;
 pub mod render;
 
 pub use canvas::Canvas;
-pub use render::{load_font, render_panel, render_reward_panel, RewardRow};
+pub use render::{
+    load_font, render_panel, render_relic_panel, render_reward_panel, RelicRow, RewardRow,
+};

@@ -1,21 +1,9 @@
-//! warframe-lite — Phase 0 smoke test.
+//! warframe-lite — command-line entry point.
 //!
-//! Verifies the end-to-end data plumbing:
-//!   * config load + `EE.log` auto-detection,
-//!   * live world-state (fissures / Void Trader / cycles),
-//!   * a warframe.market price lookup.
-//!
-//! Usage:
-//!   wf-lite                 # world-state + EE.log detection + price lookup
-//!   wf-lite <market_slug>   # also print a price summary, e.g. `mirage_prime_set`
-//!   wf-lite logstats        # parse whole EE.log history, report parse/event stats
-//!   wf-lite logwatch        # follow EE.log live and print recognized events
-//!   wf-lite capture [path]  # capture the Warframe (Xwayland) window to a PNG
-//!   wf-lite overlay-png [p] # render the live world-state panel to a PNG (offscreen)
-//!   wf-lite overlay         # show the live world-state overlay (wlr-layer-shell)
-//!   wf-lite ocr [x y w h]   # OCR the Warframe window (or a region) — pipeline test
-//!   wf-lite relic [names…]  # evaluate reward names → matched item, plat, ducats
-//!   wf-lite relic-scan      # capture the reward screen, OCR 4 names, rank them
+//! Orchestrates the overlay, relic picker, mastery, and world-state/market
+//! lookups. Running the binary with **no command prints usage** ([`print_help`]);
+//! every subcommand is dispatched from `main`. `status` shows live world state and
+//! a bare `<market_slug>` prices that item.
 
 use std::time::Duration;
 
@@ -33,6 +21,16 @@ async fn main() -> Result<()> {
         )
         .with_target(false)
         .init();
+
+    // No command (or an explicit help flag) prints usage instead of running
+    // anything, so the bare binary is discoverable.
+    match std::env::args().nth(1).as_deref() {
+        None | Some("help") | Some("-h") | Some("--help") => {
+            print_help();
+            return Ok(());
+        }
+        _ => {}
+    }
 
     // --- Config + EE.log detection ---------------------------------------
     let config_path = Config::default_path()?;
@@ -66,6 +64,9 @@ async fn main() -> Result<()> {
         Some("settings") => return launch_companion("wf-settings"),
         Some("tray") => return launch_companion("wf-tray"),
         Some("relic") => return relic_eval(&config).await,
+        Some("relics") => return relics_cmd(&config).await,
+        Some("relic-guide-png") => return relic_guide_png(&config).await,
+        Some("relic-grid-file") => return relic_grid_file().await,
         Some("relic-scan") => return relic_scan(&config).await,
         Some("reward-png") => return reward_png(&config).await,
         _ => {}
@@ -81,11 +82,9 @@ async fn main() -> Result<()> {
     }
 
     // --- Optional market lookup ------------------------------------------
-    let skip = [
-        "logstats", "logwatch", "capture", "overlay-png", "overlay", "ocr", "ocr-file", "relic",
-        "relic-scan", "relic-file", "reward-png", "mastery", "set-account",
-    ];
-    if let Some(slug) = std::env::args().nth(1).filter(|a| !skip.contains(&a.as_str())) {
+    // Reached by `status` (world state only) or a bare `<slug>` (world state +
+    // that item's price); every other command returned from the match above.
+    if let Some(slug) = std::env::args().nth(1).filter(|a| a != "status") {
         println!("\n== Market: {slug} ==");
         let market = MarketClient::new(client.clone(), config.market_platform.clone());
         match market.price_summary(&slug).await {
@@ -98,10 +97,50 @@ async fn main() -> Result<()> {
             Err(e) => println!("  market lookup failed: {e:#}"),
         }
     } else {
-        println!("\n(tip: pass a warframe.market slug to test pricing, e.g. `wf-lite mirage_prime_set`)");
+        println!("\n(tip: pass a warframe.market slug to price it, e.g. `wf-lite mirage_prime_set`)");
     }
 
     Ok(())
+}
+
+/// Print grouped usage. Shown when the binary is run with no command (or `help`).
+fn print_help() {
+    print!(
+        "\
+wf-lite — Linux-native Warframe companion (overlay, relic picker, mastery)
+
+USAGE:
+    wf-lite <command> [args]        (no command shows this help)
+
+RUN IT
+    tray                  Tray icon: waits for the game, auto-runs the overlay
+    overlay               Show the live overlay (world state + relic picker)
+    settings              Open the graphical settings window
+    toggle | show | hide  Show/hide a running overlay
+
+RELICS & MASTERY
+    relics <codes…>       Owned-relic guide: unmastered rewards + prices
+    mastery [id]          Report how many items you've mastered
+    detect-account        Auto-detect your account id from EE.log
+    set-account <id>      Save your account id for mastery lookup
+
+WORLD STATE & PRICES
+    status                Show live fissures, Baro, and world cycles
+    <market_slug>         Price an item, e.g. `wf-lite mirage_prime_set`
+
+DIAGNOSTICS
+    logstats              Parse EE.log history, report coverage/events
+    logwatch              Follow EE.log live, print recognized events
+    capture [out.png]     Capture the Warframe window to a PNG
+    ocr [x y w h]         OCR the Warframe window (or a region)
+    relic [names…]        Evaluate reward names → item, plat, mastery
+    relic-scan            Capture + rank the on-screen relic rewards
+    reward-png            Render the reward panel to a PNG (offscreen)
+    relic-guide-png       Render the relic-guide panel to a PNG (offscreen)
+
+Config: ~/.config/warframe-lite/config.toml   Docs: README.md
+"
+    );
 }
 
 fn print_worldstate(ws: &worldstate::WorldState) {
@@ -233,6 +272,155 @@ async fn relic_eval(config: &Config) -> Result<()> {
     let mastery = load_mastery(config, &client).await;
     print_reward_table(&evals, &mastery);
     Ok(())
+}
+
+/// Owned-relic mastery guide: for each relic, which rewards you haven't mastered,
+/// plus the relic's market price. `wf-lite relics <code…>` treats the given relic
+/// codes (e.g. `axi h3 meso n11`) as owned and prices them; with no args it lists
+/// every relic that contains an unmastered reward (no prices).
+async fn relics_cmd(config: &Config) -> Result<()> {
+    let client = http_client();
+    let index = wf_relic::RelicIndex::load_cached(&client, CATALOGUE_TTL).await?;
+    let mastery = load_mastery(config, &client).await;
+    println!(
+        "\n== Relic guide ({} relics; {} mastered) ==",
+        index.len(),
+        mastery.len()
+    );
+
+    // Args are relic codes (owned). Adjacent tokens like "axi h3" join into one.
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let owned: Vec<&wf_relic::RelicInfo> = if args.is_empty() {
+        index.all().iter().collect()
+    } else {
+        pair_relic_codes(&args)
+            .iter()
+            .filter_map(|c| index.best_match(c))
+            .collect()
+    };
+
+    let mut picks: Vec<wf_relic::RelicPick> = Vec::new();
+    let price = !args.is_empty(); // only price an explicit owned set (avoids 700+ calls)
+    let market = MarketClient::new(client.clone(), config.market_platform.clone());
+    let cache = price_cache();
+    for r in owned {
+        let unmastered = r.unmastered(&mastery);
+        if unmastered.is_empty() {
+            continue;
+        }
+        let plat = if price {
+            wf_relic::cached_plat(&cache, &market, &r.slug(), wf_relic::PriceOpts::default()).await
+        } else {
+            None
+        };
+        picks.push(wf_relic::RelicPick {
+            display: r.display.clone(),
+            count: 1,
+            unmastered,
+            plat,
+        });
+    }
+    cache.save();
+    wf_relic::rank_relics(&mut picks);
+
+    if picks.is_empty() {
+        println!("  no relics with unmastered rewards found");
+        return Ok(());
+    }
+    for p in picks.iter().take(if price { picks.len() } else { 40 }) {
+        let plat = p.plat.map(|v| format!("{v}p")).unwrap_or_else(|| "—".into());
+        println!(
+            "  {:<10} {:>5}  {} unmastered: {}",
+            p.display,
+            plat,
+            p.unmastered.len(),
+            p.unmastered.join(", ")
+        );
+    }
+    if !price {
+        println!("\n  (pass relic codes to price them, e.g. `wf-lite relics meso n11 axi h3`)");
+    }
+    Ok(())
+}
+
+/// Map ranked relic picks to overlay rows (top preview reward + counts).
+fn relic_rows(picks: &[wf_relic::RelicPick]) -> Vec<wf_overlay::RelicRow> {
+    picks
+        .iter()
+        .map(|p| wf_overlay::RelicRow {
+            name: p.display.clone(),
+            count: p.count,
+            unmastered: p.unmastered.len() as u32,
+            top_reward: p.unmastered.first().cloned().unwrap_or_default(),
+            plat: p.plat,
+        })
+        .collect()
+}
+
+/// Render the relic-guide overlay panel from a demo owned set, to a PNG.
+async fn relic_guide_png(config: &Config) -> Result<()> {
+    println!("\n== Rendering relic guide panel ==");
+    let client = http_client();
+    let index = wf_relic::RelicIndex::load_cached(&client, CATALOGUE_TTL).await?;
+    let mastery = load_mastery(config, &client).await;
+    let market = MarketClient::new(client.clone(), config.market_platform.clone());
+    let cache = price_cache();
+
+    let mut picks = Vec::new();
+    for code in ["axi a1", "neo v9", "meso n11", "lith g4", "axi h3"] {
+        if let Some(r) = index.best_match(code) {
+            let unmastered = r.unmastered(&mastery);
+            if unmastered.is_empty() {
+                continue;
+            }
+            let plat =
+                wf_relic::cached_plat(&cache, &market, &r.slug(), wf_relic::PriceOpts::default())
+                    .await;
+            picks.push(wf_relic::RelicPick {
+                display: r.display.clone(),
+                count: 1,
+                unmastered,
+                plat,
+            });
+        }
+    }
+    cache.save();
+    wf_relic::rank_relics(&mut picks);
+
+    let font = wf_overlay::load_font()?;
+    let canvas = wf_overlay::render_relic_panel(&relic_rows(&picks), &font);
+    let img = image::RgbaImage::from_raw(canvas.width, canvas.height, canvas.buf)
+        .context("canvas -> image")?;
+    let out = "relic-guide.png";
+    img.save(out).map_err(|e| anyhow::anyhow!("saving {out}: {e}"))?;
+    println!("  {}x{} panel saved to {out}", img.width(), img.height());
+    Ok(())
+}
+
+/// Join relic-code tokens into `"tier code"` pairs, so `["axi","h3","meso","n11"]`
+/// becomes `["axi h3", "meso n11"]`. A token that is itself a known era starts a
+/// new pair.
+fn pair_relic_codes(tokens: &[String]) -> Vec<String> {
+    const ERAS: &[&str] = &["lith", "meso", "neo", "axi", "requiem"];
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for t in tokens {
+        if ERAS.contains(&t.to_lowercase().as_str()) {
+            if !cur.is_empty() {
+                out.push(cur.clone());
+            }
+            cur = t.clone();
+        } else {
+            if !cur.is_empty() {
+                cur.push(' ');
+            }
+            cur.push_str(t);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 /// Save a Warframe account id to the config for mastery lookup.
@@ -385,6 +573,202 @@ async fn relic_file(config: &Config) -> Result<()> {
             .await;
     let mastery = load_mastery(config, &client).await;
     print_reward_table(&evals, &mastery);
+    Ok(())
+}
+
+/// Strip a trailing "Relic"/"Relics" word from an OCR'd relic label so it matches
+/// a [`wf_relic::RelicIndex`] code, e.g. `"Neo T2 Relic"` → `"Neo T2"`.
+fn strip_relic_word(s: &str) -> String {
+    let t = s.trim();
+    let lower = t.to_lowercase();
+    for suf in [" relics", " relic"] {
+        if let Some(stripped) = lower.strip_suffix(suf) {
+            return t[..stripped.len()].trim().to_string();
+        }
+    }
+    t.to_string()
+}
+
+/// Parse an owned-count badge (`"x62"`) into a number; defaults to 1.
+fn parse_count(s: &str) -> u32 {
+    s.chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Normalized (mean-subtracted, unit-norm) grayscale of the bundled "unowned"
+/// eye-icon template, plus its dimensions. Decoded once.
+fn eye_template() -> &'static (Vec<f32>, usize, usize) {
+    static T: std::sync::OnceLock<(Vec<f32>, usize, usize)> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let img = image::load_from_memory(include_bytes!("../assets/relic-unowned-eye.png"))
+            .expect("bundled eye template decodes")
+            .to_luma8();
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let vals: Vec<f32> = img.pixels().map(|p| p[0] as f32).collect();
+        let mean = vals.iter().sum::<f32>() / vals.len() as f32;
+        let centered: Vec<f32> = vals.iter().map(|v| v - mean).collect();
+        let norm = centered.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-6);
+        (centered.iter().map(|v| v / norm).collect(), w, h)
+    })
+}
+
+/// Peak brightness-invariant (normalized cross-correlation) match of the "unowned"
+/// eye template anywhere in the `eye` search window. NCC is contrast-invariant (a
+/// card brightens on hover, but the eye persists) and the window tolerates
+/// column-pitch drift. `1.0` = perfect match.
+fn eye_ncc(image: &image::RgbaImage, eye: &wf_relic::Rect) -> f32 {
+    let (tmpl, tw, th) = eye_template();
+    let (rw, rh) = (eye.w as usize, eye.h as usize);
+    if rw < *tw || rh < *th {
+        return -1.0;
+    }
+    // Luma of the search window (clamped to the frame).
+    let mut luma = vec![0f32; rw * rh];
+    for y in 0..rh {
+        for x in 0..rw {
+            let px = image
+                .get_pixel_checked(eye.x + x as u32, eye.y + y as u32)
+                .map(|p| 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32)
+                .unwrap_or(0.0);
+            luma[y * rw + x] = px;
+        }
+    }
+    let mut best = -1.0f32;
+    for oy in 0..=(rh - th) {
+        for ox in 0..=(rw - tw) {
+            let mut sum = 0.0;
+            for ty in 0..*th {
+                for tx in 0..*tw {
+                    sum += luma[(oy + ty) * rw + ox + tx];
+                }
+            }
+            let mean = sum / (tw * th) as f32;
+            let (mut dot, mut nrm) = (0.0f32, 0.0f32);
+            for ty in 0..*th {
+                for tx in 0..*tw {
+                    let pv = luma[(oy + ty) * rw + ox + tx] - mean;
+                    dot += pv * tmpl[ty * tw + tx];
+                    nrm += pv * pv;
+                }
+            }
+            let ncc = if nrm > 1e-6 { dot / nrm.sqrt() } else { 0.0 };
+            best = best.max(ncc);
+        }
+    }
+    best
+}
+
+/// Threshold on [`eye_ncc`] above which a card is treated as unowned.
+const EYE_THRESHOLD: f32 = 0.5;
+
+/// Whether the "unowned" eye icon appears in `eye` (player does not own the relic).
+fn card_has_eye(image: &image::RgbaImage, eye: &wf_relic::Rect) -> bool {
+    eye_ncc(image, eye) >= EYE_THRESHOLD
+}
+
+/// OCR the Void Relics grid in `image` and resolve each visible card to a relic +
+/// owned count (deduped, keeping the max count seen). Cards showing the "unowned"
+/// eye icon are skipped. The union across many frames while the player scrolls
+/// builds their owned set.
+fn scan_relic_grid(
+    image: &image::RgbaImage,
+    ocr: &wf_ocr::Ocr,
+    regions: &wf_relic::RelicGridRegions,
+    index: &wf_relic::RelicIndex,
+) -> Vec<(String, u32)> {
+    let pre = wf_ocr::Preprocess { scale: 4, threshold: 140, light_text: true };
+    let slots = regions.slots(image.width(), image.height());
+
+    // OCR every card concurrently — each slot shells out to tesseract, so ~32
+    // calls run in parallel across cores instead of ~2s×32 serially.
+    let resolved: Vec<Option<(String, u32)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = slots
+            .iter()
+            .map(|slot| {
+                scope.spawn(move || {
+                    // Skip relics the player doesn't own (marked with an eye icon).
+                    if card_has_eye(image, &slot.eye) {
+                        return None;
+                    }
+                    let name_crop = image::imageops::crop_imm(
+                        image, slot.name.x, slot.name.y, slot.name.w, slot.name.h,
+                    )
+                    .to_image();
+                    let raw = ocr
+                        .recognize(&name_crop, pre, wf_ocr::PageMode::Line)
+                        .unwrap_or_default()
+                        .replace('\n', " ");
+                    let info = index.best_match(&strip_relic_word(&raw))?;
+                    let count_crop = image::imageops::crop_imm(
+                        image, slot.count.x, slot.count.y, slot.count.w, slot.count.h,
+                    )
+                    .to_image();
+                    let count = parse_count(
+                        &ocr.recognize(&count_crop, pre, wf_ocr::PageMode::Line)
+                            .unwrap_or_default(),
+                    );
+                    Some((info.display.clone(), count))
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut out: Vec<(String, u32)> = Vec::new();
+    for (display, count) in resolved.into_iter().flatten() {
+        match out.iter_mut().find(|(d, _)| *d == display) {
+            Some(e) => e.1 = e.1.max(count),
+            None => out.push((display, count)),
+        }
+    }
+    out
+}
+
+/// Calibration: OCR the Void Relics grid from a PNG and print what resolved.
+/// `wf-lite relic-grid-file <path-to-relics.png>`.
+async fn relic_grid_file() -> Result<()> {
+    let path = std::env::args()
+        .nth(2)
+        .context("usage: relic-grid-file <path-to-relics.png>")?;
+    println!("\n== Relic grid file: {path} ==");
+    let image = image::open(&path)
+        .with_context(|| format!("opening {path}"))?
+        .to_rgba8();
+    let client = http_client();
+    let index = wf_relic::RelicIndex::load_cached(&client, CATALOGUE_TTL).await?;
+    let ocr = wf_ocr::Ocr::new()?;
+    let regions = wf_relic::RelicGridRegions::default_calibration();
+
+    // Per-slot debug (eye NCC + OCR) to calibrate ownership + regions.
+    let pre = wf_ocr::Preprocess { scale: 4, threshold: 140, light_text: true };
+    for (i, slot) in regions.slots(image.width(), image.height()).iter().enumerate() {
+        let ncc = eye_ncc(&image, &slot.eye);
+        let raw = ocr
+            .recognize(
+                &image::imageops::crop_imm(&image, slot.name.x, slot.name.y, slot.name.w, slot.name.h)
+                    .to_image(),
+                pre,
+                wf_ocr::PageMode::Line,
+            )
+            .unwrap_or_default()
+            .replace('\n', " ");
+        let matched = index.best_match(&strip_relic_word(&raw)).map(|r| r.display.as_str());
+        println!(
+            "  slot {i:2}: eye={ncc:+.2} {} ocr={raw:?} -> {}",
+            if ncc >= EYE_THRESHOLD { "UNOWNED" } else { "owned  " },
+            matched.unwrap_or("—")
+        );
+    }
+
+    let found = scan_relic_grid(&image, &ocr, &regions, &index);
+    println!("  resolved {} owned relics:", found.len());
+    for (display, count) in &found {
+        println!("    {display:<16} x{count}");
+    }
     Ok(())
 }
 
@@ -563,6 +947,8 @@ const OVERLAY_W: u32 = wf_overlay::render::WIDTH;
 const OVERLAY_H: u32 = 340;
 /// How long a detected reward result stays on the overlay.
 const REWARD_DISPLAY: Duration = Duration::from_secs(20);
+/// How long the owned-relic guide stays on the overlay after the last scan update.
+const RELIC_DISPLAY: Duration = Duration::from_secs(30);
 /// How long the overlay polls for the game window before falling back to the
 /// compositor's default output (lets it be launched together with the game).
 const WINDOW_WAIT: Duration = Duration::from_secs(30);
@@ -587,6 +973,13 @@ async fn load_mastery(config: &Config, client: &reqwest::Client) -> wf_relic::Ma
 }
 
 type RewardState = std::sync::Arc<std::sync::Mutex<Option<(std::time::Instant, Vec<wf_overlay::RewardRow>)>>>;
+type RelicState = std::sync::Arc<std::sync::Mutex<Option<(std::time::Instant, Vec<wf_overlay::RelicRow>)>>>;
+
+/// The overlay panel states the log watcher publishes into.
+struct Watchers {
+    reward: RewardState,
+    relic: RelicState,
+}
 
 /// Show the live overlay as a `wlr-layer-shell` surface: world state normally,
 /// automatically swapping to the relic reward result for a few seconds when a
@@ -600,6 +993,7 @@ async fn run_overlay(config: Config) -> Result<()> {
     let platform = config.platform.clone();
     let refresh = Duration::from_secs(config.worldstate_refresh_secs.max(15));
     let reward: RewardState = Arc::new(Mutex::new(None));
+    let relic: RelicState = Arc::new(Mutex::new(None));
 
     // Appearance/visibility knobs. `visible` is flipped at runtime by the control
     // socket (see `overlay_control`); `show_world` and `opacity` come from config.
@@ -610,23 +1004,36 @@ async fn run_overlay(config: Config) -> Result<()> {
     // Build one overlay frame from the current state, honoring reward-only mode,
     // the visibility toggle, and opacity. A hidden or empty frame is a fully
     // transparent (click-through) canvas.
+    // Panel priority when shown: reward screen (time-critical, ~20s) → owned-relic
+    // guide (while/after a Relics-screen scan) → world state → blank.
     let make_frame = {
         let font = font.clone();
         let reward = reward.clone();
+        let relic = relic.clone();
         move |ws: &worldstate::WorldState, shown: bool| -> wf_overlay::Canvas {
+            let blank = || wf_overlay::Canvas::new(OVERLAY_W, OVERLAY_H);
             let mut c = if !shown {
-                wf_overlay::Canvas::new(OVERLAY_W, OVERLAY_H)
+                blank()
+            } else if let Some(rows) = reward
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|(t, _)| t.elapsed() < REWARD_DISPLAY)
+                .map(|(_, r)| r.clone())
+            {
+                wf_overlay::render_reward_panel(&rows, &font).embed(OVERLAY_W, OVERLAY_H)
+            } else if let Some(rows) = relic
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|(t, _)| t.elapsed() < RELIC_DISPLAY)
+                .map(|(_, r)| r.clone())
+            {
+                wf_overlay::render_relic_panel(&rows, &font).embed(OVERLAY_W, OVERLAY_H)
+            } else if show_world {
+                wf_overlay::render_panel(ws, &font).embed(OVERLAY_W, OVERLAY_H)
             } else {
-                let r = reward.lock().unwrap();
-                match r.as_ref() {
-                    Some((t, rows)) if t.elapsed() < REWARD_DISPLAY => {
-                        wf_overlay::render_reward_panel(rows, &font).embed(OVERLAY_W, OVERLAY_H)
-                    }
-                    _ if show_world => {
-                        wf_overlay::render_panel(ws, &font).embed(OVERLAY_W, OVERLAY_H)
-                    }
-                    _ => wf_overlay::Canvas::new(OVERLAY_W, OVERLAY_H),
-                }
+                blank()
             };
             c.scale_alpha(opacity);
             c
@@ -683,15 +1090,22 @@ async fn run_overlay(config: Config) -> Result<()> {
             Ok(index) => {
                 let cache = Arc::new(price_cache());
                 let mastery = Arc::new(load_mastery(&config, &client).await);
+                // Relic drop tables for the owned-relic guide (best-effort).
+                let relic_index = wf_relic::RelicIndex::load_cached(&client, CATALOGUE_TTL)
+                    .await
+                    .ok()
+                    .map(Arc::new);
                 println!(
-                    "  relic auto-detect: ON ({} items; {} cached prices; {} mastered; watching {})",
+                    "  relic auto-detect: ON ({} items; {} relics; {} cached prices; {} mastered; watching {})",
                     index.len(),
+                    relic_index.as_ref().map_or(0, |r| r.len()),
                     cache.len(),
                     mastery.len(),
                     ee_log.display()
                 );
                 let market = MarketClient::new(client.clone(), config.market_platform.clone());
                 let reward = reward.clone();
+                let relic = relic.clone();
                 tokio::spawn(async move {
                     if let Err(e) = relic_watch_loop(
                         ee_log,
@@ -700,8 +1114,10 @@ async fn run_overlay(config: Config) -> Result<()> {
                         market,
                         cache,
                         mastery,
-                        reward,
+                        Watchers { reward, relic },
                         wf_relic::RewardRegions::default_calibration(),
+                        relic_index,
+                        wf_relic::RelicGridRegions::default_calibration(),
                     )
                     .await
                     {
@@ -822,9 +1238,12 @@ async fn wait_for_window(timeout: Duration) -> Option<(i32, i32, u32, u32)> {
     }
 }
 
-/// Watch the EE.log for a relic crack (`DVRCAftermath`); on each, scan the
-/// reward screen with retries until at least two names resolve (the OCR guard
-/// confirms the screen is up), then publish the ranked result to `reward`.
+/// Watch the EE.log and drive both screen scans:
+/// * a relic **crack** / reward-screen line opens a poll window, scanned until the
+///   4-choice screen resolves, publishing the ranked reward to `watchers.reward`;
+/// * a **Relics inventory** open (`RelicInventoryOpen`) starts an owned-relic scan
+///   that OCRs the grid every couple of seconds while the player scrolls, unioning
+///   the owned set and publishing the ranked guide to `watchers.relic`.
 #[allow(clippy::too_many_arguments)]
 async fn relic_watch_loop(
     ee_log: std::path::PathBuf,
@@ -833,9 +1252,12 @@ async fn relic_watch_loop(
     market: MarketClient,
     cache: std::sync::Arc<wf_relic::PriceCache>,
     mastery: std::sync::Arc<wf_relic::MasterySet>,
-    reward: RewardState,
+    watchers: Watchers,
     regions: wf_relic::RewardRegions,
+    relic_index: Option<std::sync::Arc<wf_relic::RelicIndex>>,
+    relic_regions: wf_relic::RelicGridRegions,
 ) -> Result<()> {
+    use std::collections::HashMap;
     use std::time::Instant;
     use wf_log::Event;
 
@@ -846,11 +1268,20 @@ async fn relic_watch_loop(
     const POLL_INTERVAL: Duration = Duration::from_secs(2);
     // Don't re-show the same 15s screen repeatedly.
     const SHOW_DEBOUNCE: Duration = Duration::from_secs(20);
+    // Owned-relic scan: end it once no new relic has been seen for this long
+    // (the player stopped scrolling / left the screen), capped at the window.
+    const RELIC_SCAN_WINDOW: Duration = Duration::from_secs(180);
+    const RELIC_SCAN_IDLE: Duration = Duration::from_secs(12);
 
     let mut tailer = wf_log::LogTailer::from_end(&ee_log);
     let mut scan_until: Option<Instant> = None;
     let mut window_open = false; // whether we've logged the current window
     let mut last_shown = Instant::now() - SHOW_DEBOUNCE;
+
+    // Owned-relic scan state.
+    let mut relic_until: Option<Instant> = None;
+    let mut relic_owned: HashMap<String, u32> = HashMap::new();
+    let mut relic_last_new = Instant::now();
 
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -865,11 +1296,60 @@ async fn relic_watch_loop(
                         tracing::info!("relic activity — watching for the reward screen");
                     }
                 }
+                Some(Event::RelicInventoryOpen) if relic_index.is_some() => {
+                    if relic_until.is_none() {
+                        relic_owned.clear();
+                        tracing::info!("relics screen opened — scanning as you scroll");
+                    }
+                    relic_until = Some(Instant::now() + RELIC_SCAN_WINDOW);
+                    relic_last_new = Instant::now();
+                }
                 _ => {}
             }
         }
 
-        // Are we inside an active polling window?
+        // --- Owned-relic scan (while the Relics screen is up) --------------
+        if let (Some(deadline), Some(ridx)) = (relic_until, relic_index.as_ref()) {
+            let expired = Instant::now() >= deadline || relic_last_new.elapsed() > RELIC_SCAN_IDLE;
+            if expired {
+                relic_until = None;
+            } else {
+                let (ocr2, regions2, ridx2) = (ocr.clone(), relic_regions.clone(), ridx.clone());
+                let scanned = tokio::task::spawn_blocking(move || {
+                    wf_capture::capture_warframe(None)
+                        .map(|cap| scan_relic_grid(&cap.image, &ocr2, &regions2, &ridx2))
+                })
+                .await;
+                if let Ok(Ok(found)) = scanned {
+                    let mut changed = false;
+                    for (display, count) in found {
+                        let e = relic_owned.entry(display).or_insert(0);
+                        if count > *e {
+                            *e = count;
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        relic_last_new = Instant::now();
+                        let rows = build_relic_rows(
+                            &relic_owned, ridx, &mastery, &cache, &market, RELIC_ROWS,
+                        )
+                        .await;
+                        tracing::info!(
+                            "relic scan: {} owned; showing {}",
+                            relic_owned.len(),
+                            rows.iter()
+                                .map(|r| format!("{} ({})", r.name, r.top_reward))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        *watchers.relic.lock().unwrap() = Some((Instant::now(), rows));
+                    }
+                }
+            }
+        }
+
+        // --- Reward screen scan -------------------------------------------
         let active = scan_until.is_some_and(|t| Instant::now() < t);
         if !active {
             window_open = false;
@@ -905,9 +1385,41 @@ async fn relic_watch_loop(
         if let Some(best) = wf_relic::best_by_plat(&evals) {
             tracing::info!("reward screen captured — best plat pick = {}", rows[best].name);
         }
-        *reward.lock().unwrap() = Some((Instant::now(), rows));
+        *watchers.reward.lock().unwrap() = Some((Instant::now(), rows));
         last_shown = Instant::now();
     }
+}
+
+/// How many relic rows fit the overlay panel height.
+const RELIC_ROWS: usize = 12;
+
+/// Build the ranked owned-relic guide rows: for each owned relic that can still
+/// drop an unmastered prime, its unmastered count + a market price, top-N by value.
+async fn build_relic_rows(
+    owned: &std::collections::HashMap<String, u32>,
+    index: &wf_relic::RelicIndex,
+    mastery: &wf_relic::MasterySet,
+    cache: &wf_relic::PriceCache,
+    market: &MarketClient,
+    max_rows: usize,
+) -> Vec<wf_overlay::RelicRow> {
+    let mut picks: Vec<wf_relic::RelicPick> = Vec::new();
+    for r in index.all() {
+        let Some(&count) = owned.get(&r.display) else {
+            continue;
+        };
+        let unmastered = r.unmastered(mastery);
+        if unmastered.is_empty() {
+            continue;
+        }
+        let plat =
+            wf_relic::cached_plat(cache, market, &r.slug(), wf_relic::PriceOpts::default()).await;
+        picks.push(wf_relic::RelicPick { display: r.display.clone(), count, unmastered, plat });
+    }
+    cache.save();
+    wf_relic::rank_relics(&mut picks);
+    picks.truncate(max_rows);
+    relic_rows(&picks)
 }
 
 /// OCR each candidate reward-name slot of an already-captured frame. Slots are

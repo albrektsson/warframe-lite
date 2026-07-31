@@ -4,10 +4,12 @@
 pub mod index;
 pub mod mastery;
 pub mod regions;
+pub mod relics;
 
 pub use index::ItemIndex;
 pub use mastery::MasterySet;
-pub use regions::{Rect, RewardRegions};
+pub use regions::{Rect, RelicGridRegions, RelicSlot, RewardRegions};
+pub use relics::{rank as rank_relics, RelicIndex, RelicInfo, RelicPick};
 
 use std::time::Duration;
 
@@ -180,7 +182,17 @@ pub async fn evaluate_cached(
 pub fn select_rewards(slot_texts: &[String], index: &ItemIndex) -> Vec<String> {
     let scored: Vec<Option<f32>> = slot_texts
         .iter()
-        .map(|t| index.best_match(t).map(|m| m.score))
+        .map(|t| {
+            // Forma/Kuva/Endo/Exilus are real rewards but aren't in the tradable
+            // catalogue — recognize them so a mostly-Forma screen still resolves
+            // ≥2 slots and triggers.
+            if untradable_label(t).is_some() {
+                return Some(0.9);
+            }
+            // A fissure reward is never a relic; reject relic matches so the Void
+            // Relics inventory grid can't be mistaken for a reward screen.
+            index.best_match(t).filter(|m| !is_relic(m.item)).map(|m| m.score)
+        })
         .collect();
 
     let mut kept: Vec<usize> = Vec::new();
@@ -215,18 +227,24 @@ enum Resolution {
     Unresolved,
 }
 
+/// Whether a catalogue item is a Void Relic (tagged `relic`) — such items are
+/// never fissure rewards, so they must not resolve in the reward path.
+fn is_relic(item: &wf_data::items::Item) -> bool {
+    item.tags.iter().any(|t| t == "relic")
+}
+
 fn resolve(name: &str, index: &ItemIndex) -> Resolution {
     if let Some(label) = untradable_label(name) {
         return Resolution::Untradable(label);
     }
     match index.best_match(name) {
-        Some(m) => Resolution::Matched {
+        Some(m) if !is_relic(m.item) => Resolution::Matched {
             name: m.item.name.clone(),
             slug: m.item.slug.clone(),
             score: m.score,
             ducats: m.item.ducats,
         },
-        None => Resolution::Unresolved,
+        _ => Resolution::Unresolved,
     }
 }
 
@@ -273,6 +291,18 @@ async fn cached_price(
     }
 }
 
+/// Lowest sell price (platinum) for `slug` via the disk price cache: fresh →
+/// instant, stale/missing → bounded fetch falling back to stale. Used to price
+/// relics for the owned-relic guide.
+pub async fn cached_plat(
+    cache: &PriceCache,
+    market: &MarketClient,
+    slug: &str,
+    opts: PriceOpts,
+) -> Option<u32> {
+    cached_price(cache, market, slug, opts).await.and_then(|s| s.lowest_sell)
+}
+
 /// Index of the highest-platinum reward, if any have a price.
 pub fn best_by_plat(evals: &[RewardEval]) -> Option<usize> {
     evals
@@ -296,6 +326,38 @@ pub fn best_by_ducats(evals: &[RewardEval]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wf_data::items::Item;
+
+    fn item(name: &str, tags: &[&str]) -> Item {
+        Item {
+            slug: index::normalize(name),
+            name: name.to_string(),
+            ducats: None,
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn select_rewards_counts_forma_and_rejects_relics() {
+        let idx = ItemIndex::new(vec![
+            item("Mirage Prime Blueprint", &["prime"]),
+            item("Meso N11 Relic", &["relic"]),
+        ]);
+        // A relic name must never resolve as a fissure reward.
+        assert!(select_rewards(&["Meso N11 Relic".to_string()], &idx).is_empty());
+        // Forma (untradable) counts toward the ≥2 guard alongside a prime part,
+        // so a mostly-Forma screen still triggers. (An empty slot between them, so
+        // the adjacent-slot dedup doesn't merge the two cards.)
+        let sel = select_rewards(
+            &[
+                "Forma Blueprint".to_string(),
+                String::new(),
+                "Mirage Prime Blueprint".to_string(),
+            ],
+            &idx,
+        );
+        assert_eq!(sel.len(), 2);
+    }
 
     fn eval(plat: Option<u32>, ducats: Option<u32>) -> RewardEval {
         RewardEval {

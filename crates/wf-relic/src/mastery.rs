@@ -44,16 +44,20 @@ impl MasterySet {
         let mut mastered = HashSet::new();
         for (path, xp) in entries {
             if xp >= cap_for(&path) {
-                mastered.insert(leaf_norm(&path));
+                mastered.insert(canonical(leaf_of(&path)));
             }
         }
         Self { mastered }
     }
 
-    /// Whether the built item a reward part belongs to has been mastered, e.g.
-    /// `"Ember Prime Systems Blueprint"` → base `"emberprime"`.
+    /// Whether the built item a reward part belongs to has been mastered.
+    ///
+    /// Both sides reduce to a [`canonical`] token set, so an internal path leaf
+    /// (`"PrimeGram"`, `"RubicoPrimeWeapon"`) matches a reward display
+    /// (`"Gram Prime Blueprint"`, `"Rubico Prime"`) regardless of word order or a
+    /// trailing suffix.
     pub fn is_mastered(&self, reward_item_name: &str) -> bool {
-        self.mastered.contains(&base_norm(reward_item_name))
+        self.mastered.contains(&canonical(reward_item_name))
     }
 }
 
@@ -124,7 +128,9 @@ pub async fn load_cached(
     account_id: &str,
     ttl: std::time::Duration,
 ) -> MasterySet {
-    let file = format!("mastery-{account_id}.json");
+    // `-v3`: the on-disk set stores normalized keys, and the normalization
+    // (see `canonical`) changed — bump the name so old caches are ignored.
+    let file = format!("mastery-v3-{account_id}.json");
     if let Some(cached) = wf_cache::load_blob::<MasterySet>(&file) {
         if cached.age() < ttl {
             tracing::info!("mastery from cache ({} items)", cached.value.len());
@@ -196,14 +202,52 @@ fn cap_for(path: &str) -> u64 {
     }
 }
 
-/// Normalize the leaf of an internal path: `/Lotus/Powersuits/Ember/EmberPrime`
-/// → `"emberprime"`.
-fn leaf_norm(path: &str) -> String {
-    let leaf = path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
-    leaf.chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .map(|c| c.to_ascii_lowercase())
-        .collect()
+/// The leaf of an internal path: `/Lotus/Powersuits/Ember/EmberPrime` → `EmberPrime`.
+fn leaf_of(path: &str) -> &str {
+    path.trim_end_matches('/').rsplit('/').next().unwrap_or("")
+}
+
+/// Split a name into words on non-alphanumerics **and** camelCase boundaries, so
+/// `"RubicoPrimeWeapon"` → `["Rubico","Prime","Weapon"]` and `"PrimeGram"` →
+/// `["Prime","Gram"]`, matching space-separated display names.
+fn split_words(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut prev_alnum_lower = false;
+    for c in s.chars() {
+        if !c.is_ascii_alphanumeric() {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            prev_alnum_lower = false;
+            continue;
+        }
+        if c.is_ascii_uppercase() && prev_alnum_lower && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur)); // camelCase boundary
+        }
+        cur.push(c);
+        prev_alnum_lower = !c.is_ascii_uppercase();
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// A canonical mastery key: split into words, lowercase, drop component/suffix
+/// words (keeping the distinguishing name + `"prime"`), sort, then **concatenate**
+/// — so an internal path leaf and a reward display name reduce to the same key
+/// regardless of word order (`PrimeGram` vs `Gram Prime`), a suffix
+/// (`RubicoPrimeWeapon`), or an extra camelCase split within a display word
+/// (`PrimeAkBoltoWeapon` → `ak`+`bolto`, which re-joins to match `Akbolto`).
+fn canonical(s: &str) -> String {
+    let mut toks: Vec<String> = split_words(s)
+        .into_iter()
+        .map(|w| w.to_ascii_lowercase())
+        .filter(|w| w != "weapon" && !COMPONENTS.contains(&w.as_str()))
+        .collect();
+    toks.sort();
+    toks.concat()
 }
 
 /// Component words stripped from a reward part name to get the built item's
@@ -215,14 +259,15 @@ const COMPONENTS: &[&str] = &[
     "disc", "band", "buckle", "clamp", "collar",
 ];
 
-/// `"Ember Prime Systems Blueprint"` → `"emberprime"`.
-fn base_norm(name: &str) -> String {
-    name.split_whitespace()
+/// The built prime's **display** name for a reward part, e.g.
+/// `"Ember Prime Systems Blueprint"` → `"Ember Prime"`. Used to dedup and label
+/// a relic's rewards by the item they build into.
+pub fn built_name(reward: &str) -> String {
+    reward
+        .split_whitespace()
         .filter(|w| !COMPONENTS.contains(&w.to_ascii_lowercase().as_str()))
-        .flat_map(|w| w.chars())
-        .filter(|c| c.is_ascii_alphanumeric())
-        .map(|c| c.to_ascii_lowercase())
-        .collect()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -236,20 +281,34 @@ mod tests {
     }
 
     #[test]
-    fn base_name_strips_components() {
-        assert_eq!(base_norm("Ember Prime Systems Blueprint"), "emberprime");
-        assert_eq!(base_norm("Paris Prime Lower Limb"), "parisprime");
-        assert_eq!(base_norm("Braton Prime Receiver"), "bratonprime");
+    fn canonical_is_order_suffix_and_split_invariant() {
+        // Reversed order, a trailing suffix, and an extra camelCase split within a
+        // display word all reduce to the same key as the display name.
+        assert_eq!(canonical("PrimeGram"), canonical("Gram Prime Blueprint"));
+        assert_eq!(canonical("RubicoPrimeWeapon"), canonical("Rubico Prime Blueprint"));
+        assert_eq!(canonical("EmberPrime"), canonical("Ember Prime Systems Blueprint"));
+        // `Ak`+`Bolto` re-joins to match the single display word `Akbolto`.
+        assert_eq!(canonical("PrimeAkBoltoWeapon"), canonical("Akbolto Prime Blueprint"));
+        // Different primes don't collide.
+        assert_ne!(canonical("Gram Prime"), canonical("Rubico Prime"));
     }
 
     #[test]
-    fn mastery_lookup_via_base_name() {
+    fn mastery_matches_reversed_suffixed_and_split_paths() {
+        // The cases that slipped through: Prime-first, -Weapon suffix, and a
+        // camelCase split within a display word (`PrimeAkBoltoWeapon`).
         let set = MasterySet::from_xp([
-            ("/Lotus/Powersuits/Ember/EmberPrime".to_string(), 9_000_000), // mastered
-            ("/Lotus/Weapons/Tenno/LongGuns/BratonPrime".to_string(), 100_000), // not
+            ("/Lotus/Weapons/Tenno/Melee/Swords/PrimeGram/PrimeGram".to_string(), 16_000_000),
+            ("/Lotus/Weapons/Tenno/LongGuns/RubicoPrime/RubicoPrimeWeapon".to_string(), 3_000_000),
+            ("/Lotus/Weapons/Tenno/Pistols/PrimeAkbolto/PrimeAkBoltoWeapon".to_string(), 648_728),
+            ("/Lotus/Powersuits/Ember/EmberPrime".to_string(), 9_000_000),
+            ("/Lotus/Weapons/Tenno/LongGuns/BratonPrime".to_string(), 100_000), // below cap
         ]);
+        assert!(set.is_mastered("Gram Prime Blueprint"));
+        assert!(set.is_mastered("Rubico Prime Blueprint"));
+        assert!(set.is_mastered("Akbolto Prime Blueprint"));
         assert!(set.is_mastered("Ember Prime Systems Blueprint"));
-        assert!(!set.is_mastered("Braton Prime Receiver"));
-        assert!(!set.is_mastered("Volnus Prime Blueprint"));
+        assert!(!set.is_mastered("Braton Prime Receiver")); // below cap → not mastered
+        assert!(!set.is_mastered("Volnus Prime Blueprint")); // absent
     }
 }

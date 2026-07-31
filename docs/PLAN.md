@@ -169,6 +169,15 @@ game**. Summary of what shipped:
   window and reads a full 3440×1440 frame via `GetImage` — legible content, **no
   black-frame/DXVK issue**, no portal prompt.
 
+- **Owned-relic mastery guide (Phases 1–3 done) 🚧.** `wf-relic::relics`
+  (`RelicIndex` from WFCD `warframe-drop-data`, cached weekly) cross-references a
+  relic's rewards with the mastered set to list the distinct unmastered built
+  primes it can still drop, priced via the existing relic market slugs. `wf-lite
+  relics <codes…>` prints the ranked guide; `render_relic_panel` shows it as an
+  overlay panel (`wf-lite relic-guide-png` to preview). **Remaining:** OCR the
+  in-game Relics screen to read *owned* relics (needs a calibration screenshot),
+  then a tray/socket "Scan relics" trigger that feeds the overlay panel.
+
 **Remaining / later polish:** config-overridable reward regions; per-resolution
 calibration (currently tuned for 3440×1440); **mastery-weighted ranking** (prefer
 a slightly-cheaper *unmastered* reward, since the "best pick" is currently pure

@@ -72,6 +72,11 @@ pub enum Event {
     /// also bring the screen up manually (Tab / progress) and log lines flush
     /// in bursts, so we can't rely on one precise moment.
     RelicCrack,
+
+    /// The Void **Relics inventory** screen was opened (the relic-management
+    /// grid). Confirmed marker: `ThemedProjectionManager.lua` populates its
+    /// inventory grid when the screen appears — used to start an owned-relic scan.
+    RelicInventoryOpen,
 }
 
 /// Substrings that mark the reward **selection screen appearing**. Confirmed
@@ -86,6 +91,12 @@ pub const RELIC_REWARD_MARKERS: &[&str] = &[
 /// Substrings that mark a relic **crack** (reward screen imminent).
 pub const RELIC_CRACK_MARKERS: &[&str] = &["DVRCAftermath"];
 
+/// Substring that marks the Void **Relics inventory** screen opening. Fires when
+/// `ThemedProjectionManager` populates its relic grid. (It also emits a
+/// `…GridEnd` line ~0.1s later, which contains this substring too; the consumer
+/// debounces, so a double-fire is harmless.)
+pub const RELIC_INVENTORY_MARKER: &str = "ThemedProjectionManager.lua: PopulateInventoryGrid";
+
 /// Classify a parsed line into an [`Event`], if it matches a known pattern.
 pub fn classify(line: &LogLine<'_>) -> Option<Event> {
     // Relic markers appear on several subsystems (HudRedux/Transmission on
@@ -96,6 +107,9 @@ pub fn classify(line: &LogLine<'_>) -> Option<Event> {
     }
     if RELIC_CRACK_MARKERS.iter().any(|m| line.message.contains(m)) {
         return Some(Event::RelicCrack);
+    }
+    if line.message.contains(RELIC_INVENTORY_MARKER) {
+        return Some(Event::RelicInventoryOpen);
     }
     match line.subsystem {
         "Sys" if line.message.starts_with("Logged in ") => {
@@ -162,6 +176,20 @@ mod tests {
         ] {
             assert_eq!(event_from_line(line), Some(Event::RelicRewardScreen));
         }
+    }
+
+    #[test]
+    fn detects_relic_inventory_open() {
+        // Real line: opening the Void Relics management screen.
+        assert_eq!(
+            event_from_line("49.227 Script [Info]: ThemedProjectionManager.lua: PopulateInventoryGrid"),
+            Some(Event::RelicInventoryOpen)
+        );
+        // The ~0.1s-later GridEnd line also matches (consumer debounces).
+        assert_eq!(
+            event_from_line("49.306 Script [Info]: ThemedProjectionManager.lua: PopulateInventoryGridEnd"),
+            Some(Event::RelicInventoryOpen)
+        );
     }
 
     #[test]

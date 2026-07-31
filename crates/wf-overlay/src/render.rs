@@ -216,6 +216,59 @@ pub fn render_reward_panel(rows: &[RewardRow], font: &Font) -> Canvas {
     canvas
 }
 
+/// One row of the owned-relic guide panel.
+#[derive(Debug, Clone)]
+pub struct RelicRow {
+    /// Relic label, e.g. "Axi A1".
+    pub name: String,
+    /// Owned count.
+    pub count: u32,
+    /// Number of distinct unmastered built primes this relic can drop.
+    pub unmastered: u32,
+    /// The first unmastered prime, shown as a preview (e.g. "Nidus Prime").
+    pub top_reward: String,
+    /// Lowest market sell price in platinum, if resolved.
+    pub plat: Option<u32>,
+}
+
+/// Render the owned-relic guide: relics that can still drop something you haven't
+/// mastered, each with its owned count, a preview of the unmastered reward(s), and
+/// the relic's market price.
+pub fn render_relic_panel(rows: &[RelicRow], font: &Font) -> Canvas {
+    let n = rows.len().max(1) as i32;
+    let height = (PAD * 2 + (n + 1) * LINE_H) as u32;
+    let mut canvas = Canvas::new(WIDTH, height);
+    canvas.fill_round_rect(0, 0, WIDTH, height, 12, BG);
+
+    let mut y = PAD + 14;
+    canvas.draw_text(font, "RELICS — UNMASTERED REWARDS", PAD as f32, y as f32, TITLE_PX, TITLE);
+    y += LINE_H;
+
+    let charw = font.metrics('0', FONT_PX).advance_width;
+    let plat_x = WIDTH as f32 - PAD as f32 - 6.0 * charw; // "NNNNp"
+    let reward_x = PAD as f32 + 13.0 * charw; // after "Requiem III x9"
+    let reward_cols = ((plat_x - reward_x) / charw).floor() as usize;
+
+    for r in rows {
+        let name = format!("{}  x{}", r.name, r.count);
+        canvas.draw_text(font, &name, PAD as f32, y as f32, FONT_PX, TEXT);
+
+        // Preview the unmastered reward(s): first prime, "+N" if there are more.
+        let extra = if r.unmastered > 1 {
+            format!(" +{}", r.unmastered - 1)
+        } else {
+            String::new()
+        };
+        let summary = format!("{}{}", r.top_reward, extra);
+        canvas.draw_text(font, &truncate(&summary, reward_cols), reward_x, y as f32, FONT_PX, DIM);
+
+        let plat = r.plat.map(|p| format!("{p}p")).unwrap_or_else(|| "—".into());
+        canvas.draw_text(font, &plat, plat_x, y as f32, FONT_PX, PLAT);
+        y += LINE_H;
+    }
+    canvas
+}
+
 fn pad_right(s: &str, n: usize) -> String {
     let mut s = s.to_string();
     while s.chars().count() < n {
