@@ -39,6 +39,22 @@ rank-30 cap; never resets on Forma. Read from DE's public profile API
 _Avoid_: Ranked, maxed (those describe the affinity climb, not the permanent
 mastery state).
 
+**Unmastered**:
+A built prime whose lifetime affinity has not yet crossed the mastery cap —
+the target of relic-cracking and fissure planning.
+
+**Owned relic**:
+A Relic the player currently holds, known only from OCR-scanning the in-game
+Void Relics screen (see ADR-0001) — never read from process memory or a login
+API. Ownership is a count per relic code (e.g. "Axi H3"), not per copy.
+_Avoid_: Relic inventory (reads as authoritative/API-sourced; "owned relic"
+keeps it clear the count is scan-derived and can lag or miss entries).
+
+**Mastery plan**:
+The ranked view of owned relics grouped by the Unmastered prime they can still
+drop, sourcing relics ordered by owned count — the basis for deciding which
+Fissures to run next.
+
 ### World state
 
 **World state**:
