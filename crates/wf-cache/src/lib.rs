@@ -46,6 +46,21 @@ impl<V> Stamped<V> {
     }
 }
 
+/// Format a [`Duration`] (typically from [`Stamped::age`]) as a short "N unit
+/// ago" string for cache-freshness display, e.g. `"5m ago"`, `"2h ago"`.
+pub fn format_age(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{s}s ago")
+    } else if s < 3600 {
+        format!("{}m ago", s / 60)
+    } else if s < 86400 {
+        format!("{}h ago", s / 3600)
+    } else {
+        format!("{}d ago", s / 86400)
+    }
+}
+
 /// Serializable wrapper borrowing its value, used only for writing.
 #[derive(Serialize)]
 struct StampedRef<'a, V> {

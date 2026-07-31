@@ -3843,9 +3843,11 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "eframe",
+ "futures",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wf-cache",
  "wf-config",
  "wf-data",
  "wf-relic",
