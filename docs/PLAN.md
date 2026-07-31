@@ -169,14 +169,26 @@ game**. Summary of what shipped:
   window and reads a full 3440×1440 frame via `GetImage` — legible content, **no
   black-frame/DXVK issue**, no portal prompt.
 
-- **Owned-relic mastery guide (Phases 1–3 done) 🚧.** `wf-relic::relics`
-  (`RelicIndex` from WFCD `warframe-drop-data`, cached weekly) cross-references a
-  relic's rewards with the mastered set to list the distinct unmastered built
-  primes it can still drop, priced via the existing relic market slugs. `wf-lite
-  relics <codes…>` prints the ranked guide; `render_relic_panel` shows it as an
-  overlay panel (`wf-lite relic-guide-png` to preview). **Remaining:** OCR the
-  in-game Relics screen to read *owned* relics (needs a calibration screenshot),
-  then a tray/socket "Scan relics" trigger that feeds the overlay panel.
+- **Owned-relic mastery guide ✅.** `wf-relic::relics` (`RelicIndex` from WFCD
+  `warframe-drop-data`, cached weekly) cross-references a relic's rewards with
+  the mastered set to list the distinct unmastered **prime** parts it can still
+  drop (Requiem Mods / Ayatan Sculptures / Riven Slivers are excluded — mastery
+  never applies to them), priced via the existing relic market slugs. Ownership
+  is read by OCR of the in-game **Void Relics** screen: opening it is
+  auto-detected from `EE.log` (`ThemedProjectionManager.lua:
+  PopulateInventoryGrid`), and the overlay scans the grid (parallelized per
+  card, ~1.6s/frame) as the player scrolls, skipping relics marked with the
+  in-game "unowned" eye icon (detected by brightness-invariant template
+  matching, since hovering brightens a card regardless of ownership). The owned
+  set is **persisted to disk** (`~/.cache/warframe-lite/owned-relics.json`) so it
+  accumulates across sessions and survives restarts. `wf-lite relics <codes…>`
+  and an overlay panel (`render_relic_panel`) show the per-relic guide.
+- **Mastery planner ✅.** `wf-relic::mastery_plan` inverts the view: for every
+  unmastered prime, which owned relics (and how many of each) can still drop it,
+  ranked by total relics in hand — a fissure-farming priority list. `wf-lite
+  mastery-plan` prints it, cross-referencing currently active fissures (via
+  `worldstate`) to flag which relics are actionable *right now*. Works from the
+  persisted owned-relic set, so it doesn't require an active scan.
 
 **Remaining / later polish:** config-overridable reward regions; per-resolution
 calibration (currently tuned for 3440×1440); **mastery-weighted ranking** (prefer

@@ -9,7 +9,9 @@ pub mod relics;
 pub use index::ItemIndex;
 pub use mastery::MasterySet;
 pub use regions::{Rect, RelicGridRegions, RelicSlot, RewardRegions};
-pub use relics::{rank as rank_relics, RelicIndex, RelicInfo, RelicPick};
+pub use relics::{
+    mastery_plan, rank as rank_relics, PrimePlan, PrimeRelicSource, RelicIndex, RelicInfo, RelicPick,
+};
 
 use std::time::Duration;
 

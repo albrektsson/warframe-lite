@@ -17,6 +17,11 @@ It shows a click-through overlay on top of the game with:
   the overlay automatically scans your relics as you scroll, then shows which of
   the ones you own can still drop a prime you **haven't mastered**, ranked by
   relic price. Also `wf-lite relics <codes…>` from the CLI.
+- **A mastery planner** — `wf-lite mastery-plan` flips the view around: for every
+  prime you haven't mastered, which of your owned relics (and how many) can
+  still drop it, so you know which fissure tier is worth farming next. The
+  scanned owned-relic set is saved to disk, so this works any time — no need to
+  have the Relics screen open.
 
 It only *observes* the game — no Overwolf, no memory reading, no account
 credentials.
@@ -101,6 +106,7 @@ wf-lite                    # (no command) show this list of commands
 wf-lite status             # live world state (fissures, Baro, cycles)
 wf-lite <market_slug>      # price an item, e.g. `wf-lite mirage_prime_set`
 wf-lite relics <codes…>    # owned-relic guide: unmastered rewards + prices
+wf-lite mastery-plan       # unmastered primes + which owned relics drop them
 wf-lite tray               # tray companion: waits for the game, runs the overlay
 wf-lite overlay            # show the live overlay (world state + relic picker)
 wf-lite settings           # open the graphical settings window (needs wf-settings)

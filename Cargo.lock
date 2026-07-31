@@ -3538,6 +3538,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wf-cache",
  "wf-capture",
  "wf-config",
  "wf-data",

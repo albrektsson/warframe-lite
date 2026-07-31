@@ -252,11 +252,16 @@ fn canonical(s: &str) -> String {
 
 /// Component words stripped from a reward part name to get the built item's
 /// base name.
+// Sourced (and cross-checked against every "<Weapon> Prime <suffix...>" reward
+// name in the WFCD drop tables) so `built_name`/`canonical` collapse every
+// prime's parts to one group — otherwise a part whose suffix isn't listed here
+// creates a spurious separate "prime" (e.g. "Ninkondi Prime Chain" used to stay
+// distinct from "Ninkondi Prime").
 const COMPONENTS: &[&str] = &[
     "blueprint", "systems", "chassis", "neuroptics", "barrel", "receiver", "stock", "link",
-    "blade", "handle", "hilt", "guard", "grip", "head", "string", "limb", "lower", "upper",
-    "ornament", "boot", "gauntlet", "carapace", "cerebrum", "wings", "harness", "pouch", "star",
-    "disc", "band", "buckle", "clamp", "collar",
+    "blade", "blades", "handle", "hilt", "guard", "grip", "head", "string", "limb", "lower",
+    "upper", "ornament", "boot", "gauntlet", "carapace", "cerebrum", "wings", "harness", "pouch",
+    "star", "stars", "disc", "band", "buckle", "clamp", "collar", "chain", "kubrow",
 ];
 
 /// The built prime's **display** name for a reward part, e.g.

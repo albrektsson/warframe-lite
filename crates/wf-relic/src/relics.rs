@@ -45,11 +45,17 @@ impl RelicInfo {
     }
 
     /// Distinct built primes among this relic's rewards that the player has **not**
-    /// mastered (skips Forma/untradable), e.g. `["Ember Prime", "Trinity Prime"]`.
+    /// mastered (skips Forma/untradable and non-prime rewards — Requiem relics
+    /// drop Requiem Mods, Ayatan Sculptures, and Riven Slivers, none of which
+    /// mastery applies to, so they'd otherwise always look "unmastered"), e.g.
+    /// `["Ember Prime", "Trinity Prime"]`.
     pub fn unmastered(&self, mastery: &MasterySet) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         for r in &self.rewards {
-            if crate::untradable_label(&r.item_name).is_some() || mastery.is_mastered(&r.item_name) {
+            if crate::untradable_label(&r.item_name).is_some()
+                || !is_prime_reward(&r.item_name)
+                || mastery.is_mastered(&r.item_name)
+            {
                 continue;
             }
             let built = built_name(&r.item_name);
@@ -160,6 +166,82 @@ pub fn rank(picks: &mut [RelicPick]) {
     });
 }
 
+/// Whether a relic reward name is an actual prime part — as opposed to a
+/// Requiem relic's Requiem Mod, Ayatan Sculpture, or Riven Sliver, which mastery
+/// (a weapon/Warframe-only concept) never applies to.
+fn is_prime_reward(item_name: &str) -> bool {
+    item_name.to_ascii_lowercase().contains("prime")
+}
+
+/// One owned relic that can still drop a given unmastered prime.
+#[derive(Debug, Clone)]
+pub struct PrimeRelicSource {
+    /// Relic label, e.g. "Axi H3".
+    pub relic_display: String,
+    /// How many the player owns.
+    pub owned_count: u32,
+    /// Drop rarity of this prime within this relic (Common/Uncommon/Rare).
+    pub rarity: String,
+}
+
+/// An unmastered prime and the owned relics that can still drop it — the basis
+/// for deciding which fissures to prioritise.
+#[derive(Debug, Clone)]
+pub struct PrimePlan {
+    /// Built prime name, e.g. "Rubico Prime".
+    pub prime: String,
+    /// Owned relics that can drop it, most-owned first.
+    pub relics: Vec<PrimeRelicSource>,
+    /// Sum of owned counts across all sourcing relics — a rough farming budget.
+    pub total_owned: u32,
+}
+
+/// Build a fissure-planning view from an owned-relic count map (relic display →
+/// count): for every unmastered prime the player's relics can still drop, which
+/// relics (and how many of each) can drop it. Ranked by `total_owned` descending,
+/// so the primes with the most farming budget already in hand come first.
+pub fn mastery_plan(
+    owned: &std::collections::HashMap<String, u32>,
+    index: &RelicIndex,
+    mastery: &MasterySet,
+) -> Vec<PrimePlan> {
+    let mut by_prime: std::collections::HashMap<String, Vec<PrimeRelicSource>> =
+        std::collections::HashMap::new();
+    for relic in index.all() {
+        let Some(&count) = owned.get(&relic.display) else {
+            continue;
+        };
+        if count == 0 {
+            continue;
+        }
+        for prime in relic.unmastered(mastery) {
+            let rarity = relic
+                .rewards
+                .iter()
+                .find(|r| built_name(&r.item_name) == prime)
+                .map(|r| r.rarity.clone())
+                .unwrap_or_default();
+            by_prime.entry(prime).or_default().push(PrimeRelicSource {
+                relic_display: relic.display.clone(),
+                owned_count: count,
+                rarity,
+            });
+        }
+    }
+    let mut plans: Vec<PrimePlan> = by_prime
+        .into_iter()
+        .map(|(prime, mut relics)| {
+            relics.sort_by(|a, b| {
+                b.owned_count.cmp(&a.owned_count).then_with(|| a.relic_display.cmp(&b.relic_display))
+            });
+            let total_owned = relics.iter().map(|r| r.owned_count).sum();
+            PrimePlan { prime, relics, total_owned }
+        })
+        .collect();
+    plans.sort_by(|a, b| b.total_owned.cmp(&a.total_owned).then_with(|| a.prime.cmp(&b.prime)));
+    plans
+}
+
 /// Fetch and parse the WFCD relic drop tables, keeping only the Intact state
 /// (the reward *set* is state-independent; only drop chances differ).
 async fn fetch(client: &reqwest::Client) -> anyhow::Result<Vec<RelicInfo>> {
@@ -243,6 +325,16 @@ mod tests {
     }
 
     #[test]
+    fn unmastered_excludes_non_prime_rewards() {
+        // Requiem relics drop Requiem Mods / Ayatan Sculptures / Riven Slivers —
+        // mastery never applies to these, so they must never appear as
+        // "unmastered" (they'd otherwise always look needed).
+        let mastery = MasterySet::default();
+        let r = relic("Requiem I", &["Xata", "Ayatan Amber Star", "Riven Sliver", "Lohk Prime"]);
+        assert_eq!(r.unmastered(&mastery), vec!["Lohk Prime".to_string()]);
+    }
+
+    #[test]
     fn best_match_tolerates_ocr_and_rejects_garbage() {
         let idx = RelicIndex::new(vec![relic("Axi H3", &[]), relic("Meso N11", &[])]);
         assert_eq!(idx.best_match("AXI H3").map(|r| r.display.as_str()), Some("Axi H3"));
@@ -260,5 +352,38 @@ mod tests {
         rank(&mut picks);
         assert_eq!(picks[0].display, "B"); // 25p, 2 unmastered (stable vs C)
         assert_eq!(picks[2].display, "A"); // lowest plat last
+    }
+
+    #[test]
+    fn mastery_plan_groups_by_prime_across_relics() {
+        let idx = RelicIndex::new(vec![
+            relic("Axi A1", &["Akstiletto Prime Barrel", "Trinity Prime Systems Blueprint"]),
+            relic("Meso N11", &["Akstiletto Prime Receiver", "Volt Prime Blueprint"]),
+            relic("Lith G4", &["Ember Prime Blueprint"]), // fully mastered relic
+        ]);
+        let mastery =
+            MasterySet::from_xp([("/Lotus/Powersuits/Ember/EmberPrime".to_string(), 9_000_000)]);
+        let owned = std::collections::HashMap::from([
+            ("Axi A1".to_string(), 5),
+            ("Meso N11".to_string(), 2),
+            ("Lith G4".to_string(), 9),  // owned but nothing unmastered → contributes nothing
+            ("Neo V9".to_string(), 3),   // owned but not in the index → ignored
+        ]);
+        let plans = mastery_plan(&owned, &idx, &mastery);
+
+        // Akstiletto Prime is sourced from two owned relics: 5 + 2 = 7, and ranks
+        // first (highest total_owned).
+        let aksti = plans.iter().find(|p| p.prime == "Akstiletto Prime").unwrap();
+        assert_eq!(aksti.total_owned, 7);
+        assert_eq!(aksti.relics.len(), 2);
+        assert_eq!(aksti.relics[0].relic_display, "Axi A1"); // most-owned first
+        assert_eq!(plans[0].prime, "Akstiletto Prime");
+
+        // Single-relic primes are present with their own relic's count.
+        assert!(plans.iter().any(|p| p.prime == "Trinity Prime" && p.total_owned == 5));
+        assert!(plans.iter().any(|p| p.prime == "Volt Prime" && p.total_owned == 2));
+
+        // A fully-mastered relic (Ember Prime) contributes no plan entries at all.
+        assert!(!plans.iter().any(|p| p.prime == "Ember Prime"));
     }
 }

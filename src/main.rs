@@ -65,6 +65,7 @@ async fn main() -> Result<()> {
         Some("tray") => return launch_companion("wf-tray"),
         Some("relic") => return relic_eval(&config).await,
         Some("relics") => return relics_cmd(&config).await,
+        Some("mastery-plan") => return mastery_plan_cmd(&config).await,
         Some("relic-guide-png") => return relic_guide_png(&config).await,
         Some("relic-grid-file") => return relic_grid_file().await,
         Some("relic-scan") => return relic_scan(&config).await,
@@ -120,6 +121,7 @@ RUN IT
 
 RELICS & MASTERY
     relics <codes…>       Owned-relic guide: unmastered rewards + prices
+    mastery-plan          Unmastered primes + which of your relics drop them
     mastery [id]          Report how many items you've mastered
     detect-account        Auto-detect your account id from EE.log
     set-account <id>      Save your account id for mastery lookup
@@ -421,6 +423,76 @@ fn pair_relic_codes(tokens: &[String]) -> Vec<String> {
         out.push(cur);
     }
     out
+}
+
+/// Fissure-planning helper: for each prime you haven't mastered, which of your
+/// owned relics (from the last scan, persisted across sessions) can still drop
+/// it, and how many — so you know which fissure tier to prioritise running.
+/// `wf-lite mastery-plan`.
+async fn mastery_plan_cmd(config: &Config) -> Result<()> {
+    let Some(owned) =
+        wf_cache::load_blob::<std::collections::HashMap<String, u32>>(OWNED_RELICS_FILE)
+    else {
+        anyhow::bail!(
+            "no owned-relic data yet. Run `wf-lite overlay` (or the tray) and open the in-game \
+             Void Relics screen once — it scans automatically as you scroll."
+        );
+    };
+
+    println!("\n== Mastery plan (owned relics scanned {}) ==", fmt_age(owned.age()));
+    let client = http_client();
+    let index = wf_relic::RelicIndex::load_cached(&client, CATALOGUE_TTL).await?;
+    let mastery = load_mastery(config, &client).await;
+    let plans = wf_relic::mastery_plan(&owned.value, &index, &mastery);
+
+    if plans.is_empty() {
+        println!("  no unmastered primes found among your scanned relics");
+        return Ok(());
+    }
+
+    // Cross-reference against currently active fissures so the breakdown can
+    // flag which relics are actionable right now.
+    let active_tiers: std::collections::HashSet<String> =
+        worldstate::fetch(&client, &config.platform)
+            .await
+            .map(|ws| ws.fissures.iter().filter(|f| f.active()).map(|f| f.tier.clone()).collect())
+            .unwrap_or_default();
+
+    println!("  {:<24} {:>6}  relics you own that can still drop it", "unmastered prime", "owned");
+    for p in &plans {
+        let breakdown = p
+            .relics
+            .iter()
+            .map(|r| {
+                let live = if active_tiers.contains(tier_of(&r.relic_display)) { "*" } else { "" };
+                format!("{}{live} x{}", r.relic_display, r.owned_count)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  {:<24} {:>6}  {breakdown}", truncate_str(&p.prime, 24), p.total_owned);
+    }
+    println!("\n  * = a fissure of that relic's tier is active right now");
+    Ok(())
+}
+
+/// The era prefix of a relic display label, e.g. `"Axi H3"` → `"Axi"`.
+fn tier_of(relic_display: &str) -> &str {
+    relic_display.split_whitespace().next().unwrap_or("")
+}
+
+/// Format a [`Duration`] as a short "N unit ago" string for cache-freshness
+/// display, e.g. `"5m ago"`, `"2h ago"`.
+fn fmt_age(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{s}s ago")
+    } else if s < 3600 {
+        format!("{}m ago", s / 60)
+    } else if s < 86400 {
+        format!("{}h ago", s / 3600)
+    } else {
+        format!("{}d ago", s / 86400)
+    }
 }
 
 /// Save a Warframe account id to the config for mastery lookup.
@@ -1278,9 +1350,20 @@ async fn relic_watch_loop(
     let mut window_open = false; // whether we've logged the current window
     let mut last_shown = Instant::now() - SHOW_DEBOUNCE;
 
-    // Owned-relic scan state.
+    // Owned-relic scan state. `relic_owned` is the cumulative, disk-persisted
+    // owned set — it survives restarts and Relics-screen visits, so the mastery
+    // planner (`wf-lite mastery-plan`) has data even outside a live scan. Loaded
+    // once here as the baseline; `session_seen` is scoped to the *current*
+    // continuous scan (cleared each time the screen is freshly reopened) and
+    // max-merges repeated OCR reads of the same relic to smooth transient
+    // undercounts (e.g. a dropped digit) — a relic's `relic_owned` entry is then
+    // replaced with that session's best reading, so depleted relics (used since
+    // the last scan) correctly drop rather than being stuck at an old high value.
+    let mut relic_owned: HashMap<String, u32> = wf_cache::load_blob(OWNED_RELICS_FILE)
+        .map(|s: wf_cache::Stamped<HashMap<String, u32>>| s.value)
+        .unwrap_or_default();
+    let mut session_seen: HashMap<String, u32> = HashMap::new();
     let mut relic_until: Option<Instant> = None;
-    let mut relic_owned: HashMap<String, u32> = HashMap::new();
     let mut relic_last_new = Instant::now();
 
     loop {
@@ -1298,8 +1381,11 @@ async fn relic_watch_loop(
                 }
                 Some(Event::RelicInventoryOpen) if relic_index.is_some() => {
                     if relic_until.is_none() {
-                        relic_owned.clear();
-                        tracing::info!("relics screen opened — scanning as you scroll");
+                        session_seen.clear();
+                        tracing::info!(
+                            "relics screen opened — scanning as you scroll ({} known from before)",
+                            relic_owned.len()
+                        );
                     }
                     relic_until = Some(Instant::now() + RELIC_SCAN_WINDOW);
                     relic_last_new = Instant::now();
@@ -1323,14 +1409,20 @@ async fn relic_watch_loop(
                 if let Ok(Ok(found)) = scanned {
                     let mut changed = false;
                     for (display, count) in found {
-                        let e = relic_owned.entry(display).or_insert(0);
-                        if count > *e {
-                            *e = count;
+                        // Smooth transient OCR undercounts within this session…
+                        let seen = session_seen.entry(display.clone()).or_insert(0);
+                        *seen = (*seen).max(count);
+                        // …then replace (not max) the persisted entry with this
+                        // session's best reading, so a depleted relic's count can
+                        // still drop from what an earlier session recorded.
+                        if relic_owned.get(&display) != Some(seen) {
+                            relic_owned.insert(display, *seen);
                             changed = true;
                         }
                     }
                     if changed {
                         relic_last_new = Instant::now();
+                        let _ = wf_cache::save_blob(OWNED_RELICS_FILE, &relic_owned);
                         let rows = build_relic_rows(
                             &relic_owned, ridx, &mastery, &cache, &market, RELIC_ROWS,
                         )
@@ -1392,6 +1484,10 @@ async fn relic_watch_loop(
 
 /// How many relic rows fit the overlay panel height.
 const RELIC_ROWS: usize = 12;
+/// Disk-cache filename for the cumulative owned-relic count map (relic display →
+/// count), written by the live scan and read by `wf-lite mastery-plan` so the
+/// planner works even without an active overlay scan.
+const OWNED_RELICS_FILE: &str = "owned-relics.json";
 
 /// Build the ranked owned-relic guide rows: for each owned relic that can still
 /// drop an unmastered prime, its unmastered count + a market price, top-N by value.
