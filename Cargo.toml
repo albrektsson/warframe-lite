@@ -11,9 +11,11 @@ members = [
     "crates/wf-cache",
     "crates/wf-settings",
     "crates/wf-tray",
+    "crates/wf-browse",
 ]
 # Build/test everything by default so a bare `cargo build --release` produces all
-# three binaries (wf-lite + the wf-tray/wf-settings companions), not just wf-lite.
+# four binaries (wf-lite + the wf-tray/wf-settings/wf-browse companions), not just
+# wf-lite.
 default-members = [
     ".",
     "crates/wf-config",
@@ -26,6 +28,7 @@ default-members = [
     "crates/wf-cache",
     "crates/wf-settings",
     "crates/wf-tray",
+    "crates/wf-browse",
 ]
 
 [workspace.package]

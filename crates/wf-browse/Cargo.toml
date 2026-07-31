@@ -1,0 +1,27 @@
+[package]
+name = "wf-browse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "wf-browse"
+path = "src/main.rs"
+
+[dependencies]
+wf-config.workspace = true
+wf-data.workspace = true
+wf-relic.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+# Same feature set as wf-settings: glow backend keeps the GUI pure-Rust with no
+# system GTK/Qt dev dependency; winit/glutin dlopen libxkbcommon / libGL /
+# libwayland at runtime.
+eframe = { version = "0.35", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "wayland",
+    "x11",
+] }

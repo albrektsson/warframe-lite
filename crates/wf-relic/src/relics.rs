@@ -173,6 +173,49 @@ fn is_prime_reward(item_name: &str) -> bool {
     item_name.to_ascii_lowercase().contains("prime")
 }
 
+/// One entry in the full Mastery browser: a built prime and whether it's been
+/// mastered yet.
+#[derive(Debug, Clone)]
+pub struct MasteryEntry {
+    /// Built prime name, e.g. "Ember Prime".
+    pub prime: String,
+    /// Whether `prime` has been mastered.
+    pub mastered: bool,
+}
+
+/// Every distinct built prime across the relic catalogue's reward tables,
+/// flagged mastered/Unmastered — the universe for the Mastery browser.
+/// Every Prime currently drops from some Relic, so no catalogue beyond the one
+/// already loaded for relic browsing is needed. Sorted alphabetically.
+///
+/// Checks mastery against the already-built prime name (e.g. "Ember Prime")
+/// rather than the raw reward name `unmastered` uses (e.g. "Ember Prime
+/// Systems Blueprint") — safe because `MasterySet::is_mastered`'s own
+/// `reward_core` normalisation strips "Prime" and component words either way,
+/// so both call shapes reduce to the same core token.
+pub fn mastery_browser(index: &RelicIndex, mastery: &MasterySet) -> Vec<MasteryEntry> {
+    let mut primes: Vec<String> = Vec::new();
+    for relic in index.all() {
+        for r in &relic.rewards {
+            if crate::untradable_label(&r.item_name).is_some() || !is_prime_reward(&r.item_name) {
+                continue;
+            }
+            let built = built_name(&r.item_name);
+            if !primes.contains(&built) {
+                primes.push(built);
+            }
+        }
+    }
+    primes.sort();
+    primes
+        .into_iter()
+        .map(|prime| {
+            let mastered = mastery.is_mastered(&prime);
+            MasteryEntry { prime, mastered }
+        })
+        .collect()
+}
+
 /// One owned relic that can still drop a given unmastered prime.
 #[derive(Debug, Clone)]
 pub struct PrimeRelicSource {
@@ -352,6 +395,52 @@ mod tests {
         rank(&mut picks);
         assert_eq!(picks[0].display, "B"); // 25p, 2 unmastered (stable vs C)
         assert_eq!(picks[2].display, "A"); // lowest plat last
+    }
+
+    #[test]
+    fn mastery_browser_dedups_across_relics_and_flags_mastered() {
+        let idx = RelicIndex::new(vec![
+            relic(
+                "Meso E1",
+                &["Ember Prime Blueprint", "Ember Prime Systems Blueprint", "Trinity Prime Blueprint"],
+            ),
+            relic("Lith G4", &["Ember Prime Chassis Blueprint"]), // same built prime, elsewhere
+        ]);
+        let mastery = MasterySet::from_xp([
+            ("/Lotus/Powersuits/Ember/EmberPrime".to_string(), 9_000_000), // mastered
+        ]);
+        let entries = mastery_browser(&idx, &mastery);
+
+        // Ember Prime appears once despite three reward rows across two relics.
+        assert_eq!(entries.len(), 2);
+        let ember = entries.iter().find(|e| e.prime == "Ember Prime").unwrap();
+        assert!(ember.mastered);
+        let trinity = entries.iter().find(|e| e.prime == "Trinity Prime").unwrap();
+        assert!(!trinity.mastered);
+    }
+
+    #[test]
+    fn mastery_browser_excludes_non_prime_rewards() {
+        // Requiem relics drop Requiem Mods / Ayatan Sculptures / Riven Slivers —
+        // none of these are primes, so they must never appear in the browser.
+        let idx = RelicIndex::new(vec![relic(
+            "Requiem I",
+            &["Xata", "Ayatan Amber Star", "Riven Sliver", "Lohk Prime"],
+        )]);
+        let entries = mastery_browser(&idx, &MasterySet::default());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].prime, "Lohk Prime");
+        assert!(!entries[0].mastered);
+    }
+
+    #[test]
+    fn mastery_browser_sorts_alphabetically() {
+        let idx = RelicIndex::new(vec![relic("Axi A1", &["Volt Prime Blueprint", "Ash Prime Blueprint"])]);
+        let entries = mastery_browser(&idx, &MasterySet::default());
+        assert_eq!(
+            entries.iter().map(|e| e.prime.as_str()).collect::<Vec<_>>(),
+            vec!["Ash Prime", "Volt Prime"]
+        );
     }
 
     #[test]

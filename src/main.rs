@@ -63,6 +63,7 @@ async fn main() -> Result<()> {
         Some("detect-account") => return detect_account_cmd(&config, &config_path).await,
         Some("settings") => return launch_companion("wf-settings"),
         Some("tray") => return launch_companion("wf-tray"),
+        Some("browse") => return launch_companion("wf-browse"),
         Some("relic") => return relic_eval(&config).await,
         Some("relics") => return relics_cmd(&config).await,
         Some("mastery-plan") => return mastery_plan_cmd(&config).await,
@@ -117,6 +118,7 @@ RUN IT
     tray                  Tray icon: waits for the game, auto-runs the overlay
     overlay               Show the live overlay (world state + relic picker)
     settings              Open the graphical settings window
+    browse                Open the mastery/relic browser (Mastery/Relics/Sell)
     toggle | show | hide  Show/hide a running overlay
 
 RELICS & MASTERY
