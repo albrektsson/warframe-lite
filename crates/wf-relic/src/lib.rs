@@ -10,8 +10,9 @@ pub use index::ItemIndex;
 pub use mastery::MasterySet;
 pub use regions::{Rect, RelicGridRegions, RelicSlot, RewardRegions};
 pub use relics::{
-    mastery_browser, mastery_plan, rank as rank_relics, sell_picks, tier_of, MasteryEntry,
-    PrimePlan, PrimeRelicSource, RelicIndex, RelicInfo, RelicPick, OWNED_RELICS_FILE,
+    farm_picks, farm_reward_names, mastery_browser, mastery_plan, rank as rank_relics, sell_picks,
+    tier_of, FarmPick, MasteryEntry, PrimePlan, PrimeRelicSource, RelicIndex, RelicInfo, RelicPick,
+    OWNED_RELICS_FILE,
 };
 
 use std::time::Duration;

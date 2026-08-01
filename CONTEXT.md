@@ -55,6 +55,17 @@ The ranked view of owned relics grouped by the Unmastered prime they can still
 drop, sourcing relics ordered by owned count — the basis for deciding which
 Fissures to run next.
 
+**Farm pick**:
+For an owned relic, its single highest-value **already-mastered** prime
+reward — the basis for cracking the relic and selling that specific part
+rather than selling the relic itself.
+
+**Radiant share**:
+A squad of four players who all bring copies of the same relic into a
+Fissure, guaranteeing four independent reward rolls and maximizing the
+chance that at least one lands the relic's most valuable drop. A Farm pick's
+natural use: organize a radiant share around the relic that names it.
+
 ### World state
 
 **World state**:
