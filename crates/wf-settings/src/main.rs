@@ -114,8 +114,8 @@ impl SettingsApp {
 }
 
 impl eframe::App for SettingsApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("warframe-lite settings");
             ui.add_space(8.0);
 
@@ -184,7 +184,7 @@ impl eframe::App for SettingsApp {
             ui.horizontal(|ui| {
                 ui.code("wf-lite toggle");
                 if ui.button("Copy").clicked() {
-                    ctx.copy_text("wf-lite toggle".to_string());
+                    ui.ctx().copy_text("wf-lite toggle".to_string());
                     self.status = "Copied command".to_string();
                 }
                 if ui.button("Open KDE shortcuts").clicked() {

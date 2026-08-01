@@ -10,7 +10,9 @@ pub use index::ItemIndex;
 pub use mastery::MasterySet;
 pub use regions::{Rect, RelicGridRegions, RelicSlot, RewardRegions};
 pub use relics::{
-    mastery_plan, rank as rank_relics, PrimePlan, PrimeRelicSource, RelicIndex, RelicInfo, RelicPick,
+    farm_picks, farm_reward_names, mastery_browser, mastery_plan, rank as rank_relics, sell_picks,
+    tier_of, FarmPick, MasteryEntry, PrimePlan, PrimeRelicSource, RelicIndex, RelicInfo, RelicPick,
+    OWNED_RELICS_FILE,
 };
 
 use std::time::Duration;
@@ -19,6 +21,12 @@ use wf_data::market::{MarketClient, PriceSummary};
 
 /// A disk-backed cache of per-item price summaries.
 pub type PriceCache = wf_cache::KeyedCache<PriceSummary>;
+
+/// Load the shared on-disk price cache every price lookup (relic or reward)
+/// reads from and writes back to.
+pub fn price_cache() -> PriceCache {
+    PriceCache::load("prices.json")
+}
 
 /// Tuning for cached price lookups.
 #[derive(Debug, Clone, Copy)]

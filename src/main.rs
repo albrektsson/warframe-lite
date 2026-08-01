@@ -63,6 +63,7 @@ async fn main() -> Result<()> {
         Some("detect-account") => return detect_account_cmd(&config, &config_path).await,
         Some("settings") => return launch_companion("wf-settings"),
         Some("tray") => return launch_companion("wf-tray"),
+        Some("browse") => return launch_companion("wf-browse"),
         Some("relic") => return relic_eval(&config).await,
         Some("relics") => return relics_cmd(&config).await,
         Some("mastery-plan") => return mastery_plan_cmd(&config).await,
@@ -117,6 +118,7 @@ RUN IT
     tray                  Tray icon: waits for the game, auto-runs the overlay
     overlay               Show the live overlay (world state + relic picker)
     settings              Open the graphical settings window
+    browse                Open the mastery/relic browser (Mastery/Relics/Sell)
     toggle | show | hide  Show/hide a running overlay
 
 RELICS & MASTERY
@@ -266,7 +268,7 @@ async fn relic_eval(config: &Config) -> Result<()> {
     let index = wf_relic::ItemIndex::load_cached(&client, CATALOGUE_TTL).await?;
     println!("  catalogue: {} items", index.len());
     let market = MarketClient::new(client.clone(), config.market_platform.clone());
-    let cache = price_cache();
+    let cache = wf_relic::price_cache();
 
     let evals =
         wf_relic::evaluate_cached(&names, &index, &market, &cache, wf_relic::PriceOpts::default())
@@ -304,7 +306,7 @@ async fn relics_cmd(config: &Config) -> Result<()> {
     let mut picks: Vec<wf_relic::RelicPick> = Vec::new();
     let price = !args.is_empty(); // only price an explicit owned set (avoids 700+ calls)
     let market = MarketClient::new(client.clone(), config.market_platform.clone());
-    let cache = price_cache();
+    let cache = wf_relic::price_cache();
     for r in owned {
         let unmastered = r.unmastered(&mastery);
         if unmastered.is_empty() {
@@ -366,7 +368,7 @@ async fn relic_guide_png(config: &Config) -> Result<()> {
     let index = wf_relic::RelicIndex::load_cached(&client, CATALOGUE_TTL).await?;
     let mastery = load_mastery(config, &client).await;
     let market = MarketClient::new(client.clone(), config.market_platform.clone());
-    let cache = price_cache();
+    let cache = wf_relic::price_cache();
 
     let mut picks = Vec::new();
     for code in ["axi a1", "neo v9", "meso n11", "lith g4", "axi h3"] {
@@ -431,7 +433,7 @@ fn pair_relic_codes(tokens: &[String]) -> Vec<String> {
 /// `wf-lite mastery-plan`.
 async fn mastery_plan_cmd(config: &Config) -> Result<()> {
     let Some(owned) =
-        wf_cache::load_blob::<std::collections::HashMap<String, u32>>(OWNED_RELICS_FILE)
+        wf_cache::load_blob::<std::collections::HashMap<String, u32>>(wf_relic::OWNED_RELICS_FILE)
     else {
         anyhow::bail!(
             "no owned-relic data yet. Run `wf-lite overlay` (or the tray) and open the in-game \
@@ -439,7 +441,7 @@ async fn mastery_plan_cmd(config: &Config) -> Result<()> {
         );
     };
 
-    println!("\n== Mastery plan (owned relics scanned {}) ==", fmt_age(owned.age()));
+    println!("\n== Mastery plan (owned relics scanned {}) ==", wf_cache::format_age(owned.age()));
     let client = http_client();
     let index = wf_relic::RelicIndex::load_cached(&client, CATALOGUE_TTL).await?;
     let mastery = load_mastery(config, &client).await;
@@ -452,11 +454,10 @@ async fn mastery_plan_cmd(config: &Config) -> Result<()> {
 
     // Cross-reference against currently active fissures so the breakdown can
     // flag which relics are actionable right now.
-    let active_tiers: std::collections::HashSet<String> =
-        worldstate::fetch(&client, &config.platform)
-            .await
-            .map(|ws| ws.fissures.iter().filter(|f| f.active()).map(|f| f.tier.clone()).collect())
-            .unwrap_or_default();
+    let active_tiers: std::collections::HashSet<String> = worldstate::fetch(&client, &config.platform)
+        .await
+        .map(|ws| ws.active_fissure_tiers())
+        .unwrap_or_default();
 
     println!("  {:<24} {:>6}  relics you own that can still drop it", "unmastered prime", "owned");
     for p in &plans {
@@ -464,7 +465,7 @@ async fn mastery_plan_cmd(config: &Config) -> Result<()> {
             .relics
             .iter()
             .map(|r| {
-                let live = if active_tiers.contains(tier_of(&r.relic_display)) { "*" } else { "" };
+                let live = if active_tiers.contains(wf_relic::tier_of(&r.relic_display)) { "*" } else { "" };
                 format!("{}{live} x{}", r.relic_display, r.owned_count)
             })
             .collect::<Vec<_>>()
@@ -473,26 +474,6 @@ async fn mastery_plan_cmd(config: &Config) -> Result<()> {
     }
     println!("\n  * = a fissure of that relic's tier is active right now");
     Ok(())
-}
-
-/// The era prefix of a relic display label, e.g. `"Axi H3"` → `"Axi"`.
-fn tier_of(relic_display: &str) -> &str {
-    relic_display.split_whitespace().next().unwrap_or("")
-}
-
-/// Format a [`Duration`] as a short "N unit ago" string for cache-freshness
-/// display, e.g. `"5m ago"`, `"2h ago"`.
-fn fmt_age(d: Duration) -> String {
-    let s = d.as_secs();
-    if s < 60 {
-        format!("{s}s ago")
-    } else if s < 3600 {
-        format!("{}m ago", s / 60)
-    } else if s < 86400 {
-        format!("{}h ago", s / 3600)
-    } else {
-        format!("{}d ago", s / 86400)
-    }
 }
 
 /// Save a Warframe account id to the config for mastery lookup.
@@ -639,7 +620,7 @@ async fn relic_file(config: &Config) -> Result<()> {
     }
 
     let market = MarketClient::new(client.clone(), config.market_platform.clone());
-    let cache = price_cache();
+    let cache = wf_relic::price_cache();
     let evals =
         wf_relic::evaluate_cached(&names, &index, &market, &cache, wf_relic::PriceOpts::default())
             .await;
@@ -867,7 +848,7 @@ async fn relic_scan(config: &Config) -> Result<()> {
     }
 
     let market = MarketClient::new(client.clone(), config.market_platform.clone());
-    let cache = price_cache();
+    let cache = wf_relic::price_cache();
     let evals =
         wf_relic::evaluate_cached(&names, &index, &market, &cache, wf_relic::PriceOpts::default())
             .await;
@@ -909,7 +890,7 @@ async fn reward_png(config: &Config) -> Result<()> {
     let client = http_client();
     let index = wf_relic::ItemIndex::load_cached(&client, CATALOGUE_TTL).await?;
     let market = MarketClient::new(client.clone(), config.market_platform.clone());
-    let cache = price_cache();
+    let cache = wf_relic::price_cache();
     let evals =
         wf_relic::evaluate_cached(&names, &index, &market, &cache, wf_relic::PriceOpts::default())
             .await;
@@ -1029,11 +1010,6 @@ const CATALOGUE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// Mastery data is refreshed at most this often (it changes slowly).
 const MASTERY_TTL: Duration = Duration::from_secs(24 * 3600);
-
-/// Load the shared on-disk price cache.
-fn price_cache() -> wf_relic::PriceCache {
-    wf_relic::PriceCache::load("prices.json")
-}
 
 /// Load the player's mastered set (cached) if an account id is configured,
 /// otherwise an empty set (mastery indicators simply off).
@@ -1158,7 +1134,7 @@ async fn run_overlay(config: Config) -> Result<()> {
     match (wf_ocr::Ocr::new(), config.resolve_ee_log()) {
         (Ok(ocr), Ok(ee_log)) => match wf_relic::ItemIndex::load_cached(&client, CATALOGUE_TTL).await {
             Ok(index) => {
-                let cache = Arc::new(price_cache());
+                let cache = Arc::new(wf_relic::price_cache());
                 let mastery = Arc::new(load_mastery(&config, &client).await);
                 // Relic drop tables for the owned-relic guide (best-effort).
                 let relic_index = wf_relic::RelicIndex::load_cached(&client, CATALOGUE_TTL)
@@ -1475,7 +1451,7 @@ async fn relic_scan_loop(
     // undercounts (e.g. a dropped digit); `relic_owned` is then *replaced* (not
     // maxed) with that session's best reading, so a depleted relic's count can
     // still drop from what an earlier session recorded.
-    let mut relic_owned: HashMap<String, u32> = wf_cache::load_blob(OWNED_RELICS_FILE)
+    let mut relic_owned: HashMap<String, u32> = wf_cache::load_blob(wf_relic::OWNED_RELICS_FILE)
         .map(|s: wf_cache::Stamped<HashMap<String, u32>>| s.value)
         .unwrap_or_default();
     let mut session_seen: HashMap<String, u32> = HashMap::new();
@@ -1532,7 +1508,7 @@ async fn relic_scan_loop(
             }
             if changed {
                 last_new = Instant::now();
-                let _ = wf_cache::save_blob(OWNED_RELICS_FILE, &relic_owned);
+                let _ = wf_cache::save_blob(wf_relic::OWNED_RELICS_FILE, &relic_owned);
                 let rows = build_relic_rows(
                     &relic_owned, &relic_index, &mastery, &cache, &market, RELIC_ROWS,
                 )
@@ -1554,10 +1530,6 @@ async fn relic_scan_loop(
 
 /// How many relic rows fit the overlay panel height.
 const RELIC_ROWS: usize = 12;
-/// Disk-cache filename for the cumulative owned-relic count map (relic display →
-/// count), written by the live scan and read by `wf-lite mastery-plan` so the
-/// planner works even without an active overlay scan.
-const OWNED_RELICS_FILE: &str = "owned-relics.json";
 
 /// Build the ranked owned-relic guide rows: for each owned relic that can still
 /// drop an unmastered prime, its unmastered count + a market price, top-N by value.

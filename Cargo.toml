@@ -11,9 +11,11 @@ members = [
     "crates/wf-cache",
     "crates/wf-settings",
     "crates/wf-tray",
+    "crates/wf-browse",
 ]
 # Build/test everything by default so a bare `cargo build --release` produces all
-# three binaries (wf-lite + the wf-tray/wf-settings companions), not just wf-lite.
+# four binaries (wf-lite + the wf-tray/wf-settings/wf-browse companions), not just
+# wf-lite.
 default-members = [
     ".",
     "crates/wf-config",
@@ -26,6 +28,7 @@ default-members = [
     "crates/wf-cache",
     "crates/wf-settings",
     "crates/wf-tray",
+    "crates/wf-browse",
 ]
 
 [workspace.package]
@@ -52,8 +55,8 @@ serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "fs", "net", "io-util"] }
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
-directories = "5"
-toml = "0.8"
+directories = "6"
+toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }

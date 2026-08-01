@@ -98,6 +98,15 @@ pub struct WorldState {
     pub cambion_cycle: Cycle,
 }
 
+impl WorldState {
+    /// The relic tiers (e.g. "Axi", "Requiem") with at least one currently
+    /// active Fissure — used to flag which owned relics are crackable right
+    /// now.
+    pub fn active_fissure_tiers(&self) -> std::collections::HashSet<String> {
+        self.fissures.iter().filter(|f| f.active()).map(|f| f.tier.clone()).collect()
+    }
+}
+
 /// Fetch the current world-state for `platform` (e.g. "pc").
 pub async fn fetch(client: &reqwest::Client, platform: &str) -> anyhow::Result<WorldState> {
     let url = format!("{BASE}/{platform}?language=en");

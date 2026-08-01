@@ -4,8 +4,9 @@
 //! StatusNotifierItem via [`ksni`], pure-Rust so no libdbus dependency) and waits
 //! for Warframe to start. When the game window appears it auto-starts the overlay
 //! (`wf-lite overlay`); when the game closes it stops it again. The tray menu also
-//! shows/hides the overlay, opens the settings window, detects the account id, and
-//! quits — a single control point for the app's modes.
+//! shows/hides the overlay, opens the settings window, opens the mastery/relic
+//! browser, detects the account id, and quits — a single control point for the
+//! app's modes.
 //!
 //! It supervises `wf-lite` as a child process rather than embedding the overlay,
 //! so the tray stays small and the overlay keeps its own lean binary.
@@ -207,6 +208,15 @@ impl ksni::Tray for WfTray {
                 label: "Settings…".into(),
                 icon_name: "configure".into(),
                 activate: Box::new(|_| run_detached(&["settings"])),
+                ..Default::default()
+            }
+            .into(),
+        );
+        items.push(
+            StandardItem {
+                label: "Browse…".into(),
+                icon_name: "view-list-details".into(),
+                activate: Box::new(|_| run_detached(&["browse"])),
                 ..Default::default()
             }
             .into(),

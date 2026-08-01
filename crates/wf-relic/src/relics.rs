@@ -6,6 +6,7 @@
 //! opening for mastery. Ownership itself is supplied by the caller (from OCR of
 //! the in-game Relics screen); this module is network/screen-agnostic and pure.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -166,11 +167,196 @@ pub fn rank(picks: &mut [RelicPick]) {
     });
 }
 
+/// The file `owned-relics.json` is cached under, via `wf_cache::load_blob`/
+/// `save_blob` — the OCR scanner's only persisted record of Owned relic
+/// counts (ADR-0001, ADR-0003). Shared so every consumer (the CLI's scanner
+/// and reader, `wf-browse`) names the same file.
+pub const OWNED_RELICS_FILE: &str = "owned-relics.json";
+
+/// The era prefix of a relic display label, e.g. `"Axi H3"` → `"Axi"`.
+pub fn tier_of(relic_display: &str) -> &str {
+    relic_display.split_whitespace().next().unwrap_or("")
+}
+
+/// Every owned relic — mastered or not — as a priced, ranked [`RelicPick`],
+/// for the Sell tab: deciding which relics are worth selling rather than
+/// cracking. Unlike [`mastery_plan`] (and the full-catalogue guide behind
+/// `relics_cmd`), relics with zero Unmastered rewards are kept here — a
+/// fully-mastered relic is the clearest "sell, don't crack" case.
+///
+/// Prices come from a caller-supplied map (relic market slug →
+/// already-resolved plat, `None` where unresolved) rather than being fetched
+/// inline, keeping this pure; a slug missing from the map is treated the same
+/// as an explicit `None` — the relic still appears, unpriced.
+pub fn sell_picks(
+    owned: &HashMap<String, u32>,
+    prices: &HashMap<String, Option<u32>>,
+    index: &RelicIndex,
+    mastery: &MasterySet,
+) -> Vec<RelicPick> {
+    let mut picks: Vec<RelicPick> = index
+        .all()
+        .iter()
+        .filter_map(|relic| {
+            let count = *owned.get(&relic.display)?;
+            if count == 0 {
+                return None;
+            }
+            let plat = prices.get(&relic.slug()).copied().flatten();
+            Some(RelicPick {
+                display: relic.display.clone(),
+                count,
+                unmastered: relic.unmastered(mastery),
+                plat,
+            })
+        })
+        .collect();
+    rank(&mut picks);
+    picks
+}
+
 /// Whether a relic reward name is an actual prime part — as opposed to a
 /// Requiem relic's Requiem Mod, Ayatan Sculpture, or Riven Sliver, which mastery
 /// (a weapon/Warframe-only concept) never applies to.
 fn is_prime_reward(item_name: &str) -> bool {
     item_name.to_ascii_lowercase().contains("prime")
+}
+
+/// A relic's rewards that are real prime parts the player has already
+/// mastered — the Farm tab's candidate pool, the mirror image of
+/// [`RelicInfo::unmastered`].
+fn mastered_rewards<'a>(
+    relic: &'a RelicInfo,
+    mastery: &'a MasterySet,
+) -> impl Iterator<Item = &'a RelicReward> {
+    relic.rewards.iter().filter(move |r| {
+        crate::untradable_label(&r.item_name).is_none()
+            && is_prime_reward(&r.item_name)
+            && mastery.is_mastered(&r.item_name)
+    })
+}
+
+/// One owned relic's most profitable already-mastered drop: crack the relic
+/// and sell this specific part instead of selling the relic itself — and,
+/// since it names the *one* best reward, a natural relic to organize a
+/// 4-player "radiant share" around to maximize the odds of rolling it.
+#[derive(Debug, Clone)]
+pub struct FarmPick {
+    /// Relic label, e.g. "Axi H3".
+    pub display: String,
+    /// How many the player owns.
+    pub count: u32,
+    /// The already-mastered reward name this relic can drop with the highest
+    /// resolved market price, e.g. "Atlas Prime Neuroptics Blueprint".
+    pub best_reward: String,
+    /// Market sell price in platinum of `best_reward`, if resolved.
+    pub plat: Option<u32>,
+    /// Drop rarity of `best_reward` within this relic (Common/Uncommon/Rare).
+    pub rarity: String,
+}
+
+/// The distinct already-mastered prime reward names among the player's owned
+/// relics — the set of item names the Farm tab needs a market price for.
+/// Kept separate from [`farm_picks`] so pricing (a network concern) happens
+/// once at the caller before ranking, mirroring [`sell_picks`]'s split from
+/// its caller's price-fetch loop.
+pub fn farm_reward_names(
+    owned: &HashMap<String, u32>,
+    index: &RelicIndex,
+    mastery: &MasterySet,
+) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for relic in index.all() {
+        if owned.get(&relic.display).copied().unwrap_or(0) == 0 {
+            continue;
+        }
+        for r in mastered_rewards(relic, mastery) {
+            if !names.contains(&r.item_name) {
+                names.push(r.item_name.clone());
+            }
+        }
+    }
+    names
+}
+
+/// For every owned relic with at least one already-mastered prime reward, the
+/// single highest-value pick — the basis of the Farm tab. Ranked by that
+/// reward's price, highest first.
+///
+/// Prices come from a caller-supplied map (reward item name →
+/// already-resolved plat, `None` where unresolved) rather than being fetched
+/// inline, keeping this pure; a name missing from the map is treated the same
+/// as an explicit `None`.
+pub fn farm_picks(
+    owned: &HashMap<String, u32>,
+    prices: &HashMap<String, Option<u32>>,
+    index: &RelicIndex,
+    mastery: &MasterySet,
+) -> Vec<FarmPick> {
+    let mut picks: Vec<FarmPick> = index
+        .all()
+        .iter()
+        .filter_map(|relic| {
+            let count = *owned.get(&relic.display)?;
+            if count == 0 {
+                return None;
+            }
+            let best = mastered_rewards(relic, mastery)
+                .max_by_key(|r| prices.get(&r.item_name).copied().flatten().unwrap_or(0))?;
+            Some(FarmPick {
+                display: relic.display.clone(),
+                count,
+                best_reward: best.item_name.clone(),
+                plat: prices.get(&best.item_name).copied().flatten(),
+                rarity: best.rarity.clone(),
+            })
+        })
+        .collect();
+    picks.sort_by_key(|p| std::cmp::Reverse(p.plat.unwrap_or(0)));
+    picks
+}
+
+/// One entry in the full Mastery browser: a built prime and whether it's been
+/// mastered yet.
+#[derive(Debug, Clone)]
+pub struct MasteryEntry {
+    /// Built prime name, e.g. "Ember Prime".
+    pub prime: String,
+    /// Whether `prime` has been mastered.
+    pub mastered: bool,
+}
+
+/// Every distinct built prime across the relic catalogue's reward tables,
+/// flagged mastered/Unmastered — the universe for the Mastery browser.
+/// Every Prime currently drops from some Relic, so no catalogue beyond the one
+/// already loaded for relic browsing is needed. Sorted alphabetically.
+///
+/// Checks mastery against the already-built prime name (e.g. "Ember Prime")
+/// rather than the raw reward name `unmastered` uses (e.g. "Ember Prime
+/// Systems Blueprint") — safe because `MasterySet::is_mastered`'s own
+/// `reward_core` normalisation strips "Prime" and component words either way,
+/// so both call shapes reduce to the same core token.
+pub fn mastery_browser(index: &RelicIndex, mastery: &MasterySet) -> Vec<MasteryEntry> {
+    let mut primes: Vec<String> = Vec::new();
+    for relic in index.all() {
+        for r in &relic.rewards {
+            if crate::untradable_label(&r.item_name).is_some() || !is_prime_reward(&r.item_name) {
+                continue;
+            }
+            let built = built_name(&r.item_name);
+            if !primes.contains(&built) {
+                primes.push(built);
+            }
+        }
+    }
+    primes.sort();
+    primes
+        .into_iter()
+        .map(|prime| {
+            let mastered = mastery.is_mastered(&prime);
+            MasteryEntry { prime, mastered }
+        })
+        .collect()
 }
 
 /// One owned relic that can still drop a given unmastered prime.
@@ -286,6 +472,7 @@ async fn fetch(client: &reqwest::Client) -> anyhow::Result<Vec<RelicInfo>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn relic(display: &str, rewards: &[&str]) -> RelicInfo {
         let (tier, code) = display.split_once(' ').unwrap();
@@ -296,6 +483,19 @@ mod tests {
             rewards: rewards
                 .iter()
                 .map(|n| RelicReward { item_name: n.to_string(), rarity: String::new() })
+                .collect(),
+        }
+    }
+
+    fn relic_with_rarity(display: &str, rewards: &[(&str, &str)]) -> RelicInfo {
+        let (tier, code) = display.split_once(' ').unwrap();
+        RelicInfo {
+            tier: tier.to_string(),
+            code: code.to_string(),
+            display: display.to_string(),
+            rewards: rewards
+                .iter()
+                .map(|(n, r)| RelicReward { item_name: n.to_string(), rarity: r.to_string() })
                 .collect(),
         }
     }
@@ -355,6 +555,107 @@ mod tests {
     }
 
     #[test]
+    fn sell_picks_includes_fully_mastered_relics() {
+        // Meso E1's only reward is mastered, so it has zero unmastered rewards
+        // — mastery_plan/relics_cmd would hide it, but the Sell tab must show
+        // it: a fully-mastered relic is the clearest "sell, don't crack" case.
+        let idx = RelicIndex::new(vec![relic("Meso E1", &["Ember Prime Blueprint"])]);
+        let mastery = MasterySet::from_xp([
+            ("/Lotus/Powersuits/Ember/EmberPrime".to_string(), 9_000_000),
+        ]);
+        let owned = HashMap::from([("Meso E1".to_string(), 3)]);
+        let prices = HashMap::from([("meso_e1_relic".to_string(), Some(12))]);
+
+        let picks = sell_picks(&owned, &prices, &idx, &mastery);
+
+        assert_eq!(picks.len(), 1);
+        assert_eq!(picks[0].display, "Meso E1");
+        assert_eq!(picks[0].count, 3);
+        assert!(picks[0].unmastered.is_empty());
+        assert_eq!(picks[0].plat, Some(12));
+    }
+
+    #[test]
+    fn sell_picks_unresolved_price_is_none_not_dropped() {
+        let idx = RelicIndex::new(vec![relic("Axi H3", &["Volt Prime Blueprint"])]);
+        let owned = HashMap::from([("Axi H3".to_string(), 1)]);
+        let prices = HashMap::new(); // never resolved (timeout/error)
+
+        let picks = sell_picks(&owned, &prices, &idx, &MasterySet::default());
+
+        assert_eq!(picks.len(), 1);
+        assert_eq!(picks[0].plat, None);
+    }
+
+    #[test]
+    fn sell_picks_sorted_by_price_descending_and_excludes_unowned() {
+        let idx = RelicIndex::new(vec![
+            relic("Axi A1", &["Volt Prime Blueprint"]),
+            relic("Meso B2", &["Rhino Prime Blueprint"]),
+            relic("Lith C3", &["Loki Prime Blueprint"]), // not owned — must be excluded
+        ]);
+        let owned = HashMap::from([
+            ("Axi A1".to_string(), 2),
+            ("Meso B2".to_string(), 1),
+            ("Lith C3".to_string(), 0), // owned key present but zero count — excluded too
+        ]);
+        let prices = HashMap::from([
+            ("axi_a1_relic".to_string(), Some(15)),
+            ("meso_b2_relic".to_string(), Some(40)),
+        ]);
+
+        let picks = sell_picks(&owned, &prices, &idx, &MasterySet::default());
+
+        assert_eq!(picks.iter().map(|p| p.display.as_str()).collect::<Vec<_>>(), vec!["Meso B2", "Axi A1"]);
+    }
+
+    #[test]
+    fn mastery_browser_dedups_across_relics_and_flags_mastered() {
+        let idx = RelicIndex::new(vec![
+            relic(
+                "Meso E1",
+                &["Ember Prime Blueprint", "Ember Prime Systems Blueprint", "Trinity Prime Blueprint"],
+            ),
+            relic("Lith G4", &["Ember Prime Chassis Blueprint"]), // same built prime, elsewhere
+        ]);
+        let mastery = MasterySet::from_xp([
+            ("/Lotus/Powersuits/Ember/EmberPrime".to_string(), 9_000_000), // mastered
+        ]);
+        let entries = mastery_browser(&idx, &mastery);
+
+        // Ember Prime appears once despite three reward rows across two relics.
+        assert_eq!(entries.len(), 2);
+        let ember = entries.iter().find(|e| e.prime == "Ember Prime").unwrap();
+        assert!(ember.mastered);
+        let trinity = entries.iter().find(|e| e.prime == "Trinity Prime").unwrap();
+        assert!(!trinity.mastered);
+    }
+
+    #[test]
+    fn mastery_browser_excludes_non_prime_rewards() {
+        // Requiem relics drop Requiem Mods / Ayatan Sculptures / Riven Slivers —
+        // none of these are primes, so they must never appear in the browser.
+        let idx = RelicIndex::new(vec![relic(
+            "Requiem I",
+            &["Xata", "Ayatan Amber Star", "Riven Sliver", "Lohk Prime"],
+        )]);
+        let entries = mastery_browser(&idx, &MasterySet::default());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].prime, "Lohk Prime");
+        assert!(!entries[0].mastered);
+    }
+
+    #[test]
+    fn mastery_browser_sorts_alphabetically() {
+        let idx = RelicIndex::new(vec![relic("Axi A1", &["Volt Prime Blueprint", "Ash Prime Blueprint"])]);
+        let entries = mastery_browser(&idx, &MasterySet::default());
+        assert_eq!(
+            entries.iter().map(|e| e.prime.as_str()).collect::<Vec<_>>(),
+            vec!["Ash Prime", "Volt Prime"]
+        );
+    }
+
+    #[test]
     fn mastery_plan_groups_by_prime_across_relics() {
         let idx = RelicIndex::new(vec![
             relic("Axi A1", &["Akstiletto Prime Barrel", "Trinity Prime Systems Blueprint"]),
@@ -385,5 +686,109 @@ mod tests {
 
         // A fully-mastered relic (Ember Prime) contributes no plan entries at all.
         assert!(!plans.iter().any(|p| p.prime == "Ember Prime"));
+    }
+
+    #[test]
+    fn farm_reward_names_lists_distinct_mastered_prime_rewards_of_owned_relics() {
+        let mastery = MasterySet::from_xp([
+            ("/Lotus/Powersuits/Ember/EmberPrime".to_string(), 9_000_000), // mastered
+        ]);
+        let idx = RelicIndex::new(vec![
+            relic(
+                "Meso E1",
+                &["Ember Prime Blueprint", "Ember Prime Systems Blueprint", "Trinity Prime Blueprint"],
+            ),
+            relic("Axi A1", &["Volt Prime Blueprint"]), // not owned
+        ]);
+        let owned = HashMap::from([("Meso E1".to_string(), 2)]);
+
+        let names = farm_reward_names(&owned, &idx, &mastery);
+
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"Ember Prime Blueprint".to_string()));
+        assert!(names.contains(&"Ember Prime Systems Blueprint".to_string()));
+        assert!(!names.iter().any(|n| n.contains("Trinity"))); // not mastered
+        assert!(!names.iter().any(|n| n.contains("Volt"))); // not owned
+    }
+
+    #[test]
+    fn farm_picks_selects_the_highest_priced_mastered_reward_per_relic() {
+        let mastery = MasterySet::from_xp([
+            ("/Lotus/Powersuits/Ember/EmberPrime".to_string(), 9_000_000),
+            ("/Lotus/Powersuits/Trinity/TrinityPrime".to_string(), 9_000_000),
+        ]);
+        let idx = RelicIndex::new(vec![relic_with_rarity(
+            "Meso E1",
+            &[
+                ("Ember Prime Blueprint", "Common"),
+                ("Ember Prime Systems Blueprint", "Uncommon"),
+                ("Trinity Prime Blueprint", "Rare"),
+            ],
+        )]);
+        let owned = HashMap::from([("Meso E1".to_string(), 3)]);
+        let prices = HashMap::from([
+            ("Ember Prime Blueprint".to_string(), Some(5)),
+            ("Ember Prime Systems Blueprint".to_string(), Some(40)),
+            ("Trinity Prime Blueprint".to_string(), Some(20)),
+        ]);
+
+        let picks = farm_picks(&owned, &prices, &idx, &mastery);
+
+        assert_eq!(picks.len(), 1);
+        assert_eq!(picks[0].display, "Meso E1");
+        assert_eq!(picks[0].count, 3);
+        assert_eq!(picks[0].best_reward, "Ember Prime Systems Blueprint");
+        assert_eq!(picks[0].plat, Some(40));
+        assert_eq!(picks[0].rarity, "Uncommon");
+    }
+
+    #[test]
+    fn farm_picks_excludes_relics_with_no_mastered_reward_and_unowned_relics() {
+        let idx = RelicIndex::new(vec![
+            relic("Axi A1", &["Volt Prime Blueprint"]), // owned, nothing mastered
+            relic("Lith C3", &["Loki Prime Blueprint"]), // not owned
+        ]);
+        let owned = HashMap::from([("Axi A1".to_string(), 1), ("Lith C3".to_string(), 0)]);
+
+        let picks = farm_picks(&owned, &HashMap::new(), &idx, &MasterySet::default());
+
+        assert!(picks.is_empty());
+    }
+
+    #[test]
+    fn farm_picks_ranked_by_price_descending() {
+        let mastery = MasterySet::from_xp([
+            ("/Lotus/Powersuits/Ember/EmberPrime".to_string(), 9_000_000),
+            ("/Lotus/Powersuits/Volt/VoltPrime".to_string(), 9_000_000),
+        ]);
+        let idx = RelicIndex::new(vec![
+            relic("Meso E1", &["Ember Prime Blueprint"]),
+            relic("Axi A1", &["Volt Prime Blueprint"]),
+        ]);
+        let owned = HashMap::from([("Meso E1".to_string(), 1), ("Axi A1".to_string(), 1)]);
+        let prices = HashMap::from([
+            ("Ember Prime Blueprint".to_string(), Some(10)),
+            ("Volt Prime Blueprint".to_string(), Some(50)),
+        ]);
+
+        let picks = farm_picks(&owned, &prices, &idx, &mastery);
+
+        assert_eq!(
+            picks.iter().map(|p| p.display.as_str()).collect::<Vec<_>>(),
+            vec!["Axi A1", "Meso E1"]
+        );
+    }
+
+    #[test]
+    fn farm_picks_unresolved_price_is_none_not_dropped() {
+        let mastery =
+            MasterySet::from_xp([("/Lotus/Powersuits/Ember/EmberPrime".to_string(), 9_000_000)]);
+        let idx = RelicIndex::new(vec![relic("Meso E1", &["Ember Prime Blueprint"])]);
+        let owned = HashMap::from([("Meso E1".to_string(), 1)]);
+
+        let picks = farm_picks(&owned, &HashMap::new(), &idx, &mastery);
+
+        assert_eq!(picks.len(), 1);
+        assert_eq!(picks[0].plat, None);
     }
 }
