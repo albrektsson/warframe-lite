@@ -66,6 +66,14 @@ Fissure, guaranteeing four independent reward rolls and maximizing the
 chance that at least one lands the relic's most valuable drop. A Farm pick's
 natural use: organize a radiant share around the relic that names it.
 
+**Wishlisted part**:
+A reward part the player has hand-marked as wanted, independent of its
+mastery status. Unlike Owned relic or Mastery, this is player-declared intent
+with no scan or API source behind it — the player is the source of truth (see
+ADR-0004). Surfaces as its own marker on the reward screen, separate from the
+mastery emblem.
+_Avoid_: Favorite, tracked item.
+
 ### World state
 
 **World state**:

@@ -1,4 +1,9 @@
-# `wf-browse` is read-only: relic ownership only ever changes via OCR scan
+# `wf-browse` is read-only for OCR-derived state: relic ownership only ever changes via OCR scan
+
+_Scope note (see ADR-0004): this rule covers OCR-derived state like
+`owned-relics.json` specifically. It does not extend to hand-curated,
+player-declared data such as the equipment wishlist, which has no scan-derived
+truth to diverge from._
 
 `wf-browse` never writes to `owned-relics.json` — there is no way, from the
 GUI, to increment, decrement, or otherwise correct an Owned relic count, even
