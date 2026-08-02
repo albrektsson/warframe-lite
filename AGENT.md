@@ -73,9 +73,38 @@ A single Cargo workspace of focused crates:
 
 ## Environment specifics
 
-- Calibrated for **3440×1440**; reward-slot coordinates scale proportionally but
-  other resolutions may need re-tuning (`wf-lite relic-file <png>` and
-  `wf-lite ocr-file` help recalibrate against a captured reward screen).
+- Calibrated for **3440×1440**; reward-slot coordinates (`RewardRegions` in
+  `crates/wf-relic/src/regions.rs`) scale with the capture's **height** and stay
+  centred on its actual horizontal centre — not a width-scaled position. Verified
+  against a real captured 2560×1440 4-reward screen (same height as the
+  reference, ~25% narrower): the panel kept the reference pitch/name size
+  unchanged and centred within ~12px of true screen centre, matching the
+  reference calibration's own small centre bias. A resolution with a
+  **different height** than 3440×1440 (not just a different width) is the case
+  still unverified against a real capture, and is the one most likely to need
+  re-tuning.
+- **Recalibrating against a new capture:** grab a reward-screen PNG (the JPEGs
+  Steam's screenshot key saves need converting first, e.g. `magick in.jpg
+  out.png` — the `image` crate here isn't built with JPEG support), then:
+  1. `wf-lite relic-file <png>` runs the full pipeline (candidate slots → OCR →
+     match) and prints each slot's OCR text and matched item — a quick signal
+     for whether the current calibration is landing on the right region already.
+  2. If slots are garbled or empty, use `wf-lite ocr-file <png> <x> <y> <w> <h>`
+     to test crop rectangles directly; it also saves `<png>.pre.png`, the exact
+     preprocessed (thresholded) crop tesseract sees, which is the fastest way to
+     confirm a rectangle visually lines up with a card's name text (note:
+     `ocr-file` forces single-line OCR, so a good two-line crop can still print
+     garbled text there — trust the saved `.pre.png` crop position over
+     `ocr-file`'s own OCR text for two-line names; the real pipeline in
+     `relic-file`/`relic-scan` OCRs the same crop as a block instead).
+  3. Once a rectangle's confirmed on-screen centre (`observed_cx`) is known,
+     derive `RewardRegions::default_calibration()`'s fields: with
+     `sy = height / 1440`, `pitch`/`name_w`/`name_h`/`name_y` are the confirmed
+     pixel values divided by `sy` (they scale with height, not width), and
+     `center_x = 1720 - (width / 2 - observed_cx) / sy` (1720 is half the
+     reference width; the subtraction recovers how far `observed_cx` sits from
+     *this* capture's own true centre, then rescales that gap back to
+     reference-pixel terms).
 - OCR shells out to `tesseract` (installed via Homebrew on Bazzite); the binary is
   overridable with the `WF_TESSERACT` env var.
 - Mastery needs the account id set once (`wf-lite set-account <id>`, from

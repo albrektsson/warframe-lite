@@ -9,7 +9,11 @@
 //! block.
 //!
 //! Calibrated against captured 3440×1440 reward screens (both a 4-reward and a
-//! 3-reward screen).
+//! 3-reward screen), and verified against a captured 2560×1440 4-reward screen
+//! (see AGENT.md's "Environment specifics" for the recalibration process). The
+//! panel scales with the capture's **height**, not its width, and stays
+//! centred on the capture's actual screen centre rather than a width-scaled
+//! position.
 
 /// A rectangle in screen/window pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,12 +60,18 @@ impl RewardRegions {
     /// Seven centres spaced at `pitch/2` around the screen centre — the union of
     /// the 2-, 3- and 4-card layouts. Even-indexed centres are the 4-card slots;
     /// odd-indexed centres are the 3-card slots.
+    ///
+    /// All magnitudes (pitch, name size) scale with `height` — the panel keeps
+    /// its on-screen size relative to vertical resolution regardless of aspect
+    /// ratio, and stays centred on the capture's actual horizontal centre
+    /// (offset by the reference calibration's own centre bias, scaled the same
+    /// way) rather than a width-scaled `center_x`.
     pub fn candidate_slots(&self, width: u32, height: u32) -> Vec<Rect> {
-        let sx = width as f32 / self.ref_width as f32;
         let sy = height as f32 / self.ref_height as f32;
-        let cx = self.center_x as f32 * sx;
-        let half = self.pitch as f32 * sx / 2.0;
-        let w = (self.name_w as f32 * sx).round() as u32;
+        let center_bias = self.ref_width as f32 / 2.0 - self.center_x as f32;
+        let cx = width as f32 / 2.0 - center_bias * sy;
+        let half = self.pitch as f32 * sy / 2.0;
+        let w = (self.name_w as f32 * sy).round() as u32;
         let h = (self.name_h as f32 * sy).round() as u32;
         let y = (self.name_y as f32 * sy).round() as u32;
 
@@ -271,5 +281,18 @@ mod tests {
         let r = RewardRegions::default_calibration();
         let slots = r.candidate_slots(1720, 720); // half
         assert_eq!(slots[3].x + slots[3].w / 2, 854); // 1708/2
+    }
+
+    #[test]
+    fn scales_with_height_not_width_on_a_narrower_aspect_ratio() {
+        // Pinned against a real captured 2560x1440 4-reward screen (AGENT.md).
+        let r = RewardRegions::default_calibration();
+        let slots = r.candidate_slots(2560, 1440);
+        let mid = &slots[3];
+        assert_eq!(mid.x + mid.w / 2, 1268); // 2560/2 - (3440/2 - 1708)
+        assert_eq!(slots[0].x + slots[0].w / 2, 794);
+        assert_eq!(slots[6].x + slots[6].w / 2, 1742);
+        assert_eq!(mid.w, 330); // unscaled: same height as the reference
+        assert_eq!(mid.h, 88);
     }
 }
