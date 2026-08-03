@@ -1,5 +1,15 @@
 # Plan: `warframe-lite` — a standalone, Linux-native light variant of AlecaFrame
 
+> **Scope update (2026-08, [ADR-0007](adr/0007-live-world-state-out-of-scope.md)):**
+> The project is now scoped to **relics, equipment, and mastery** and the data
+> they touch (relic reward picking, owned-relic scanning, the mastery/fissure
+> plan, market prices, drop tables, mastery). General live **world state** — the
+> Void Trader and the Cetus/Vallis/Cambion cycles — is **out of scope** and being
+> removed. Live **Fissures** are the one `warframestat.us` feed kept, as a relic
+> feature (the mastery plan flags which relic tiers are runnable now). Text below
+> describing "timers & world state" as a co-equal must-have reflects the original
+> plan and is superseded by this note where the two disagree.
+
 ## Context
 
 AlecaFrame is the most capable Warframe companion app, but it is built as an
@@ -32,6 +42,8 @@ optional later phase, not part of the core "light" deliverable.
 - **Language:** Rust
 - **Form factor:** In-game overlay
 - **Must-have features:** Relic reward picker (OCR); Timers & world state
+  _(superseded — see the scope-update note above: general world state is now out
+  of scope; only live Fissures remain, as a relic feature)_
 - **Inventory tier:** Pursue via **memory reading** (later phase; user preferred this over credential-login API)
 - **Environment:** KDE Plasma (Wayland); Warframe launched via **Steam (Proton)**
 
@@ -96,9 +108,11 @@ game**. Summary of what shipped:
 - **Phase 0 — data plumbing ✅.** Config load, Steam-Proton `EE.log`
   auto-detection (appid 230410 via `libraryfolders.vdf`), live world state, and
   warframe.market pricing, all verified live.
-- **Phase 1 — world-state overlay ✅.** A pure-Rust `wlr-layer-shell` panel (top
-  layer, click-through) shows fissures (normal → Steel Path → Storm), Baro, and
-  the Cetus/Vallis/Cambion cycles, re-rendering every second so ETAs tick.
+- **Phase 1 — fissure overlay ✅.** A pure-Rust `wlr-layer-shell` panel (top
+  layer, click-through) shows fissures (normal → Steel Path → Storm),
+  re-rendering every second so ETAs tick. _(Originally also showed Baro and the
+  Cetus/Vallis/Cambion cycles; those are removed per ADR-0007 — general world
+  state is out of scope.)_
 - **Phase 2 — relic reward picker ✅.** OCR (`wf-ocr`, tesseract CLI) + picker
   brain (`wf-relic`: fuzzy match to the ~3.8k-item warframe.market catalogue +
   plat ranking). Handles the **variable, centred reward layout** (2–4 cards

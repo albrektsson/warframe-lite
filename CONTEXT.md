@@ -1,9 +1,16 @@
 # warframe-lite
 
-A Linux-native, Overwolf-free companion app for Warframe: a `wlr-layer-shell`
-overlay that shows live game timers and automatically picks the best relic
-reward, built entirely from data the game exposes on its own — never by
-reading or writing its process memory.
+A Linux-native, Overwolf-free companion app for Warframe focused on relics,
+equipment, and mastery: a `wlr-layer-shell` overlay that surfaces live Void
+Fissures and automatically picks the best relic reward, built entirely from
+data the game exposes on its own — never by reading or writing its process
+memory.
+
+Scope is deliberately narrow (see [ADR-0007](docs/adr/0007-live-world-state-out-of-scope.md)):
+relic reward picking, owned-relic scanning, the mastery/fissure plan, and the
+market/drop-table/mastery data those touch. General live world state — the
+Void Trader and the open-world day/night cycles — is **out of scope**. Live
+Void Fissures are the one live feed retained, because they are a relic feature.
 
 ## Language
 
@@ -11,7 +18,11 @@ reading or writing its process memory.
 
 **Fissure**:
 A timed Void mission that lets a player crack Relics for rewards. Comes in
-three tiers, sorted normal → Steel Path → Storm.
+three tiers, sorted normal → Steel Path → Storm. The live set of active
+Fissures is the one game-wide feed still polled from `warframestat.us` — kept
+because it is a relic feature (the Mastery plan uses it to flag which relic
+tiers are runnable right now), unlike the general world state that is now out
+of scope (see [ADR-0007](docs/adr/0007-live-world-state-out-of-scope.md)).
 _Avoid_: Void mission, relic mission.
 
 **Relic**:
@@ -97,19 +108,20 @@ ADR-0004). Surfaces as its own marker on the reward screen, separate from the
 mastery emblem.
 _Avoid_: Favorite, tracked item.
 
-### World state
+### Out of scope: general world state
 
-**World state**:
-The set of live, game-wide timers and statuses — Fissures, the Void Trader,
-and the Cetus/Vallis/Cambion cycles — polled from `warframestat.us`.
-_Avoid_: Live data, game status.
+**World state** (out of scope):
+The set of live, game-wide timers and statuses beyond Fissures — historically
+the Void Trader and the Cetus/Vallis/Cambion cycles, polled from
+`warframestat.us`. As of [ADR-0007](docs/adr/0007-live-world-state-out-of-scope.md)
+the project is scoped to relics/equipment/mastery, and this general world state
+is out of scope. Live **Fissures** are the one `warframestat.us` feed retained
+(defined above under _Fissures & rewards_), because they are a relic feature.
 
-**Void Trader**:
-Baro Ki'Teer, a vendor who visits on a recurring schedule; tracked as part of
-world state.
-_Avoid_: Baro (fine in conversation, but prefer "Void Trader" in code/UI so it
-reads consistently with the other world-state entries).
+**Void Trader** (out of scope):
+Baro Ki'Teer, a recurring vendor. No longer tracked — general world state, see
+ADR-0007.
 
-**Cycle**:
-A recurring day/night or weather rotation on an open-world zone (Cetus,
-Orb Vallis, Cambion Drift); tracked as part of world state.
+**Cycle** (out of scope):
+A day/night or weather rotation on an open-world zone (Cetus, Orb Vallis,
+Cambion Drift). No longer tracked — general world state, see ADR-0007.

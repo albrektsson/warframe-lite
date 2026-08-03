@@ -149,9 +149,9 @@ impl eframe::App for SettingsApp {
                     ui.add(egui::Slider::new(&mut self.config.overlay.opacity, 0.1..=1.0));
                     ui.end_row();
 
-                    ui.label("World-state panel");
+                    ui.label("Fissure panel");
                     ui.checkbox(
-                        &mut self.config.overlay.world_state,
+                        &mut self.config.overlay.fissures,
                         "show (off = reward picker only)",
                     );
                     ui.end_row();

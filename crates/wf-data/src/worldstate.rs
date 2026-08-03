@@ -1,10 +1,15 @@
-//! Live world-state from the warframestat.us API.
+//! Live Void Fissures from the warframestat.us API.
+//!
+//! General world state (Void Trader, open-world cycles) is out of scope — see
+//! ADR-0007. This module keeps only the Fissure feed, which is a relic feature:
+//! the mastery plan uses the active-fissure tiers to flag which owned relics are
+//! crackable right now.
 //!
 //! We deserialize only the subset of fields warframe-lite currently uses;
 //! serde ignores the (very large) remainder of the payload.
 //!
-//! Note: warframestat does not send pre-formatted `eta`/`timeLeft` strings on
-//! these objects — only an `expiry` timestamp — so we compute remaining time
+//! Note: warframestat does not send pre-formatted `eta` strings on these
+//! objects — only an `expiry` timestamp — so we compute remaining time
 //! ourselves from `expiry`.
 
 use serde::Deserialize;
@@ -42,60 +47,12 @@ impl Fissure {
     }
 }
 
-/// The Void Trader (Baro Ki'Teer).
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct VoidTrader {
-    /// Trader name, e.g. "Baro Ki'Teer".
-    pub character: String,
-    /// Relay where he is / will be.
-    pub location: String,
-    /// Whether he is currently present.
-    pub active: bool,
-    /// RFC3339 arrival time (relevant while away).
-    pub activation: String,
-    /// RFC3339 departure time (relevant while present).
-    pub expiry: String,
-}
-
-impl VoidTrader {
-    /// Formatted time until Baro arrives.
-    pub fn arrives_in(&self) -> String {
-        format_eta(&self.activation)
-    }
-
-    /// Formatted time until Baro leaves.
-    pub fn leaves_in(&self) -> String {
-        format_eta(&self.expiry)
-    }
-}
-
-/// A simple day/night-style cycle (Cetus, Vallis, Cambion, ...).
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct Cycle {
-    /// Current state, e.g. "day"/"night", "warm"/"cold", "fass"/"vome".
-    pub state: String,
-    /// RFC3339 expiry of the current state.
-    pub expiry: String,
-}
-
-impl Cycle {
-    /// Formatted time until the next state.
-    pub fn time_left(&self) -> String {
-        format_eta(&self.expiry)
-    }
-}
-
-/// The slice of world-state warframe-lite currently consumes.
+/// The slice of world-state warframe-lite consumes: just the live Fissures
+/// (see ADR-0007 — general world state is out of scope).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct WorldState {
     pub fissures: Vec<Fissure>,
-    pub void_trader: VoidTrader,
-    pub cetus_cycle: Cycle,
-    pub vallis_cycle: Cycle,
-    pub cambion_cycle: Cycle,
 }
 
 impl WorldState {

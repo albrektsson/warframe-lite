@@ -1,9 +1,9 @@
 //! warframe-lite — command-line entry point.
 //!
-//! Orchestrates the overlay, relic picker, mastery, and world-state/market
+//! Orchestrates the overlay, relic picker, mastery, and live-Fissure/market
 //! lookups. Running the binary with **no command prints usage** ([`print_help`]);
-//! every subcommand is dispatched from `main`. `status` shows live world state and
-//! a bare `<market_slug>` prices that item.
+//! every subcommand is dispatched from `main`. `status` shows live Void Fissures
+//! and a bare `<market_slug>` prices that item.
 
 use std::time::Duration;
 
@@ -76,15 +76,15 @@ async fn main() -> Result<()> {
 
     let client = http_client();
 
-    // --- World state ------------------------------------------------------
-    println!("\n== World state ({}) ==", config.platform);
+    // --- Live Fissures ----------------------------------------------------
+    println!("\n== Fissures ({}) ==", config.platform);
     match worldstate::fetch(&client, &config.platform).await {
-        Ok(ws) => print_worldstate(&ws),
-        Err(e) => println!("  worldstate fetch failed: {e:#}"),
+        Ok(ws) => print_fissures(&ws),
+        Err(e) => println!("  fissure fetch failed: {e:#}"),
     }
 
     // --- Optional market lookup ------------------------------------------
-    // Reached by `status` (world state only) or a bare `<slug>` (world state +
+    // Reached by `status` (fissures only) or a bare `<slug>` (fissures +
     // that item's price); every other command returned from the match above.
     if let Some(slug) = std::env::args().nth(1).filter(|a| a != "status") {
         println!("\n== Market: {slug} ==");
@@ -116,7 +116,7 @@ USAGE:
 
 RUN IT
     tray                  Tray icon: waits for the game, auto-runs the overlay
-    overlay               Show the live overlay (world state + relic picker)
+    overlay               Show the live overlay (live fissures + relic picker)
     settings              Open the graphical settings window
     browse                Open the mastery/relic browser (Mastery/Relics/Sell)
     toggle | show | hide  Show/hide a running overlay
@@ -128,8 +128,8 @@ RELICS & MASTERY
     detect-account        Auto-detect your account id from EE.log
     set-account <id>      Save your account id for mastery lookup
 
-WORLD STATE & PRICES
-    status                Show live fissures, Baro, and world cycles
+FISSURES & PRICES
+    status                Show live Void Fissures
     <market_slug>         Price an item, e.g. `wf-lite mirage_prime_set`
 
 DIAGNOSTICS
@@ -147,7 +147,7 @@ Config: ~/.config/warframe-lite/config.toml   Docs: README.md
     );
 }
 
-fn print_worldstate(ws: &worldstate::WorldState) {
+fn print_fissures(ws: &worldstate::WorldState) {
     let active: Vec<_> = ws.fissures.iter().filter(|f| f.active()).collect();
     println!("  Fissures: {} active", active.len());
     for f in active.iter().take(8) {
@@ -157,23 +157,6 @@ fn print_worldstate(ws: &worldstate::WorldState) {
             "    {:<6} {:<13} {:<22} {}{}{}",
             f.tier, f.mission_type, f.node, f.eta(), sp, storm
         );
-    }
-
-    let vt = &ws.void_trader;
-    if vt.active {
-        println!("  Baro: HERE at {} (leaves in {})", vt.location, vt.leaves_in());
-    } else if !vt.location.is_empty() {
-        println!("  Baro: {} (arrives in {})", vt.location, vt.arrives_in());
-    }
-
-    print_cycle("Cetus", &ws.cetus_cycle);
-    print_cycle("Vallis", &ws.vallis_cycle);
-    print_cycle("Cambion", &ws.cambion_cycle);
-}
-
-fn print_cycle(name: &str, c: &worldstate::Cycle) {
-    if !c.state.is_empty() {
-        println!("  {name}: {} ({} left)", c.state, c.time_left());
     }
 }
 
@@ -1176,7 +1159,7 @@ type RelicState = std::sync::Arc<std::sync::Mutex<Option<(std::time::Instant, Ve
 /// (which reads it every iteration to decide whether to scan or idle).
 type RelicDeadline = std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>;
 
-/// Show the live overlay as a `wlr-layer-shell` surface: world state normally,
+/// Show the live overlay as a `wlr-layer-shell` surface: live Fissures normally,
 /// automatically swapping to the relic reward result for a few seconds when a
 /// fissure reward is detected in the log.
 async fn run_overlay(config: Config) -> Result<()> {
@@ -1186,21 +1169,21 @@ async fn run_overlay(config: Config) -> Result<()> {
     let font = Arc::new(wf_overlay::load_font()?);
     let client = http_client();
     let platform = config.platform.clone();
-    let refresh = Duration::from_secs(config.worldstate_refresh_secs.max(15));
+    let refresh = Duration::from_secs(config.fissure_refresh_secs.max(15));
     let reward: RewardState = Arc::new(Mutex::new(None));
     let relic: RelicState = Arc::new(Mutex::new(None));
 
     // Appearance/visibility knobs. `visible` is flipped at runtime by the control
-    // socket (see `overlay_control`); `show_world` and `opacity` come from config.
+    // socket (see `overlay_control`); `show_fissures` and `opacity` come from config.
     let visible = Arc::new(AtomicBool::new(true));
-    let show_world = config.overlay.world_state;
+    let show_fissures = config.overlay.fissures;
     let opacity = config.overlay.opacity;
 
     // Build one overlay frame from the current state, honoring reward-only mode,
     // the visibility toggle, and opacity. A hidden or empty frame is a fully
     // transparent (click-through) canvas.
     // Panel priority when shown: reward screen (time-critical, ~20s) → owned-relic
-    // guide (while/after a Relics-screen scan) → world state → blank.
+    // guide (while/after a Relics-screen scan) → live fissures → blank.
     let make_frame = {
         let font = font.clone();
         let reward = reward.clone();
@@ -1225,7 +1208,7 @@ async fn run_overlay(config: Config) -> Result<()> {
                 .map(|(_, r)| r.clone())
             {
                 wf_overlay::render_relic_panel(&rows, &font).embed(OVERLAY_W, OVERLAY_H)
-            } else if show_world {
+            } else if show_fissures {
                 wf_overlay::render_panel(ws, &font).embed(OVERLAY_W, OVERLAY_H)
             } else {
                 blank()
@@ -1237,11 +1220,11 @@ async fn run_overlay(config: Config) -> Result<()> {
 
     println!("\n== Live overlay (Ctrl-C to stop) ==");
     println!(
-        "  placement: {} (margin {}x{}); world panel: {}; opacity: {opacity}",
+        "  placement: {} (margin {}x{}); fissure panel: {}; opacity: {opacity}",
         config.overlay.anchor,
         config.overlay.margin_x,
         config.overlay.margin_y,
-        if show_world { "on" } else { "reward-only" },
+        if show_fissures { "on" } else { "reward-only" },
     );
     let ws = worldstate::fetch(&client, &platform)
         .await

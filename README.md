@@ -6,9 +6,9 @@ Overwolf**. Built for KDE Plasma (Wayland) with the game under Steam Proton, in 
 
 It shows a click-through overlay on top of the game with:
 
-- **Live world state** — Void Fissures (sorted normal → Steel Path → Storm), the
-  Void Trader, and the Cetus / Vallis / Cambion day-night cycles, with ETAs that
-  tick down each second.
+- **Live Void Fissures** — sorted normal → Steel Path → Storm, with ETAs that
+  tick down each second. (General world state — the Void Trader and open-world
+  cycles — is out of scope; see `docs/adr/0007-live-world-state-out-of-scope.md`.)
 - **An automatic relic reward picker** — when a Void Fissure reward screen
   appears, the overlay swaps to the 2–4 rewards ranked by live warframe.market
   plat price, with the best pick highlighted and a mastery emblem in front of
@@ -104,12 +104,12 @@ A Fedora `.spec` builds from source with the standard Rust macros and pulls in
 
 ```
 wf-lite                    # (no command) show this list of commands
-wf-lite status             # live world state (fissures, Baro, cycles)
+wf-lite status             # live Void Fissures
 wf-lite <market_slug>      # price an item, e.g. `wf-lite mirage_prime_set`
 wf-lite relics <codes…>    # owned-relic guide: unmastered rewards + prices
 wf-lite mastery-plan       # unmastered primes + which owned relics drop them
 wf-lite tray               # tray companion: waits for the game, runs the overlay
-wf-lite overlay            # show the live overlay (world state + relic picker)
+wf-lite overlay            # show the live overlay (live fissures + relic picker)
 wf-lite settings           # open the graphical settings window (needs wf-settings)
 wf-lite toggle             # show/hide a running overlay (also: show / hide)
 wf-lite capture [out.png]  # capture the Warframe window to a PNG
@@ -140,7 +140,7 @@ anchor = "top-right"   # top-left | top-right | bottom-left | bottom-right
                        # | top | bottom | left | right | center
 margin_x = 24          # horizontal inset from the anchored edge(s), px
 margin_y = 24          # vertical inset
-world_state = true     # false = reward-only: invisible until a relic reward screen
+fissures = true        # false = reward-only: invisible until a relic reward screen
 opacity = 1.0          # 1.0 = as-drawn, lower = more transparent (e.g. 0.7)
 ```
 
@@ -152,7 +152,7 @@ The running overlay listens on a control socket and shows/hides instantly.
 ### Settings window
 
 `wf-lite settings` opens a small graphical window (`wf-settings`) to edit
-placement, opacity, and the world-state toggle, detect your account id, and help
+placement, opacity, and the fissure-panel toggle, detect your account id, and help
 bind the KDE hotkey — all writing the same `config.toml`. It's a **separate
 binary** so the overlay stays dependency-light; download `wf-settings` from the
 release alongside `wf-lite`, or build it with `cargo build --release -p

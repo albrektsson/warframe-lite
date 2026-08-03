@@ -22,12 +22,12 @@ const EE_LOG_REL: &str =
 pub struct Config {
     /// Path to Warframe's `EE.log`. `None` means "auto-detect at runtime".
     pub ee_log_path: Option<PathBuf>,
-    /// Which platform to query world-state for (pc, ps4, xb1, swi, mob).
+    /// Which platform to query live Fissures for (pc, ps4, xb1, swi, mob).
     pub platform: String,
     /// Warframe.market platform (pc, ps4, xbox, switch).
     pub market_platform: String,
-    /// How often to refresh world-state, in seconds.
-    pub worldstate_refresh_secs: u64,
+    /// How often to refresh the live Fissure list, in seconds.
+    pub fissure_refresh_secs: u64,
     /// Warframe account id (24-hex) for mastery lookup via the public profile
     /// API. Find it at <https://www.warframe.com/api/user-data> (`user_id`).
     /// `None` disables mastery indicators.
@@ -38,7 +38,7 @@ pub struct Config {
 
 /// Where the overlay sits and how visible it is. Warframe uses every screen
 /// corner for HUD/menu elements, so position, opacity, and whether the
-/// persistent world-state panel shows at all are all configurable.
+/// persistent Fissure panel shows at all are all configurable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OverlayConfig {
@@ -49,9 +49,9 @@ pub struct OverlayConfig {
     pub margin_x: i32,
     /// Vertical inset from the anchored edge(s), in pixels.
     pub margin_y: i32,
-    /// Show the persistent world-state panel. When `false`, the overlay is
+    /// Show the persistent live-Fissure panel. When `false`, the overlay is
     /// invisible until a relic reward screen is detected (reward-only mode).
-    pub world_state: bool,
+    pub fissures: bool,
     /// Panel opacity, `0.0` (invisible) to `1.0` (as-drawn). Scales the whole
     /// panel's alpha so it obscures less of the game behind it.
     pub opacity: f32,
@@ -63,7 +63,7 @@ impl Default for OverlayConfig {
             anchor: "top-right".to_string(),
             margin_x: 24,
             margin_y: 24,
-            world_state: true,
+            fissures: true,
             opacity: 1.0,
         }
     }
@@ -75,7 +75,7 @@ impl Default for Config {
             ee_log_path: None,
             platform: "pc".to_string(),
             market_platform: "pc".to_string(),
-            worldstate_refresh_secs: 60,
+            fissure_refresh_secs: 60,
             account_id: None,
             overlay: OverlayConfig::default(),
         }
@@ -250,6 +250,6 @@ mod tests {
         let text = toml::to_string_pretty(&cfg).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.platform, cfg.platform);
-        assert_eq!(back.worldstate_refresh_secs, cfg.worldstate_refresh_secs);
+        assert_eq!(back.fissure_refresh_secs, cfg.fissure_refresh_secs);
     }
 }

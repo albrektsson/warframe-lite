@@ -1,4 +1,4 @@
-//! Renders the world-state info panel to a [`Canvas`].
+//! Renders the live-Fissure info panel to a [`Canvas`].
 
 use anyhow::Result;
 use fontdue::Font;
@@ -20,7 +20,6 @@ const BG: Color = Color::rgba(18, 20, 26, 235);
 const TITLE: Color = Color::rgb(120, 200, 255);
 const TEXT: Color = Color::rgb(220, 224, 230);
 const DIM: Color = Color::rgb(150, 156, 166);
-const BARO: Color = Color::rgb(120, 230, 170);
 
 /// Candidate monospace fonts, first existing wins.
 const FONT_CANDIDATES: &[&str] = &[
@@ -71,12 +70,6 @@ pub fn render_panel(ws: &WorldState, font: &Font) -> Canvas {
     let mut rows = 1; // title
     rows += shown as i32; // fissures
     rows += 1; // "+N more" or spacing
-    rows += 1; // baro
-    for c in [&ws.cetus_cycle, &ws.vallis_cycle, &ws.cambion_cycle] {
-        if !c.state.is_empty() {
-            rows += 1;
-        }
-    }
     let height = (PAD * 2 + rows * LINE_H) as u32;
 
     let mut canvas = Canvas::new(WIDTH, height);
@@ -113,33 +106,6 @@ pub fn render_panel(ws: &WorldState, font: &Font) -> Canvas {
     if fissures.len() > MAX_FISSURES {
         let more = format!("+{} more fissures", fissures.len() - MAX_FISSURES);
         canvas.draw_text(font, &more, PAD as f32, y as f32, FONT_PX, DIM);
-    }
-    y += LINE_H;
-
-    // Baro.
-    let vt = &ws.void_trader;
-    let baro = if vt.active {
-        format!("Baro: HERE @ {} · leaves {}", vt.location, vt.leaves_in())
-    } else if !vt.location.is_empty() {
-        format!("Baro: {} · in {}", vt.location, vt.arrives_in())
-    } else {
-        "Baro: —".to_string()
-    };
-    canvas.draw_text(font, &truncate(&baro, 46), PAD as f32, y as f32, FONT_PX, BARO);
-    y += LINE_H;
-
-    // Cycles.
-    for (name, c) in [
-        ("Cetus", &ws.cetus_cycle),
-        ("Vallis", &ws.vallis_cycle),
-        ("Cambion", &ws.cambion_cycle),
-    ] {
-        if c.state.is_empty() {
-            continue;
-        }
-        let line = format!("{:<8} {} · {}", name, pad_right(&c.state, 6), c.time_left());
-        canvas.draw_text(font, &line, PAD as f32, y as f32, FONT_PX, TEXT);
-        y += LINE_H;
     }
 
     canvas
@@ -269,14 +235,6 @@ pub fn render_relic_panel(rows: &[RelicRow], font: &Font) -> Canvas {
     canvas
 }
 
-fn pad_right(s: &str, n: usize) -> String {
-    let mut s = s.to_string();
-    while s.chars().count() < n {
-        s.push(' ');
-    }
-    s
-}
-
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()
@@ -304,8 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn truncate_and_pad_helpers() {
-        assert_eq!(pad_right("ab", 4), "ab  ");
+    fn truncate_helper() {
         assert_eq!(truncate("abcdef", 4), "abc…");
         assert_eq!(truncate("ab", 4), "ab");
     }

@@ -11,8 +11,9 @@ refused, not implemented.
 A single Cargo workspace of focused crates:
 
 - **wf-config** — TOML config + Steam-Proton `EE.log` auto-detection.
-- **wf-data** — external read-only APIs: world state (`warframestat.us`), market
-  prices + item catalogue (`warframe.market` v2).
+- **wf-data** — external read-only APIs: live Void Fissures (`warframestat.us`;
+  general world state is out of scope, see ADR-0007), market prices + item
+  catalogue (`warframe.market` v2).
 - **wf-log** — `EE.log` line parser, rotation-aware tailer, and event classifier
   (relic crack / reward-screen markers).
 - **wf-capture** — pure-Rust X11 capture (`x11rb`) of the Warframe Xwayland

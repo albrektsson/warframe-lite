@@ -1,7 +1,7 @@
 //! Overlay rendering and display for warframe-lite.
 //!
 //! * [`canvas`] — a tiny dependency-free RGBA drawing surface.
-//! * [`render`] — draws the world-state panel onto a canvas.
+//! * [`render`] — draws the live-Fissure panel onto a canvas.
 //! * [`layer`] — shows a canvas as a Wayland `wlr-layer-shell` overlay.
 
 pub mod canvas;
