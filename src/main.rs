@@ -718,6 +718,18 @@ fn card_has_eye(image: &image::RgbaImage, eye: &wf_relic::Rect) -> bool {
 /// for a real "15". Tunable — one of the two scan-calibration knobs.
 const RELIC_COUNT_CAP: u32 = 99;
 
+/// Max ink coverage for a name-crop to be treated as a text line rather than
+/// relic-orb artwork. A name line is thin strokes on dark (well under this); an
+/// orb or item render fills most of the crop. Lets the dense phase sampling skip
+/// the many candidates that land on artwork without an OCR call.
+const MAX_NAME_COVERAGE: f32 = 0.30;
+
+/// Min horizontal ink spread (fraction of crop width) for a name crop to count
+/// as a name *line* during phase alignment. A relic name spans most of the crop;
+/// the `xN` count badge one row up is text too but only a narrow left strip, so
+/// this stops phase selection from locking onto the badge row.
+const MIN_NAME_HSPAN: f32 = 0.35;
+
 /// How many frames must agree on a relic's count before it is believed. Two is
 /// enough to defeat a lone OCR outlier while still confirming within a single
 /// dwell on the card; mode-voting lets the true value overtake a wrong pair as
@@ -744,21 +756,63 @@ enum ObsKind {
     Unowned,
 }
 
+/// Preprocessing for the relic grid: 4× upscale, light-on-dark threshold.
+fn grid_pre() -> wf_ocr::Preprocess {
+    wf_ocr::Preprocess { scale: 4, threshold: 140, light_text: true }
+}
+
+/// Crop a slot rectangle out of a frame.
+fn crop_rect(image: &image::RgbaImage, r: &wf_relic::Rect) -> image::RgbaImage {
+    image::imageops::crop_imm(image, r.x, r.y, r.w, r.h).to_image()
+}
+
+/// The vertical phase (fraction of a `row_pitch`) whose name band best lands on
+/// real text. The Relics list scrolls continuously, so the true rows sit at an
+/// arbitrary sub-pitch offset; we score a handful of phases by how many name
+/// crops have text-like ink coverage — cheaply, with **no** OCR and no upscale —
+/// and keep the best. This is what makes one aligned OCR pass enough, instead of
+/// OCR-ing every phase (which was ~7× the cost, minutes per frame).
+fn best_grid_phase(image: &image::RgbaImage, regions: &wf_relic::RelicGridRegions) -> f32 {
+    const PHASE_SAMPLES: u32 = 12;
+    let coarse = wf_ocr::Preprocess { scale: 1, threshold: 140, light_text: true };
+    (0..PHASE_SAMPLES)
+        .map(|p| {
+            let phase = p as f32 / PHASE_SAMPLES as f32;
+            let score = regions
+                .slots(image.width(), image.height(), phase)
+                .iter()
+                .filter(|s| {
+                    // A name line spreads across the crop; the badge row above is
+                    // also text but narrow, so require horizontal spread too.
+                    wf_ocr::looks_like_name_line(
+                        &crop_rect(image, &s.name),
+                        coarse,
+                        MAX_NAME_COVERAGE,
+                        MIN_NAME_HSPAN,
+                    )
+                })
+                .count();
+            (p, score)
+        })
+        .max_by_key(|&(_, score)| score)
+        .map(|(p, _)| p as f32 / PHASE_SAMPLES as f32)
+        .unwrap_or(0.0)
+}
+
 /// OCR the Void Relics grid in `image` and resolve each visible card to a
-/// `(relic, refinement)` observation. Unlike the old max-merge scanner this reads
-/// *every* card — including ones flagged with the "unowned" eye icon, whose name
-/// we now need so a later scan can zero the right relic — and it collapses each
-/// frame to **one** vote per `(code, refinement)`: a frame that reads a card two
-/// ways (across sampled row phases) abstains rather than double-voting, so the
-/// caller's agreement gate really counts *frames*, not slots.
+/// `(relic, refinement)` observation. Reads *every* card — including ones flagged
+/// with the "unowned" eye icon, whose name we now need so a later scan can zero
+/// the right relic — at the single best-aligned vertical phase (see
+/// [`best_grid_phase`]), collapsing the frame to **one** vote per
+/// `(code, refinement)` so the caller's agreement gate counts *frames*, not slots.
 fn scan_relic_grid(
     image: &image::RgbaImage,
     ocr: &wf_ocr::Ocr,
     regions: &wf_relic::RelicGridRegions,
     index: &wf_relic::RelicIndex,
 ) -> Vec<RelicObservation> {
-    let pre = wf_ocr::Preprocess { scale: 4, threshold: 140, light_text: true };
-    let slots = regions.slots(image.width(), image.height());
+    let pre = grid_pre();
+    let slots = regions.slots(image.width(), image.height(), best_grid_phase(image, regions));
 
     // OCR every card concurrently — each slot shells out to tesseract, so ~32
     // calls run in parallel across cores instead of ~2s×32 serially.
@@ -772,8 +826,15 @@ fn scan_relic_grid(
                             image, slot.name.x, slot.name.y, slot.name.w, slot.name.h,
                         )
                         .to_image();
+                        // Even at the aligned phase, some columns land on artwork
+                        // or empty cells; skip those before paying for OCR — a
+                        // name line's ink coverage is far below solid artwork's.
+                        if !wf_ocr::looks_like_text(&name_crop, pre, MAX_NAME_COVERAGE) {
+                            return None;
+                        }
+                        // Read as a block: refined names wrap onto two lines.
                         let raw = ocr
-                            .recognize(&name_crop, pre, wf_ocr::PageMode::Line)
+                            .recognize(&name_crop, pre, wf_ocr::PageMode::Block)
                             .unwrap_or_default()
                             .replace('\n', " ");
                         let (base, refinement) = wf_relic::parse_refinement(&raw);
@@ -870,16 +931,18 @@ async fn relic_grid_file() -> Result<()> {
     let ocr = wf_ocr::Ocr::new()?;
     let regions = wf_relic::RelicGridRegions::default_calibration();
 
-    // Per-slot debug (eye NCC + OCR) to calibrate ownership + regions.
-    let pre = wf_ocr::Preprocess { scale: 4, threshold: 140, light_text: true };
-    for (i, slot) in regions.slots(image.width(), image.height()).iter().enumerate() {
+    // Per-slot debug (eye NCC + OCR) to calibrate ownership + regions, at the
+    // same best-aligned phase the live scanner picks.
+    let pre = grid_pre();
+    let phase = best_grid_phase(&image, &regions);
+    for (i, slot) in regions.slots(image.width(), image.height(), phase).iter().enumerate() {
         let ncc = eye_ncc(&image, &slot.eye);
         let raw = ocr
             .recognize(
                 &image::imageops::crop_imm(&image, slot.name.x, slot.name.y, slot.name.w, slot.name.h)
                     .to_image(),
                 pre,
-                wf_ocr::PageMode::Line,
+                wf_ocr::PageMode::Block,
             )
             .unwrap_or_default()
             .replace('\n', " ");

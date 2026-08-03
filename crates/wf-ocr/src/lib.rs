@@ -161,6 +161,60 @@ pub fn is_blank(img: &RgbaImage, pre: Preprocess) -> bool {
     text_fraction(&preprocess(img, pre)) < MIN_TEXT_FRACTION
 }
 
+/// Fraction of `img` classified as ink (text-coloured) after `pre`
+/// preprocessing, in `0.0..=1.0`. A line of text covers only a small fraction;
+/// a solid graphic (a relic orb, item artwork) covers a large one. Grid
+/// scanners use this to skip candidate crops that landed on artwork rather than
+/// a name line before paying for an OCR call — see [`looks_like_text`].
+pub fn text_coverage(img: &RgbaImage, pre: Preprocess) -> f32 {
+    text_fraction(&preprocess(img, pre))
+}
+
+/// Whether a preprocessed crop's ink coverage falls in the band typical of a
+/// **line of text** — above the blank floor, below the density of solid
+/// artwork. Lets a scanner reject both empty gaps and relic-orb/artwork crops
+/// cheaply, so dense candidate sampling doesn't spend an OCR call on every one.
+pub fn looks_like_text(img: &RgbaImage, pre: Preprocess, max_coverage: f32) -> bool {
+    let c = text_coverage(img, pre);
+    c >= MIN_TEXT_FRACTION && c <= max_coverage
+}
+
+/// Whether a crop looks like a **full line of text** — text-band coverage *and*
+/// ink spread across a good fraction of its width. The extra width test tells a
+/// wide name line apart from a short label that is also text-like but occupies
+/// only a narrow strip (a relic card's `xN` count badge), so grid phase-
+/// alignment locks onto the name row rather than the badge row above it. One
+/// preprocess pass computes both signals.
+pub fn looks_like_name_line(
+    img: &RgbaImage,
+    pre: Preprocess,
+    max_coverage: f32,
+    min_hspan: f32,
+) -> bool {
+    let g = preprocess(img, pre);
+    let (w, h) = (g.width(), g.height());
+    if w == 0 || h == 0 {
+        return false;
+    }
+    let mut ink = 0u64;
+    let mut cols_with_ink = 0u32;
+    for x in 0..w {
+        let mut col_has_ink = false;
+        for y in 0..h {
+            if g.get_pixel(x, y).0[0] == 0 {
+                ink += 1;
+                col_has_ink = true;
+            }
+        }
+        if col_has_ink {
+            cols_with_ink += 1;
+        }
+    }
+    let coverage = ink as f32 / (w as u64 * h as u64) as f32;
+    let hspan = cols_with_ink as f32 / w as f32;
+    coverage >= MIN_TEXT_FRACTION && coverage <= max_coverage && hspan >= min_hspan
+}
+
 /// Fraction of pixels classified as "text" (dark) in a preprocessed image.
 fn text_fraction(img: &GrayImage) -> f32 {
     let total = (img.width() as u64 * img.height() as u64).max(1);
@@ -232,6 +286,31 @@ mod tests {
     fn psm_mapping() {
         assert_eq!(PageMode::Line.psm(), "7");
         assert_eq!(PageMode::Block.psm(), "6");
+    }
+
+    #[test]
+    fn name_line_needs_width_not_just_ink() {
+        let pre = Preprocess { scale: 1, threshold: 140, light_text: true };
+        // A wide line: bright (text) pixels spread across most columns.
+        let mut wide = RgbaImage::from_pixel(40, 8, image::Rgba([10, 10, 10, 255]));
+        for x in 2..38 {
+            wide.put_pixel(x, 4, image::Rgba([240, 240, 240, 255]));
+        }
+        assert!(looks_like_name_line(&wide, pre, 0.30, 0.35));
+
+        // A narrow blob (like an "xN" badge) has ink but only in a few columns —
+        // rejected, so phase alignment won't lock onto the badge row.
+        let mut narrow = RgbaImage::from_pixel(40, 8, image::Rgba([10, 10, 10, 255]));
+        for x in 0..5 {
+            for y in 0..8 {
+                narrow.put_pixel(x, y, image::Rgba([240, 240, 240, 255]));
+            }
+        }
+        assert!(!looks_like_name_line(&narrow, pre, 0.30, 0.35));
+
+        // A solid bright block (a relic orb) is too dense — rejected by coverage.
+        let dense = RgbaImage::from_pixel(40, 8, image::Rgba([240, 240, 240, 255]));
+        assert!(!looks_like_name_line(&dense, pre, 0.30, 0.35));
     }
 
     #[test]
