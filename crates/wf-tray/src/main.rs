@@ -13,11 +13,42 @@
 
 use std::path::PathBuf;
 use std::process::Child;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use ksni::TrayMethods;
 
 const POLL: Duration = Duration::from_secs(2);
+
+/// The warframe-lite mark (a hexagon enclosing an "M"), bundled as a PNG so the
+/// tray icon lives inside the binary — no dependency on an installed icon theme,
+/// which is why a bare `icon_name` showed nothing. Decoded once into ksni's
+/// ARGB32 pixmap on first use.
+fn app_icon() -> Vec<ksni::Icon> {
+    static ICON: OnceLock<Option<ksni::Icon>> = OnceLock::new();
+    ICON.get_or_init(|| {
+        let bytes = include_bytes!("../assets/icon.png");
+        match image::load_from_memory(bytes) {
+            Ok(img) => {
+                let img = img.to_rgba8();
+                let (width, height) = (img.width() as i32, img.height() as i32);
+                let mut data = img.into_vec();
+                // ksni wants ARGB32 in network byte order; `image` gives RGBA.
+                for px in data.chunks_exact_mut(4) {
+                    px.rotate_right(1);
+                }
+                Some(ksni::Icon { width, height, data })
+            }
+            Err(e) => {
+                tracing::error!("failed to decode bundled tray icon: {e}");
+                None
+            }
+        }
+    })
+    .clone()
+    .into_iter()
+    .collect()
+}
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -135,15 +166,15 @@ impl ksni::Tray for WfTray {
     fn title(&self) -> String {
         "warframe-lite".into()
     }
-    fn icon_name(&self) -> String {
-        "warframe-lite".into()
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        app_icon()
     }
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {
             title: "warframe-lite".into(),
             description: self.status_text(),
-            icon_name: "warframe-lite".into(),
-            icon_pixmap: Vec::new(),
+            icon_name: String::new(),
+            icon_pixmap: app_icon(),
         }
     }
 

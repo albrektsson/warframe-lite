@@ -17,3 +17,6 @@ tokio.workspace = true
 # StatusNotifierItem tray via DBus (KDE Plasma). ksni 0.3 is pure-Rust (zbus),
 # so it adds no system dbus/link dependency.
 ksni = "0.3"
+# Decodes the bundled tray-icon PNG into ksni's ARGB32 pixmap, so the icon
+# travels inside the binary rather than depending on an installed icon theme.
+image.workspace = true
