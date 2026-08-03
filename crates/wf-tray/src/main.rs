@@ -136,13 +136,13 @@ impl ksni::Tray for WfTray {
         "warframe-lite".into()
     }
     fn icon_name(&self) -> String {
-        "applications-games".into()
+        "warframe-lite".into()
     }
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {
             title: "warframe-lite".into(),
             description: self.status_text(),
-            icon_name: "applications-games".into(),
+            icon_name: "warframe-lite".into(),
             icon_pixmap: Vec::new(),
         }
     }

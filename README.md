@@ -65,6 +65,7 @@ your launcher:
 ```
 install -Dm755 wf-tray ~/.local/bin/wf-tray
 install -Dm644 packaging/warframe-lite.desktop ~/.local/share/applications/warframe-lite.desktop
+install -Dm644 packaging/warframe-lite.svg ~/.local/share/icons/hicolor/scalable/apps/warframe-lite.svg
 ```
 
 Prefer no tray? Start the overlay directly instead — either in a terminal
