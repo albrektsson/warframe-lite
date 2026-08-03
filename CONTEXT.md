@@ -46,9 +46,32 @@ the target of relic-cracking and fissure planning.
 **Owned relic**:
 A Relic the player currently holds, known only from OCR-scanning the in-game
 Void Relics screen (see ADR-0001) — never read from process memory or a login
-API. Ownership is a count per relic code (e.g. "Axi H3"), not per copy.
+API. Ownership is a **Confirmed count** per (relic code, **Refinement**) pair —
+e.g. "Axi H3" Intact and "Axi H3" Radiant are counted separately — not per copy.
 _Avoid_: Relic inventory (reads as authoritative/API-sourced; "owned relic"
 keeps it clear the count is scan-derived and can lag or miss entries).
+
+**Refinement**:
+A Relic's state — Intact, Exceptional, Flawless, or Radiant — which improves
+its rare-drop odds and is shown as a bracketed suffix on the Void Relics screen
+("Meso Z4 Relic [Radiant]"). Part of a Relic's scanned identity: the same code
+in different refinements is tracked as distinct owned entries. Fissure planning
+uses the Intact drop tables, so only Intact copies feed the Mastery plan.
+
+**Confirmed count**:
+An owned-relic count trusted only after the OCR scan reads the same value on
+enough frames to agree with itself (see ADR-0005) — never from a single read.
+Corrects downward on new evidence; drops to zero only when a card is scanned
+showing the "unowned" eye icon. A count never re-confirmed on a later scan is
+kept but flagged by its **Scan age**, never silently deleted.
+_Avoid_: Owned count (fine loosely, but "confirmed" marks that a lone or
+outlier OCR read is not yet believed).
+
+**Scan age**:
+How long ago a specific owned entry was last confirmed by a scan (`last_seen`,
+per entry — not one timestamp for the whole set). Surfaces as a per-relic
+"seen N ago" freshness marker so a stale count that no longer matches the
+in-game inventory is visible rather than silently trusted.
 
 **Mastery plan**:
 The ranked view of owned relics grouped by the Unmastered prime they can still

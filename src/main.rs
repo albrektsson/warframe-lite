@@ -433,7 +433,7 @@ fn pair_relic_codes(tokens: &[String]) -> Vec<String> {
 /// `wf-lite mastery-plan`.
 async fn mastery_plan_cmd(config: &Config) -> Result<()> {
     let Some(owned) =
-        wf_cache::load_blob::<std::collections::HashMap<String, u32>>(wf_relic::OWNED_RELICS_FILE)
+        wf_cache::load_blob::<wf_relic::OwnedRelics>(wf_relic::OWNED_RELICS_FILE)
     else {
         anyhow::bail!(
             "no owned-relic data yet. Run `wf-lite overlay` (or the tray) and open the in-game \
@@ -441,11 +441,22 @@ async fn mastery_plan_cmd(config: &Config) -> Result<()> {
         );
     };
 
-    println!("\n== Mastery plan (owned relics scanned {}) ==", wf_cache::format_age(owned.age()));
+    // Per-entry scan ages are the authoritative freshness signal now; summarise
+    // them as a range for the header (the file-level stamp is just when it was
+    // last written).
+    let age_note = match wf_relic::intact_age_range(&owned.value) {
+        Some((newest, oldest)) if newest == oldest => wf_cache::format_age(oldest),
+        Some((newest, oldest)) => {
+            format!("{} – {}", wf_cache::format_age(newest), wf_cache::format_age(oldest))
+        }
+        None => wf_cache::format_age(owned.age()),
+    };
+    println!("\n== Mastery plan (owned relics scanned {age_note}) ==");
     let client = http_client();
     let index = wf_relic::RelicIndex::load_cached(&client, CATALOGUE_TTL).await?;
     let mastery = load_mastery(config, &client).await;
-    let plans = wf_relic::mastery_plan(&owned.value, &index, &mastery);
+    let intact = wf_relic::intact_counts(&owned.value);
+    let plans = wf_relic::mastery_plan(&intact, &index, &mastery);
 
     if plans.is_empty() {
         println!("  no unmastered primes found among your scanned relics");
@@ -629,29 +640,6 @@ async fn relic_file(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Strip a trailing "Relic"/"Relics" word from an OCR'd relic label so it matches
-/// a [`wf_relic::RelicIndex`] code, e.g. `"Neo T2 Relic"` → `"Neo T2"`.
-fn strip_relic_word(s: &str) -> String {
-    let t = s.trim();
-    let lower = t.to_lowercase();
-    for suf in [" relics", " relic"] {
-        if let Some(stripped) = lower.strip_suffix(suf) {
-            return t[..stripped.len()].trim().to_string();
-        }
-    }
-    t.to_string()
-}
-
-/// Parse an owned-count badge (`"x62"`) into a number; defaults to 1.
-fn parse_count(s: &str) -> u32 {
-    s.chars()
-        .filter(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .parse()
-        .unwrap_or(1)
-        .max(1)
-}
-
 /// Normalized (mean-subtracted, unit-norm) grayscale of the bundled "unowned"
 /// eye-icon template, plus its dimensions. Decoded once.
 fn eye_template() -> &'static (Vec<f32>, usize, usize) {
@@ -723,62 +711,148 @@ fn card_has_eye(image: &image::RgbaImage, eye: &wf_relic::Rect) -> bool {
     eye_ncc(image, eye) >= EYE_THRESHOLD
 }
 
-/// OCR the Void Relics grid in `image` and resolve each visible card to a relic +
-/// owned count (deduped, keeping the max count seen). Cards showing the "unowned"
-/// eye icon are skipped. The union across many frames while the player scrolls
-/// builds their owned set.
+/// Upper bound on a plausible per-refinement Intact owned count. Any badge that
+/// reads above this is rejected as OCR garbage rather than trusted (see
+/// ADR-0005). Deliberately well above a realistic hoard of one relic so genuine
+/// large counts still register; the observed failure mode was a spurious "145"
+/// for a real "15". Tunable — one of the two scan-calibration knobs.
+const RELIC_COUNT_CAP: u32 = 99;
+
+/// How many frames must agree on a relic's count before it is believed. Two is
+/// enough to defeat a lone OCR outlier while still confirming within a single
+/// dwell on the card; mode-voting lets the true value overtake a wrong pair as
+/// the player keeps scrolling (see ADR-0005).
+const RELIC_AGREEMENT: u32 = 2;
+
+/// One relic card's resolved reading on a single frame.
+struct RelicObservation {
+    /// Relic display code, e.g. "Meso B9".
+    display: String,
+    refinement: wf_relic::Refinement,
+    kind: ObsKind,
+}
+
+/// What a single frame concluded about one relic card.
+enum ObsKind {
+    /// The count badge read as this value (a genuinely blank badge → 1, since a
+    /// single copy shows no badge on the Void Relics screen).
+    Count(u32),
+    /// The card resolved to a relic but its badge was present-yet-unreadable, so
+    /// this frame casts no count vote rather than guessing.
+    Abstain,
+    /// The "unowned" eye icon is present — positive proof the player owns zero.
+    Unowned,
+}
+
+/// OCR the Void Relics grid in `image` and resolve each visible card to a
+/// `(relic, refinement)` observation. Unlike the old max-merge scanner this reads
+/// *every* card — including ones flagged with the "unowned" eye icon, whose name
+/// we now need so a later scan can zero the right relic — and it collapses each
+/// frame to **one** vote per `(code, refinement)`: a frame that reads a card two
+/// ways (across sampled row phases) abstains rather than double-voting, so the
+/// caller's agreement gate really counts *frames*, not slots.
 fn scan_relic_grid(
     image: &image::RgbaImage,
     ocr: &wf_ocr::Ocr,
     regions: &wf_relic::RelicGridRegions,
     index: &wf_relic::RelicIndex,
-) -> Vec<(String, u32)> {
+) -> Vec<RelicObservation> {
     let pre = wf_ocr::Preprocess { scale: 4, threshold: 140, light_text: true };
     let slots = regions.slots(image.width(), image.height());
 
     // OCR every card concurrently — each slot shells out to tesseract, so ~32
     // calls run in parallel across cores instead of ~2s×32 serially.
-    let resolved: Vec<Option<(String, u32)>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = slots
-            .iter()
-            .map(|slot| {
-                scope.spawn(move || {
-                    // Skip relics the player doesn't own (marked with an eye icon).
-                    if card_has_eye(image, &slot.eye) {
-                        return None;
-                    }
-                    let name_crop = image::imageops::crop_imm(
-                        image, slot.name.x, slot.name.y, slot.name.w, slot.name.h,
-                    )
-                    .to_image();
-                    let raw = ocr
-                        .recognize(&name_crop, pre, wf_ocr::PageMode::Line)
-                        .unwrap_or_default()
-                        .replace('\n', " ");
-                    let info = index.best_match(&strip_relic_word(&raw))?;
-                    let count_crop = image::imageops::crop_imm(
-                        image, slot.count.x, slot.count.y, slot.count.w, slot.count.h,
-                    )
-                    .to_image();
-                    let count = parse_count(
-                        &ocr.recognize(&count_crop, pre, wf_ocr::PageMode::Line)
-                            .unwrap_or_default(),
-                    );
-                    Some((info.display.clone(), count))
+    let resolved: Vec<Option<(String, wf_relic::Refinement, ObsKind)>> =
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = slots
+                .iter()
+                .map(|slot| {
+                    scope.spawn(move || {
+                        let name_crop = image::imageops::crop_imm(
+                            image, slot.name.x, slot.name.y, slot.name.w, slot.name.h,
+                        )
+                        .to_image();
+                        let raw = ocr
+                            .recognize(&name_crop, pre, wf_ocr::PageMode::Line)
+                            .unwrap_or_default()
+                            .replace('\n', " ");
+                        let (base, refinement) = wf_relic::parse_refinement(&raw);
+                        let info = index.best_match(&base)?;
+                        // Read the name even on eye cards (done above) so we can
+                        // attribute the "unowned" proof to the right relic.
+                        let kind = if card_has_eye(image, &slot.eye) {
+                            ObsKind::Unowned
+                        } else {
+                            read_count_badge(image, &slot.count, ocr, pre)
+                        };
+                        Some((info.display.clone(), refinement, kind))
+                    })
                 })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
 
-    let mut out: Vec<(String, u32)> = Vec::new();
-    for (display, count) in resolved.into_iter().flatten() {
-        match out.iter_mut().find(|(d, _)| *d == display) {
-            Some(e) => e.1 = e.1.max(count),
-            None => out.push((display, count)),
-        }
+    dedupe_frame(resolved.into_iter().flatten())
+}
+
+/// Read one card's count badge: a blank crop means the player owns exactly one
+/// (singles show no badge); otherwise a strict `x?NN` parse, abstaining on
+/// anything unreadable (see [`wf_ocr::parse_badge`]).
+fn read_count_badge(
+    image: &image::RgbaImage,
+    count: &wf_relic::Rect,
+    ocr: &wf_ocr::Ocr,
+    pre: wf_ocr::Preprocess,
+) -> ObsKind {
+    let crop =
+        image::imageops::crop_imm(image, count.x, count.y, count.w, count.h).to_image();
+    if wf_ocr::is_blank(&crop, pre) {
+        return ObsKind::Count(1);
     }
-    out
+    let text = ocr.recognize(&crop, pre, wf_ocr::PageMode::Line).unwrap_or_default();
+    match wf_ocr::parse_badge(&text, RELIC_COUNT_CAP) {
+        Some(n) => ObsKind::Count(n),
+        None => ObsKind::Abstain,
+    }
+}
+
+/// Collapse a frame's per-slot reads to one [`RelicObservation`] per
+/// `(code, refinement)`. Owned reads win over an eye flag for the same card
+/// (never zero on an ambiguous frame); the owned count is trusted only if the
+/// slots that read a value agree, otherwise the frame abstains for that card.
+fn dedupe_frame(
+    reads: impl Iterator<Item = (String, wf_relic::Refinement, ObsKind)>,
+) -> Vec<RelicObservation> {
+    use std::collections::HashMap;
+    let mut groups: HashMap<(String, wf_relic::Refinement), Vec<ObsKind>> = HashMap::new();
+    for (display, refinement, kind) in reads {
+        groups.entry((display, refinement)).or_default().push(kind);
+    }
+    groups
+        .into_iter()
+        .map(|((display, refinement), kinds)| {
+            let counts: Vec<u32> = kinds
+                .iter()
+                .filter_map(|k| if let ObsKind::Count(n) = k { Some(*n) } else { None })
+                .collect();
+            let owned_reads =
+                counts.len() + kinds.iter().filter(|k| matches!(k, ObsKind::Abstain)).count();
+            let has_unowned = kinds.iter().any(|k| matches!(k, ObsKind::Unowned));
+            let kind = if owned_reads == 0 && has_unowned {
+                ObsKind::Unowned
+            } else if let Some(&first) = counts.first() {
+                // Trust the count only if every slot that read one agrees.
+                if counts.iter().all(|&c| c == first) {
+                    ObsKind::Count(first)
+                } else {
+                    ObsKind::Abstain
+                }
+            } else {
+                ObsKind::Abstain // owned card, but no slot produced a usable count
+            };
+            RelicObservation { display, refinement, kind }
+        })
+        .collect()
 }
 
 /// Calibration: OCR the Void Relics grid from a PNG and print what resolved.
@@ -809,18 +883,30 @@ async fn relic_grid_file() -> Result<()> {
             )
             .unwrap_or_default()
             .replace('\n', " ");
-        let matched = index.best_match(&strip_relic_word(&raw)).map(|r| r.display.as_str());
+        let (base, refinement) = wf_relic::parse_refinement(&raw);
+        let matched = index.best_match(&base).map(|r| r.display.as_str());
+        let badge = read_count_badge(&image, &slot.count, &ocr, pre);
         println!(
-            "  slot {i:2}: eye={ncc:+.2} {} ocr={raw:?} -> {}",
+            "  slot {i:2}: eye={ncc:+.2} {} ocr={raw:?} -> {} [{refinement:?}] {}",
             if ncc >= EYE_THRESHOLD { "UNOWNED" } else { "owned  " },
-            matched.unwrap_or("—")
+            matched.unwrap_or("—"),
+            match badge {
+                ObsKind::Count(n) => format!("x{n}"),
+                ObsKind::Abstain => "badge?".to_string(),
+                ObsKind::Unowned => "-".to_string(),
+            }
         );
     }
 
     let found = scan_relic_grid(&image, &ocr, &regions, &index);
-    println!("  resolved {} owned relics:", found.len());
-    for (display, count) in &found {
-        println!("    {display:<16} x{count}");
+    println!("  resolved {} card observations:", found.len());
+    for o in &found {
+        let what = match o.kind {
+            ObsKind::Count(n) => format!("x{n}"),
+            ObsKind::Abstain => "badge unreadable (abstain)".to_string(),
+            ObsKind::Unowned => "UNOWNED (eye)".to_string(),
+        };
+        println!("    {:<16} [{:?}] {what}", o.display, o.refinement);
     }
     Ok(())
 }
@@ -1443,18 +1529,34 @@ async fn relic_scan_loop(
     // when there's nothing to do).
     const IDLE_POLL: Duration = Duration::from_millis(400);
 
-    // `relic_owned` is the cumulative, disk-persisted owned set — it survives
-    // restarts and Relics-screen visits, so the mastery planner (`wf-lite
-    // mastery-plan`) has data even outside a live scan. `session_seen` is
-    // scoped to the *current* continuous scan (cleared each fresh open) and
-    // max-merges repeated OCR reads of the same relic to smooth transient
-    // undercounts (e.g. a dropped digit); `relic_owned` is then *replaced* (not
-    // maxed) with that session's best reading, so a depleted relic's count can
-    // still drop from what an earlier session recorded.
-    let mut relic_owned: HashMap<String, u32> = wf_cache::load_blob(wf_relic::OWNED_RELICS_FILE)
-        .map(|s: wf_cache::Stamped<HashMap<String, u32>>| s.value)
-        .unwrap_or_default();
-    let mut session_seen: HashMap<String, u32> = HashMap::new();
+    // `relic_owned` is the cumulative, disk-persisted owned set, keyed per
+    // (code, refinement) (see ADR-0005) — it survives restarts and Relics-screen
+    // visits, so the mastery planner (`wf-lite mastery-plan`) has data even
+    // outside a live scan. Within the *current* continuous scan (cleared each
+    // fresh open), `tally` votes across frames and only confirms a count once
+    // enough frames agree, and `session_applied` records which confirmed value
+    // we've already written this session so a stable count refreshes its
+    // last-seen stamp once, not on every frame.
+    let owned_path = wf_cache::cache_dir().ok().map(|d| d.join(wf_relic::OWNED_RELICS_FILE));
+    let mut relic_owned: wf_relic::OwnedRelics =
+        match wf_cache::load_blob::<wf_relic::OwnedRelics>(wf_relic::OWNED_RELICS_FILE) {
+            Some(s) => s.value,
+            None => {
+                // Absent, or a legacy/foreign format we can no longer trust — back
+                // up any existing file and start clean (ADR-0005).
+                if let Some(p) = &owned_path {
+                    if p.exists() {
+                        let bak = p.with_extension("json.bak");
+                        if std::fs::rename(p, &bak).is_ok() {
+                            tracing::info!("backed up unrecognised {} to {}", p.display(), bak.display());
+                        }
+                    }
+                }
+                wf_relic::OwnedRelics::default()
+            }
+        };
+    let mut tally: wf_ocr::Tally<(String, wf_relic::Refinement)> = wf_ocr::Tally::new();
+    let mut session_applied: HashMap<(String, wf_relic::Refinement), u32> = HashMap::new();
     let mut was_active = false;
     // Bogus initial value (not a real deadline the watcher could ever set) so the
     // very first observed deadline always registers as a change below.
@@ -1483,9 +1585,10 @@ async fn relic_scan_loop(
         }
         if !was_active {
             was_active = true;
-            session_seen.clear();
+            tally = wf_ocr::Tally::new();
+            session_applied.clear();
             tracing::info!(
-                "relics screen opened — scanning as you scroll ({} known from before)",
+                "relics screen opened — scanning as you scroll ({} relics known from before)",
                 relic_owned.len()
             );
         }
@@ -1498,23 +1601,34 @@ async fn relic_scan_loop(
         .await;
         if let Ok(Ok(found)) = scanned {
             let mut changed = false;
-            for (display, count) in found {
-                let seen = session_seen.entry(display.clone()).or_insert(0);
-                *seen = (*seen).max(count);
-                if relic_owned.get(&display) != Some(seen) {
-                    relic_owned.insert(display, *seen);
-                    changed = true;
+            for obs in found {
+                let key = (obs.display.clone(), obs.refinement);
+                match obs.kind {
+                    ObsKind::Count(n) => tally.record(key.clone(), n),
+                    ObsKind::Unowned => tally.record(key.clone(), 0), // 0 = confirmed unowned
+                    ObsKind::Abstain => continue,
                 }
+                let Some(confirmed) = tally.confirmed(&key, RELIC_AGREEMENT) else {
+                    continue;
+                };
+                // Write each confirmed value once per session; a stable count then
+                // just refreshes nothing until it actually changes.
+                if session_applied.get(&key) == Some(&confirmed) {
+                    continue;
+                }
+                session_applied.insert(key.clone(), confirmed);
+                apply_confirmed_count(&mut relic_owned, &key, confirmed);
+                changed = true;
             }
             if changed {
                 last_new = Instant::now();
                 let _ = wf_cache::save_blob(wf_relic::OWNED_RELICS_FILE, &relic_owned);
-                let rows = build_relic_rows(
-                    &relic_owned, &relic_index, &mastery, &cache, &market, RELIC_ROWS,
-                )
-                .await;
+                let intact = wf_relic::intact_counts(&relic_owned);
+                let rows =
+                    build_relic_rows(&intact, &relic_index, &mastery, &cache, &market, RELIC_ROWS)
+                        .await;
                 tracing::info!(
-                    "relic scan: {} owned; showing {}",
+                    "relic scan: {} relics owned; showing {}",
                     relic_owned.len(),
                     rows.iter()
                         .map(|r| format!("{} ({})", r.name, r.top_reward))
@@ -1525,6 +1639,31 @@ async fn relic_scan_loop(
             }
         }
         tokio::time::sleep(SCAN_COOLDOWN).await;
+    }
+}
+
+/// Apply a confirmed `(code, refinement)` count to the owned set: a value of 0
+/// (a confirmed "unowned" eye reading) removes that entry — positive proof the
+/// player owns none — while any positive value replaces the count and refreshes
+/// its last-seen stamp (see ADR-0005).
+fn apply_confirmed_count(
+    owned: &mut wf_relic::OwnedRelics,
+    key: &(String, wf_relic::Refinement),
+    value: u32,
+) {
+    let (code, refinement) = key;
+    if value == 0 {
+        if let Some(by_ref) = owned.get_mut(code) {
+            by_ref.remove(refinement);
+            if by_ref.is_empty() {
+                owned.remove(code);
+            }
+        }
+    } else {
+        owned.entry(code.clone()).or_default().insert(
+            *refinement,
+            wf_cache::Stamped { value, fetched_at: wf_cache::now_unix() },
+        );
     }
 }
 

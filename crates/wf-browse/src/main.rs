@@ -204,7 +204,11 @@ struct Live {
     sell_picks: Option<Vec<RelicPick>>,
     /// `None` when no relics have been scanned yet.
     farm_picks: Option<Vec<FarmPick>>,
-    owned_age: Option<Duration>,
+    /// Freshest and stalest Intact scan ages `(newest, oldest)`, for the summary
+    /// line; `None` when nothing has been scanned.
+    owned_age_range: Option<(Duration, Duration)>,
+    /// Per-relic-code Intact scan age, for the per-relic freshness markers.
+    ages: HashMap<String, Duration>,
     active_tiers: HashSet<String>,
 }
 
@@ -221,18 +225,22 @@ impl Live {
     /// set, against the launch-time relic catalogue/mastery/prices (which
     /// never change after launch).
     fn compute(
-        owned: Option<&wf_cache::Stamped<HashMap<String, u32>>>,
+        owned: Option<&wf_cache::Stamped<wf_relic::OwnedRelics>>,
         index: &RelicIndex,
         mastery: &MasterySet,
         prices: &Prices,
         active_tiers: HashSet<String>,
     ) -> Self {
+        // The planners consume the Intact-only projection (relic drop tables are
+        // Intact-only); refined copies are tracked but excluded here.
+        let intact = owned.map(|o| wf_relic::intact_counts(&o.value));
         // mastery_plan/sell_picks/farm_picks already rank their output.
-        let plans = owned.map(|o| wf_relic::mastery_plan(&o.value, index, mastery));
-        let sell_picks = owned.map(|o| wf_relic::sell_picks(&o.value, &prices.sell, index, mastery));
-        let farm_picks = owned.map(|o| wf_relic::farm_picks(&o.value, &prices.farm, index, mastery));
-        let owned_age = owned.map(|o| o.age());
-        Self { plans, sell_picks, farm_picks, owned_age, active_tiers }
+        let plans = intact.as_ref().map(|c| wf_relic::mastery_plan(c, index, mastery));
+        let sell_picks = intact.as_ref().map(|c| wf_relic::sell_picks(c, &prices.sell, index, mastery));
+        let farm_picks = intact.as_ref().map(|c| wf_relic::farm_picks(c, &prices.farm, index, mastery));
+        let owned_age_range = owned.and_then(|o| wf_relic::intact_age_range(&o.value));
+        let ages = owned.map(|o| wf_relic::intact_ages(&o.value)).unwrap_or_default();
+        Self { plans, sell_picks, farm_picks, owned_age_range, ages, active_tiers }
     }
 }
 
@@ -250,7 +258,7 @@ async fn poll(
     let client = wf_data::http_client();
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
-        let owned = wf_cache::load_blob::<HashMap<String, u32>>(wf_relic::OWNED_RELICS_FILE);
+        let owned = wf_cache::load_blob::<wf_relic::OwnedRelics>(wf_relic::OWNED_RELICS_FILE);
         let active_tiers = wf_data::worldstate::fetch(&client, &platform)
             .await
             .map(|ws| ws.active_fissure_tiers())
@@ -267,7 +275,7 @@ async fn poll(
 struct LoadedData {
     index: RelicIndex,
     mastery: MasterySet,
-    owned: Option<wf_cache::Stamped<HashMap<String, u32>>>,
+    owned: Option<wf_cache::Stamped<wf_relic::OwnedRelics>>,
     active_tiers: HashSet<String>,
     prices: Prices,
 }
@@ -314,7 +322,7 @@ async fn load_data(config: &Config) -> LoadedData {
         Some(id) => wf_relic::mastery::load_cached(&client, id, MASTERY_TTL).await,
         None => MasterySet::default(),
     };
-    let owned = wf_cache::load_blob::<HashMap<String, u32>>(wf_relic::OWNED_RELICS_FILE);
+    let owned = wf_cache::load_blob::<wf_relic::OwnedRelics>(wf_relic::OWNED_RELICS_FILE);
     let active_tiers = wf_data::worldstate::fetch(&client, &config.platform)
         .await
         .map(|ws| ws.active_fissure_tiers())
@@ -323,13 +331,16 @@ async fn load_data(config: &Config) -> LoadedData {
     let mut sell_prices = HashMap::new();
     let mut farm_prices = HashMap::new();
     if let Some(owned) = &owned {
+        // Prices are only needed for relics with an Intact count (what the tabs
+        // rank); refined-only copies don't drive the guide.
+        let intact = wf_relic::intact_counts(&owned.value);
         let market = wf_data::market::MarketClient::new(client.clone(), config.market_platform.clone());
         let cache = wf_relic::price_cache();
 
         let relic_slugs: Vec<String> = index
             .all()
             .iter()
-            .filter(|relic| owned.value.get(&relic.display).copied().unwrap_or(0) > 0)
+            .filter(|relic| intact.get(&relic.display).copied().unwrap_or(0) > 0)
             .map(|relic| relic.slug())
             .collect();
         sell_prices = fetch_prices(relic_slugs, &cache, &market, |slug| (slug.clone(), slug)).await;
@@ -338,7 +349,7 @@ async fn load_data(config: &Config) -> LoadedData {
             tracing::warn!("item catalogue load failed: {e:#}");
             ItemIndex::new(Vec::new())
         });
-        let reward_names = wf_relic::farm_reward_names(&owned.value, &index, &mastery);
+        let reward_names = wf_relic::farm_reward_names(&intact, &index, &mastery);
         let resolved: Vec<(String, String)> = reward_names
             .into_iter()
             .filter_map(|name| item_index.best_match(&name).map(|m| (name, m.item.slug.clone())))
@@ -498,9 +509,9 @@ impl BrowseApp {
         // Clone the pieces this frame needs and drop the lock immediately,
         // rather than holding it across the whole render below — the only
         // other lock-holder is the background poller's brief write.
-        let (plans, owned_age, active_tiers) = {
+        let (plans, owned_age_range, ages, active_tiers) = {
             let live = lock_live(&self.live);
-            (live.plans.clone(), live.owned_age, live.active_tiers.clone())
+            (live.plans.clone(), live.owned_age_range, live.ages.clone(), live.active_tiers.clone())
         };
         let Some(mut plans) = plans else {
             ui.label(NO_OWNED_DATA_MSG);
@@ -515,7 +526,7 @@ impl BrowseApp {
         });
         ui.add_space(4.0);
 
-        owned_age_label(ui, owned_age);
+        owned_age_label(ui, owned_age_range);
 
         if plans.is_empty() {
             ui.label("no unmastered primes found among your scanned relics");
@@ -547,7 +558,8 @@ impl BrowseApp {
                         .map(|r| {
                             let is_live = active_tiers.contains(wf_relic::tier_of(&r.relic_display));
                             let flag = if is_live { "*" } else { "" };
-                            format!("{}{flag} x{}", r.relic_display, r.owned_count)
+                            let stale = stale_marker(&ages, &r.relic_display);
+                            format!("{}{flag} x{}{stale}", r.relic_display, r.owned_count)
                         })
                         .collect::<Vec<_>>()
                         .join(", ");
@@ -560,16 +572,19 @@ impl BrowseApp {
         });
         ui.add_space(4.0);
         ui.label(
-            egui::RichText::new("* = a fissure of that relic's tier is active right now")
-                .small()
-                .weak(),
+            egui::RichText::new(
+                "* = a fissure of that relic's tier is active right now   ⚠ = count not \
+                 re-confirmed recently, may be stale",
+            )
+            .small()
+            .weak(),
         );
     }
 
     fn sell_tab(&mut self, ui: &mut egui::Ui) {
-        let (picks, owned_age) = {
+        let (picks, owned_age_range, ages) = {
             let live = lock_live(&self.live);
-            (live.sell_picks.clone(), live.owned_age)
+            (live.sell_picks.clone(), live.owned_age_range, live.ages.clone())
         };
         let Some(mut picks) = picks else {
             ui.label(NO_OWNED_DATA_MSG);
@@ -591,7 +606,7 @@ impl BrowseApp {
         });
         ui.add_space(4.0);
 
-        owned_age_label(ui, owned_age);
+        owned_age_label(ui, owned_age_range);
 
         if picks.is_empty() {
             ui.label("no owned relics found");
@@ -617,11 +632,12 @@ impl BrowseApp {
         }
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("sell_grid").num_columns(4).striped(true).show(ui, |ui| {
+            egui::Grid::new("sell_grid").num_columns(5).striped(true).show(ui, |ui| {
                 ui.strong("relic");
                 ui.strong("owned");
                 ui.strong("plat");
                 ui.strong("unmastered");
+                ui.strong("scanned");
                 ui.end_row();
 
                 for p in &picks {
@@ -630,6 +646,7 @@ impl BrowseApp {
                     ui.label(p.count.to_string());
                     ui.label(plat);
                     ui.label(p.unmastered.len().to_string());
+                    ui.label(age_cell(&ages, &p.display));
                     ui.end_row();
                 }
             });
@@ -637,9 +654,9 @@ impl BrowseApp {
     }
 
     fn farm_tab(&mut self, ui: &mut egui::Ui) {
-        let (picks, owned_age) = {
+        let (picks, owned_age_range, ages) = {
             let live = lock_live(&self.live);
-            (live.farm_picks.clone(), live.owned_age)
+            (live.farm_picks.clone(), live.owned_age_range, live.ages.clone())
         };
         let Some(mut picks) = picks else {
             ui.label(NO_OWNED_DATA_MSG);
@@ -656,7 +673,7 @@ impl BrowseApp {
         });
         ui.add_space(4.0);
 
-        owned_age_label(ui, owned_age);
+        owned_age_label(ui, owned_age_range);
 
         if picks.is_empty() {
             ui.label("no owned relics have an already-mastered prime reward to farm");
@@ -679,12 +696,13 @@ impl BrowseApp {
         }
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("farm_grid").num_columns(5).striped(true).show(ui, |ui| {
+            egui::Grid::new("farm_grid").num_columns(6).striped(true).show(ui, |ui| {
                 ui.strong("relic");
                 ui.strong("owned");
                 ui.strong("best mastered reward");
                 ui.strong("plat");
                 ui.strong("rarity");
+                ui.strong("scanned");
                 ui.end_row();
 
                 for p in &picks {
@@ -694,6 +712,7 @@ impl BrowseApp {
                     ui.label(&p.best_reward);
                     ui.label(plat);
                     ui.colored_label(rarity_color(&p.rarity), &p.rarity);
+                    ui.label(age_cell(&ages, &p.display));
                     ui.end_row();
                 }
             });
@@ -715,12 +734,50 @@ fn plan_is_live(plan: &PrimePlan, active_tiers: &HashSet<String>) -> bool {
     plan.relics.iter().any(|r| active_tiers.contains(wf_relic::tier_of(&r.relic_display)))
 }
 
-/// The "owned relics scanned N ago" freshness line shared by the Relics &
-/// Plan, Sell, and Farm tabs.
-fn owned_age_label(ui: &mut egui::Ui, age: Option<Duration>) {
-    if let Some(age) = age {
-        ui.label(format!("owned relics scanned {}", wf_cache::format_age(age)));
+/// The owned-relic freshness line shared by the Relics & Plan, Sell, and Farm
+/// tabs. Counts are stamped per relic (see ADR-0005), so this summarises the
+/// span: a single age when everything was seen together, else "newest – oldest".
+fn owned_age_label(ui: &mut egui::Ui, range: Option<(Duration, Duration)>) {
+    if let Some((newest, oldest)) = range {
+        let text = if newest == oldest {
+            format!("owned relics scanned {}", wf_cache::format_age(oldest))
+        } else {
+            format!(
+                "owned relics scanned {} – {}",
+                wf_cache::format_age(newest),
+                wf_cache::format_age(oldest)
+            )
+        };
+        ui.label(text);
         ui.add_space(6.0);
+    }
+}
+
+/// Colour for stale (past [`wf_relic::STALE_AFTER`]) freshness text.
+const STALE_COLOR: egui::Color32 = egui::Color32::from_rgb(0xD8, 0x8A, 0x00);
+
+/// A per-relic "last scanned" cell: dimmed when fresh, amber when stale, "—"
+/// when the relic has no Intact scan on record.
+fn age_cell(ages: &HashMap<String, Duration>, display: &str) -> egui::RichText {
+    match ages.get(display) {
+        Some(age) => {
+            let text = egui::RichText::new(wf_cache::format_age(*age)).small();
+            if *age >= wf_relic::STALE_AFTER {
+                text.color(STALE_COLOR)
+            } else {
+                text.weak()
+            }
+        }
+        None => egui::RichText::new("—").small().weak(),
+    }
+}
+
+/// A compact stale marker (`" ⚠3d ago"`) appended to a relic token in the plan
+/// breakdown; empty when the relic is fresh or unscanned.
+fn stale_marker(ages: &HashMap<String, Duration>, display: &str) -> String {
+    match ages.get(display) {
+        Some(age) if *age >= wf_relic::STALE_AFTER => format!(" ⚠{}", wf_cache::format_age(*age)),
+        _ => String::new(),
     }
 }
 

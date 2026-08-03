@@ -3,11 +3,16 @@
 
 pub mod index;
 pub mod mastery;
+pub mod owned;
 pub mod regions;
 pub mod relics;
 
 pub use index::ItemIndex;
 pub use mastery::MasterySet;
+pub use owned::{
+    intact_age, intact_age_range, intact_ages, intact_counts, parse_refinement, OwnedCount,
+    OwnedRelics, Refinement, STALE_AFTER,
+};
 pub use regions::{Rect, RelicGridRegions, RelicSlot, RewardRegions};
 pub use relics::{
     farm_picks, farm_reward_names, mastery_browser, mastery_plan, rank as rank_relics, sell_picks,

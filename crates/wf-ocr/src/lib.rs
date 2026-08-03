@@ -12,6 +12,9 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use image::{GrayImage, RgbaImage};
 
+pub mod count;
+pub use count::{parse_badge, Tally};
+
 /// Tesseract page-segmentation mode for a recognition call.
 #[derive(Debug, Clone, Copy)]
 pub enum PageMode {
@@ -148,6 +151,15 @@ impl Ocr {
 /// real (even short, e.g. a two-letter relic code) text crop's coverage, so
 /// only genuinely empty/background crops are skipped.
 const MIN_TEXT_FRACTION: f32 = 0.001;
+
+/// Whether `img` has essentially no text after `pre` preprocessing — i.e. the
+/// crop is blank background, not recognisable glyphs. The relic scanner uses
+/// this to tell a *missing* count badge (which, on the Void Relics screen, means
+/// the player owns exactly one copy) apart from a badge that's present but
+/// unreadable (which should cast no count vote — see ADR-0005).
+pub fn is_blank(img: &RgbaImage, pre: Preprocess) -> bool {
+    text_fraction(&preprocess(img, pre)) < MIN_TEXT_FRACTION
+}
 
 /// Fraction of pixels classified as "text" (dark) in a preprocessed image.
 fn text_fraction(img: &GrayImage) -> f32 {
