@@ -1559,9 +1559,28 @@ async fn relic_watch_loop(
                 continue;
             }
         };
-        let names = wf_relic::select_rewards(&slots, &index);
+        let mut names = wf_relic::select_rewards(&slots, &index);
         if names.len() < 2 {
             continue; // screen not up yet (or already gone) — keep polling
+        }
+
+        // The reward cards fan in with a brief entrance animation, so this first
+        // hit can catch the screen mid-render with a card's text not yet legible
+        // (see the "only detected 3 of 4 parts" report). Resample a few times
+        // over the settle window and keep whichever pass resolved the most
+        // rewards, rather than locking in an incomplete first read.
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let (ocr2, regions2) = (ocr.clone(), regions.clone());
+            let Ok(Ok(slots)) =
+                tokio::task::spawn_blocking(move || capture_and_ocr(&ocr2, &regions2)).await
+            else {
+                continue;
+            };
+            let found = wf_relic::select_rewards(&slots, &index);
+            if found.len() > names.len() {
+                names = found;
+            }
         }
 
         let evals =
