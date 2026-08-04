@@ -130,7 +130,7 @@ pub async fn evaluate(
             out.push(RewardEval::untradable(name.clone(), label));
             continue;
         }
-        match index.best_match(name) {
+        match index.best_match(name).filter(|m| is_prime(m.item)) {
             Some(m) => {
                 let slug = m.item.slug.clone();
                 let plat = match market.price_summary(&slug).await {
@@ -206,9 +206,11 @@ pub fn select_rewards(slot_texts: &[String], index: &ItemIndex) -> Vec<String> {
             if untradable_label(t).is_some() {
                 return Some(0.9);
             }
-            // A fissure reward is never a relic; reject relic matches so the Void
-            // Relics inventory grid can't be mistaken for a reward screen.
-            index.best_match(t).filter(|m| !is_relic(m.item)).map(|m| m.score)
+            // A fissure reward is always a Prime part; reject anything else
+            // (mods, arcanes, relics, …) so the Void Relics inventory grid, an
+            // end-of-mission loot summary, or other on-screen text can't be
+            // mistaken for a reward screen.
+            index.best_match(t).filter(|m| is_prime(m.item)).map(|m| m.score)
         })
         .collect();
 
@@ -244,10 +246,14 @@ enum Resolution {
     Unresolved,
 }
 
-/// Whether a catalogue item is a Void Relic (tagged `relic`) — such items are
-/// never fissure rewards, so they must not resolve in the reward path.
-fn is_relic(item: &wf_data::items::Item) -> bool {
-    item.tags.iter().any(|t| t == "relic")
+/// Whether a catalogue item is tagged `prime` — a fissure reward is always
+/// either a Prime part/blueprint or one of the untradables handled separately
+/// by [`untradable_label`], so this is the only shape a resolved reward can
+/// take. Rejects everything else (mods, arcanes, relics, …) that might
+/// otherwise clear the fuzzy-match threshold on noisy OCR text — including
+/// "Primed"-named mods, since the check is on the catalogue tag, not the name.
+fn is_prime(item: &wf_data::items::Item) -> bool {
+    item.tags.iter().any(|t| t == "prime")
 }
 
 fn resolve(name: &str, index: &ItemIndex) -> Resolution {
@@ -255,7 +261,7 @@ fn resolve(name: &str, index: &ItemIndex) -> Resolution {
         return Resolution::Untradable(label);
     }
     match index.best_match(name) {
-        Some(m) if !is_relic(m.item) => Resolution::Matched {
+        Some(m) if is_prime(m.item) => Resolution::Matched {
             name: m.item.name.clone(),
             slug: m.item.slug.clone(),
             score: m.score,
@@ -374,6 +380,25 @@ mod tests {
             &idx,
         );
         assert_eq!(sel.len(), 2);
+    }
+
+    #[test]
+    fn select_rewards_rejects_mods() {
+        // A mod (e.g. picked up during the mission, not a fissure reward) must
+        // never resolve as a reward choice, even though it isn't relic-tagged
+        // and clears the fuzzy-match threshold cleanly.
+        let idx = ItemIndex::new(vec![
+            item("Mirage Prime Blueprint", &["prime"]),
+            item("Blunderbuss", &["mod", "shotgun", "primary"]),
+            item("Flame Repellent", &["mod", "warframe"]),
+        ]);
+        assert!(select_rewards(&["Blunderbuss".to_string()], &idx).is_empty());
+        assert!(select_rewards(&["Flame Repellent".to_string()], &idx).is_empty());
+        let sel = select_rewards(
+            &["Blunderbuss".to_string(), "Mirage Prime Blueprint".to_string()],
+            &idx,
+        );
+        assert_eq!(sel, vec!["Mirage Prime Blueprint".to_string()]);
     }
 
     fn eval(plat: Option<u32>, ducats: Option<u32>) -> RewardEval {
