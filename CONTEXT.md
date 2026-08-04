@@ -43,6 +43,22 @@ The fully-built Warframe or weapon that a reward *part* belongs to. Mastery is
 tracked per built prime, not per individual part — every part maps to one
 before a mastery lookup.
 
+**Prime Part**:
+One craftable component of a Built prime — its own Blueprint, or a piece like
+Chassis/Systems/Neuroptics (or a weapon's equivalent) — as distinguished in a
+relic's reward table. Sits one level below Built prime: a prime is built from
+a fixed set of these, each needed in its own **Build quantity** (e.g. Afuris
+Prime needs 2 Barrel).
+_Avoid_: Component (the informal word used internally for the same idea),
+reward, drop.
+
+**Build quantity**:
+How many copies of a given Prime Part a Built prime's recipe requires — 1 for
+most parts, but >1 for some weapon parts (e.g. dual weapons). Sourced from a
+second, separate WFCD dataset (`warframe-items`) that the drop-table data
+doesn't carry (see ADR-0011); shown only when known, never guessed at 1 when
+a lookup misses.
+
 **Mastery**:
 A permanent status an item earns once its lifetime affinity crosses its
 rank-30 cap; never resets on Forma. Read from DE's public profile API
@@ -98,8 +114,8 @@ in-game inventory is visible rather than silently trusted.
 
 **Mastery plan**:
 The ranked view of owned relics grouped by the Unmastered prime they can still
-drop, sourcing relics ordered by owned count — the basis for deciding which
-Fissures to run next.
+drop, then by the Prime Part each relic sources, with relics under each part
+ordered by owned count — the basis for deciding which Fissures to run next.
 
 **Farm pick**:
 For an owned relic, its single highest-value **already-mastered** prime
@@ -113,12 +129,12 @@ chance that at least one lands the relic's most valuable drop. A Farm pick's
 natural use: organize a radiant share around the relic that names it.
 
 **Wishlisted part**:
-A reward part the player has hand-marked as wanted, independent of its
-mastery status. Unlike Owned relic or Mastery, this is player-declared intent
-with no scan or API source behind it — the player is the source of truth (see
+A Prime Part the player has hand-marked as wanted, independent of its mastery
+status. Unlike Owned relic or Mastery, this is player-declared intent with no
+scan or API source behind it — the player is the source of truth (see
 ADR-0004). Surfaces as its own marker on the reward screen, separate from the
 mastery emblem.
-_Avoid_: Favorite, tracked item.
+_Avoid_: Favorite, tracked item, reward part (superseded by Prime Part).
 
 ### Out of scope: general world state
 

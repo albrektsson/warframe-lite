@@ -4,20 +4,22 @@
 pub mod index;
 pub mod mastery;
 pub mod owned;
+pub mod part_quantities;
 pub mod regions;
 pub mod relics;
 
 pub use index::ItemIndex;
-pub use mastery::MasterySet;
+pub use mastery::{MasterySet, PrimePart};
 pub use owned::{
     apply_confirmed_count, clear_entry, intact_age, intact_age_range, intact_ages, intact_counts,
     mark_seen, parse_refinement, OwnedCount, OwnedEntry, OwnedRelics, Refinement, STALE_AFTER,
 };
+pub use part_quantities::PartQuantities;
 pub use regions::{Rect, RelicGridRegions, RelicSlot, RewardRegions};
 pub use relics::{
     farm_picks, farm_reward_names, mastery_browser, mastery_plan, rank as rank_relics, sell_picks,
-    tier_of, FarmPick, MasteryEntry, PrimePlan, PrimeRelicSource, RelicIndex, RelicInfo, RelicPick,
-    OWNED_RELICS_FILE,
+    tier_of, FarmPick, MasteryEntry, PrimePartGroup, PrimePlan, PrimeRelicSource, RelicIndex,
+    RelicInfo, RelicPick, OWNED_RELICS_FILE,
 };
 
 use std::time::Duration;

@@ -12,7 +12,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::index::{levenshtein, normalize};
-use crate::mastery::{built_name, MasterySet};
+use crate::mastery::{built_name, prime_part, MasterySet, PrimePart};
+use crate::part_quantities::PartQuantities;
 
 const RELICS_URL: &str =
     "https://raw.githubusercontent.com/WFCD/warframe-drop-data/gh-pages/data/relics.json";
@@ -52,13 +53,7 @@ impl RelicInfo {
     /// `["Ember Prime", "Trinity Prime"]`.
     pub fn unmastered(&self, mastery: &MasterySet) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        for r in &self.rewards {
-            if crate::untradable_label(&r.item_name).is_some()
-                || !is_prime_reward(&r.item_name)
-                || mastery.is_mastered(&r.item_name)
-            {
-                continue;
-            }
+        for r in unmastered_rewards(self, mastery) {
             let built = built_name(&r.item_name);
             if !out.contains(&built) {
                 out.push(built);
@@ -235,9 +230,24 @@ fn is_prime_reward(item_name: &str) -> bool {
     item_name.to_ascii_lowercase().contains("prime")
 }
 
+/// A relic's rewards that are real, still-unmastered prime parts — the shared
+/// filter behind [`RelicInfo::unmastered`] and [`mastery_plan`], which both
+/// need it (the former collapsed to built-prime names, the latter kept at
+/// per-reward granularity to also resolve each one's [`PrimePart`]).
+fn unmastered_rewards<'a>(
+    relic: &'a RelicInfo,
+    mastery: &'a MasterySet,
+) -> impl Iterator<Item = &'a RelicReward> {
+    relic.rewards.iter().filter(move |r| {
+        crate::untradable_label(&r.item_name).is_none()
+            && is_prime_reward(&r.item_name)
+            && !mastery.is_mastered(&r.item_name)
+    })
+}
+
 /// A relic's rewards that are real prime parts the player has already
 /// mastered — the Farm tab's candidate pool, the mirror image of
-/// [`RelicInfo::unmastered`].
+/// [`unmastered_rewards`].
 fn mastered_rewards<'a>(
     relic: &'a RelicInfo,
     mastery: &'a MasterySet,
@@ -372,40 +382,61 @@ pub fn mastery_browser(index: &RelicIndex, mastery: &MasterySet) -> Vec<MasteryE
         .collect()
 }
 
-/// One owned relic that can still drop a given unmastered prime.
+/// One owned relic that can still drop a given [`PrimePart`].
 #[derive(Debug, Clone)]
 pub struct PrimeRelicSource {
     /// Relic label, e.g. "Axi H3".
     pub relic_display: String,
     /// How many the player owns.
     pub owned_count: u32,
-    /// Drop rarity of this prime within this relic (Common/Uncommon/Rare).
+    /// Drop rarity of this part within this relic (Common/Uncommon/Rare).
     pub rarity: String,
 }
 
-/// An unmastered prime and the owned relics that can still drop it — the basis
-/// for deciding which fissures to prioritise.
+/// One Prime Part of an unmastered prime, and the owned relics that can still
+/// drop it.
+#[derive(Debug, Clone)]
+pub struct PrimePartGroup {
+    pub part: PrimePart,
+    /// How many `part.part` a full build needs, if known — never guessed when
+    /// unknown (see ADR-0011).
+    pub build_quantity: Option<u32>,
+    /// Owned relics that can drop this part, most-owned first.
+    pub relics: Vec<PrimeRelicSource>,
+}
+
+/// An unmastered prime, broken down by Prime Part, and the owned relics that
+/// can still drop each — the basis for deciding which fissures to prioritise.
 #[derive(Debug, Clone)]
 pub struct PrimePlan {
     /// Built prime name, e.g. "Rubico Prime".
     pub prime: String,
-    /// Owned relics that can drop it, most-owned first.
-    pub relics: Vec<PrimeRelicSource>,
-    /// Sum of owned counts across all sourcing relics — a rough farming budget.
+    /// This prime's parts, each with their own sourcing relics.
+    pub parts: Vec<PrimePartGroup>,
+    /// Sum of owned counts across all distinct sourcing relics (a relic
+    /// counted once even if it drops more than one of this prime's parts) —
+    /// a rough farming budget.
     pub total_owned: u32,
 }
 
 /// Build a fissure-planning view from an owned-relic count map (relic display →
-/// count): for every unmastered prime the player's relics can still drop, which
-/// relics (and how many of each) can drop it. Ranked by `total_owned` descending,
-/// so the primes with the most farming budget already in hand come first.
+/// count): for every unmastered prime the player's relics can still drop, broken
+/// down by Prime Part, which relics (and how many of each) can drop it. Ranked
+/// by `total_owned` descending, so the primes with the most farming budget
+/// already in hand come first; parts within a prime are ranked the same way.
 pub fn mastery_plan(
     owned: &std::collections::HashMap<String, u32>,
     index: &RelicIndex,
     mastery: &MasterySet,
+    quantities: &PartQuantities,
 ) -> Vec<PrimePlan> {
-    let mut by_prime: std::collections::HashMap<String, Vec<PrimeRelicSource>> =
+    let mut by_prime: std::collections::HashMap<String, std::collections::HashMap<PrimePart, Vec<PrimeRelicSource>>> =
         std::collections::HashMap::new();
+    // Dedup a relic's contribution to a prime's `total_owned` even when it
+    // drops more than one of that prime's parts.
+    let mut prime_relic_counts: std::collections::HashMap<String, std::collections::HashMap<String, u32>> =
+        std::collections::HashMap::new();
+
     for relic in index.all() {
         let Some(&count) = owned.get(&relic.display) else {
             continue;
@@ -413,28 +444,42 @@ pub fn mastery_plan(
         if count == 0 {
             continue;
         }
-        for prime in relic.unmastered(mastery) {
-            let rarity = relic
-                .rewards
-                .iter()
-                .find(|r| built_name(&r.item_name) == prime)
-                .map(|r| r.rarity.clone())
-                .unwrap_or_default();
-            by_prime.entry(prime).or_default().push(PrimeRelicSource {
-                relic_display: relic.display.clone(),
-                owned_count: count,
-                rarity,
-            });
+        let mut seen: Vec<PrimePart> = Vec::new();
+        for r in unmastered_rewards(relic, mastery) {
+            let pp = prime_part(&r.item_name);
+            if seen.contains(&pp) {
+                continue;
+            }
+            seen.push(pp.clone());
+            by_prime.entry(pp.prime.clone()).or_default().entry(pp.clone()).or_default().push(
+                PrimeRelicSource {
+                    relic_display: relic.display.clone(),
+                    owned_count: count,
+                    rarity: r.rarity.clone(),
+                },
+            );
+            prime_relic_counts.entry(pp.prime).or_default().insert(relic.display.clone(), count);
         }
     }
+
     let mut plans: Vec<PrimePlan> = by_prime
         .into_iter()
-        .map(|(prime, mut relics)| {
-            relics.sort_by(|a, b| {
-                b.owned_count.cmp(&a.owned_count).then_with(|| a.relic_display.cmp(&b.relic_display))
-            });
-            let total_owned = relics.iter().map(|r| r.owned_count).sum();
-            PrimePlan { prime, relics, total_owned }
+        .map(|(prime, part_map)| {
+            let mut parts: Vec<PrimePartGroup> = part_map
+                .into_iter()
+                .map(|(pp, mut relics)| {
+                    relics.sort_by(|a, b| {
+                        b.owned_count
+                            .cmp(&a.owned_count)
+                            .then_with(|| a.relic_display.cmp(&b.relic_display))
+                    });
+                    let build_quantity = quantities.get(&pp);
+                    PrimePartGroup { part: pp, build_quantity, relics }
+                })
+                .collect();
+            parts.sort_by(|a, b| a.part.part.cmp(&b.part.part));
+            let total_owned = prime_relic_counts.get(&prime).map(|m| m.values().sum()).unwrap_or(0);
+            PrimePlan { prime, parts, total_owned }
         })
         .collect();
     plans.sort_by(|a, b| b.total_owned.cmp(&a.total_owned).then_with(|| a.prime.cmp(&b.prime)));
@@ -679,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn mastery_plan_groups_by_prime_across_relics() {
+    fn mastery_plan_groups_by_prime_and_part_across_relics() {
         let idx = RelicIndex::new(vec![
             relic("Axi A1", &["Akstiletto Prime Barrel", "Trinity Prime Systems Blueprint"]),
             relic("Meso N11", &["Akstiletto Prime Receiver", "Volt Prime Blueprint"]),
@@ -693,14 +738,20 @@ mod tests {
             ("Lith G4".to_string(), 9),  // owned but nothing unmastered → contributes nothing
             ("Neo V9".to_string(), 3),   // owned but not in the index → ignored
         ]);
-        let plans = mastery_plan(&owned, &idx, &mastery);
+        let plans = mastery_plan(&owned, &idx, &mastery, &PartQuantities::empty());
 
-        // Akstiletto Prime is sourced from two owned relics: 5 + 2 = 7, and ranks
-        // first (highest total_owned).
+        // Akstiletto Prime's Barrel and Receiver are two different parts, each
+        // sourced from a different owned relic: 5 + 2 = 7 total_owned, and it
+        // ranks first (highest total_owned).
         let aksti = plans.iter().find(|p| p.prime == "Akstiletto Prime").unwrap();
         assert_eq!(aksti.total_owned, 7);
-        assert_eq!(aksti.relics.len(), 2);
-        assert_eq!(aksti.relics[0].relic_display, "Axi A1"); // most-owned first
+        assert_eq!(aksti.parts.len(), 2);
+        let barrel = aksti.parts.iter().find(|g| g.part.part == "Barrel").unwrap();
+        assert_eq!(barrel.relics.len(), 1);
+        assert_eq!(barrel.relics[0].relic_display, "Axi A1");
+        assert_eq!(barrel.relics[0].owned_count, 5);
+        let receiver = aksti.parts.iter().find(|g| g.part.part == "Receiver").unwrap();
+        assert_eq!(receiver.relics[0].relic_display, "Meso N11");
         assert_eq!(plans[0].prime, "Akstiletto Prime");
 
         // Single-relic primes are present with their own relic's count.
@@ -709,6 +760,44 @@ mod tests {
 
         // A fully-mastered relic (Ember Prime) contributes no plan entries at all.
         assert!(!plans.iter().any(|p| p.prime == "Ember Prime"));
+    }
+
+    #[test]
+    fn mastery_plan_dedups_a_relics_owned_count_across_its_own_multiple_parts() {
+        // One relic dropping two different parts of the same prime must only
+        // count its owned copies once toward that prime's total_owned, not
+        // once per part.
+        let idx = RelicIndex::new(vec![relic(
+            "Axi B2",
+            &["Loki Prime Systems Blueprint", "Loki Prime Chassis Blueprint"],
+        )]);
+        let owned = std::collections::HashMap::from([("Axi B2".to_string(), 4)]);
+
+        let plans = mastery_plan(&owned, &idx, &MasterySet::default(), &PartQuantities::empty());
+
+        let loki = plans.iter().find(|p| p.prime == "Loki Prime").unwrap();
+        assert_eq!(loki.total_owned, 4);
+        assert_eq!(loki.parts.len(), 2);
+        assert!(loki.parts.iter().all(|g| g.relics.len() == 1 && g.relics[0].owned_count == 4));
+    }
+
+    #[test]
+    fn mastery_plan_carries_build_quantity_when_known_and_none_when_unknown() {
+        let idx = RelicIndex::new(vec![relic("Axi C3", &["Afuris Prime Barrel", "Afuris Prime Link"])]);
+        let owned = std::collections::HashMap::from([("Axi C3".to_string(), 1)]);
+        let quantities = PartQuantities::from_entries_for_test(vec![(
+            "Afuris Prime".to_string(),
+            "Barrel".to_string(),
+            2,
+        )]);
+
+        let plans = mastery_plan(&owned, &idx, &MasterySet::default(), &quantities);
+
+        let afuris = plans.iter().find(|p| p.prime == "Afuris Prime").unwrap();
+        let barrel = afuris.parts.iter().find(|g| g.part.part == "Barrel").unwrap();
+        assert_eq!(barrel.build_quantity, Some(2));
+        let link = afuris.parts.iter().find(|g| g.part.part == "Link").unwrap();
+        assert_eq!(link.build_quantity, None); // not in the lookup — never guessed at 1
     }
 
     #[test]

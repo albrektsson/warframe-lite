@@ -28,7 +28,9 @@ use std::time::Duration;
 use eframe::egui;
 use futures::stream::{self, StreamExt};
 use wf_config::Config;
-use wf_relic::{FarmPick, ItemIndex, MasteryEntry, MasterySet, PrimePlan, RelicIndex, RelicPick};
+use wf_relic::{
+    FarmPick, ItemIndex, MasteryEntry, MasterySet, PartQuantities, PrimePlan, RelicIndex, RelicPick,
+};
 
 const CATALOGUE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 const MASTERY_TTL: Duration = Duration::from_secs(24 * 3600);
@@ -80,13 +82,20 @@ fn main() -> eframe::Result<()> {
     // `rt` is never dropped before `run_native` returns, so the poller spawned
     // on it below keeps running for as long as the window stays open.
     let rt = tokio::runtime::Runtime::new().expect("failed to start tokio runtime");
-    let LoadedData { index, mastery, owned, active_tiers, prices } = rt.block_on(load_data(&config));
+    let LoadedData { index, mastery, quantities, owned, active_tiers, prices } =
+        rt.block_on(load_data(&config));
 
     let mastery_rows = wf_relic::mastery_browser(&index, &mastery);
-    let live =
-        Arc::new(Mutex::new(Live::compute(owned.as_ref(), &index, &mastery, &prices, active_tiers)));
+    let live = Arc::new(Mutex::new(Live::compute(
+        owned.as_ref(),
+        &index,
+        &mastery,
+        &quantities,
+        &prices,
+        active_tiers,
+    )));
 
-    rt.spawn(poll(live.clone(), index, mastery, prices, config.platform));
+    rt.spawn(poll(live.clone(), index, mastery, quantities, prices, config.platform));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -230,6 +239,7 @@ impl Live {
         owned: Option<&wf_cache::Stamped<wf_relic::OwnedRelics>>,
         index: &RelicIndex,
         mastery: &MasterySet,
+        quantities: &PartQuantities,
         prices: &Prices,
         active_tiers: HashSet<String>,
     ) -> Self {
@@ -237,7 +247,7 @@ impl Live {
         // Intact-only); refined copies are tracked but excluded here.
         let intact = owned.map(|o| wf_relic::intact_counts(&o.value));
         // mastery_plan/sell_picks/farm_picks already rank their output.
-        let plans = intact.as_ref().map(|c| wf_relic::mastery_plan(c, index, mastery));
+        let plans = intact.as_ref().map(|c| wf_relic::mastery_plan(c, index, mastery, quantities));
         let sell_picks = intact.as_ref().map(|c| wf_relic::sell_picks(c, &prices.sell, index, mastery));
         let farm_picks = intact.as_ref().map(|c| wf_relic::farm_picks(c, &prices.farm, index, mastery));
         let owned_age_range = owned.and_then(|o| wf_relic::intact_age_range(&o.value));
@@ -254,6 +264,7 @@ async fn poll(
     live: Arc<Mutex<Live>>,
     index: RelicIndex,
     mastery: MasterySet,
+    quantities: PartQuantities,
     prices: Prices,
     platform: String,
 ) {
@@ -265,18 +276,20 @@ async fn poll(
             .await
             .map(|ws| ws.active_fissure_tiers())
             .unwrap_or_default();
-        let fresh = Live::compute(owned.as_ref(), &index, &mastery, &prices, active_tiers);
+        let fresh = Live::compute(owned.as_ref(), &index, &mastery, &quantities, &prices, active_tiers);
         *lock_live(&live) = fresh;
     }
 }
 
 /// Data loaded once at launch: the relic catalogue, the player's mastered set,
-/// their scanned Owned relic counts (if any), which relic tiers currently have
-/// an active Fissure, and — for owned relics only — each relic's resolved
-/// sell price and each already-mastered reward's resolved part price.
+/// Prime Part build quantities, their scanned Owned relic counts (if any),
+/// which relic tiers currently have an active Fissure, and — for owned relics
+/// only — each relic's resolved sell price and each already-mastered reward's
+/// resolved part price.
 struct LoadedData {
     index: RelicIndex,
     mastery: MasterySet,
+    quantities: PartQuantities,
     owned: Option<wf_cache::Stamped<wf_relic::OwnedRelics>>,
     active_tiers: HashSet<String>,
     prices: Prices,
@@ -324,6 +337,10 @@ async fn load_data(config: &Config) -> LoadedData {
         Some(id) => wf_relic::mastery::load_cached(&client, id, MASTERY_TTL).await,
         None => MasterySet::default(),
     };
+    let quantities = PartQuantities::load_cached(&client, CATALOGUE_TTL).await.unwrap_or_else(|e| {
+        tracing::warn!("part quantity load failed: {e:#}");
+        PartQuantities::empty()
+    });
     let owned = wf_cache::load_blob::<wf_relic::OwnedRelics>(wf_relic::OWNED_RELICS_FILE);
     let active_tiers = wf_data::worldstate::fetch(&client, &config.platform)
         .await
@@ -361,7 +378,14 @@ async fn load_data(config: &Config) -> LoadedData {
         cache.save();
     }
 
-    LoadedData { index, mastery, owned, active_tiers, prices: Prices { sell: sell_prices, farm: farm_prices } }
+    LoadedData {
+        index,
+        mastery,
+        quantities,
+        owned,
+        active_tiers,
+        prices: Prices { sell: sell_prices, farm: farm_prices },
+    }
 }
 
 /// The browser's tabs: Mastery, Relics & Plan, Sell, Farm, and Owned.
@@ -555,30 +579,42 @@ impl BrowseApp {
         }
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("relics_plan_grid").num_columns(3).striped(true).show(ui, |ui| {
-                ui.strong("unmastered prime");
-                ui.strong("owned");
-                ui.strong("relics you own that can still drop it");
-                ui.end_row();
+            for p in &plans {
+                ui.horizontal(|ui| {
+                    ui.strong(&p.prime);
+                    ui.weak(format!("owned {}", p.total_owned));
+                });
+                egui::Grid::new(format!("relics_plan_grid_{}", p.prime))
+                    .num_columns(3)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("part");
+                        ui.strong("need");
+                        ui.strong("relics you own that can still drop it");
+                        ui.end_row();
 
-                for p in &plans {
-                    let breakdown = p
-                        .relics
-                        .iter()
-                        .map(|r| {
-                            let is_live = active_tiers.contains(wf_relic::tier_of(&r.relic_display));
-                            let flag = if is_live { "*" } else { "" };
-                            let stale = stale_marker(&ages, &r.relic_display);
-                            format!("{}{flag} x{}{stale}", r.relic_display, r.owned_count)
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    ui.label(&p.prime);
-                    ui.label(p.total_owned.to_string());
-                    ui.label(breakdown);
-                    ui.end_row();
-                }
-            });
+                        for g in &p.parts {
+                            let need = g.build_quantity.map(|q| format!("x{q}")).unwrap_or_default();
+                            let breakdown = g
+                                .relics
+                                .iter()
+                                .map(|r| {
+                                    let is_live =
+                                        active_tiers.contains(wf_relic::tier_of(&r.relic_display));
+                                    let flag = if is_live { "*" } else { "" };
+                                    let stale = stale_marker(&ages, &r.relic_display);
+                                    format!("{}{flag} x{}{stale}", r.relic_display, r.owned_count)
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            ui.label(&g.part.part);
+                            ui.label(need);
+                            ui.label(breakdown);
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(6.0);
+            }
         });
         ui.add_space(4.0);
         ui.label(
@@ -865,7 +901,10 @@ fn reset_owned_relics() {
 
 /// Whether any relic sourcing `plan` currently has an active Fissure.
 fn plan_is_live(plan: &PrimePlan, active_tiers: &HashSet<String>) -> bool {
-    plan.relics.iter().any(|r| active_tiers.contains(wf_relic::tier_of(&r.relic_display)))
+    plan.parts
+        .iter()
+        .flat_map(|g| &g.relics)
+        .any(|r| active_tiers.contains(wf_relic::tier_of(&r.relic_display)))
 }
 
 /// The owned-relic freshness line shared by the Relics & Plan, Sell, and Farm

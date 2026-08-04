@@ -309,6 +309,40 @@ pub fn built_name(reward: &str) -> String {
         .join(" ")
 }
 
+/// One craftable component of a Built prime (CONTEXT.md's "Prime Part"): its
+/// own Blueprint, or a piece like Chassis/Systems/Neuroptics (or a weapon's
+/// equivalent). One level below `built_name`'s Built prime.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PrimePart {
+    /// Built prime display name, e.g. "Ember Prime".
+    pub prime: String,
+    /// Component label, e.g. "Systems", "Blueprint".
+    pub part: String,
+}
+
+/// The distinguishing component word of a reward's name, e.g. `"Ember
+/// Prime Systems Blueprint"` → `"Systems"`. Falls back to `"Blueprint"` when
+/// "Blueprint" is the only component word present (a frame/weapon's own build
+/// blueprint, as opposed to one of its components) or when the reward has no
+/// component word at all (a bare `"<Weapon> Prime"` reward names that
+/// weapon's own — implicit — blueprint).
+pub fn part_name(reward: &str) -> String {
+    reward
+        .split_whitespace()
+        .find(|w| {
+            let lw = w.to_ascii_lowercase();
+            lw != "blueprint" && COMPONENTS.contains(&lw.as_str())
+        })
+        .map(|w| w.to_string())
+        .unwrap_or_else(|| "Blueprint".to_string())
+}
+
+/// A reward's [`PrimePart`] identity: which prime it builds, and which
+/// component of it.
+pub fn prime_part(reward: &str) -> PrimePart {
+    PrimePart { prime: built_name(reward), part: part_name(reward) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +359,34 @@ mod tests {
         assert_eq!(reward_core("Ember Prime Systems Blueprint"), "ember");
         assert_eq!(reward_core("Cobra & Crane Prime"), "cobracrane");
         assert_ne!(reward_core("Gram Prime"), reward_core("Rubico Prime"));
+    }
+
+    #[test]
+    fn part_name_picks_the_specific_component_over_blueprint() {
+        assert_eq!(part_name("Ember Prime Systems Blueprint"), "Systems");
+        assert_eq!(part_name("Akstiletto Prime Barrel"), "Barrel");
+    }
+
+    #[test]
+    fn part_name_falls_back_to_blueprint() {
+        // The frame/weapon's own build blueprint: "Blueprint" is the only
+        // component word present.
+        assert_eq!(part_name("Ember Prime Blueprint"), "Blueprint");
+        // No component word at all: WFCD's raw reward text for some weapons'
+        // own blueprint omits the word "Blueprint" entirely.
+        assert_eq!(part_name("Cobra & Crane Prime"), "Blueprint");
+    }
+
+    #[test]
+    fn prime_part_pairs_built_name_and_part_name() {
+        assert_eq!(
+            prime_part("Ember Prime Systems Blueprint"),
+            PrimePart { prime: "Ember Prime".to_string(), part: "Systems".to_string() }
+        );
+        assert_eq!(
+            prime_part("Ember Prime Blueprint"),
+            PrimePart { prime: "Ember Prime".to_string(), part: "Blueprint".to_string() }
+        );
     }
 
     #[test]

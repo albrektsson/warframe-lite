@@ -438,8 +438,14 @@ async fn mastery_plan_cmd(config: &Config) -> Result<()> {
     let client = http_client();
     let index = wf_relic::RelicIndex::load_cached(&client, CATALOGUE_TTL).await?;
     let mastery = load_mastery(config, &client).await;
+    let quantities = wf_relic::PartQuantities::load_cached(&client, CATALOGUE_TTL)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("part quantity load failed: {e:#}");
+            wf_relic::PartQuantities::empty()
+        });
     let intact = wf_relic::intact_counts(&owned.value);
-    let plans = wf_relic::mastery_plan(&intact, &index, &mastery);
+    let plans = wf_relic::mastery_plan(&intact, &index, &mastery, &quantities);
 
     if plans.is_empty() {
         println!("  no unmastered primes found among your scanned relics");
@@ -453,18 +459,23 @@ async fn mastery_plan_cmd(config: &Config) -> Result<()> {
         .map(|ws| ws.active_fissure_tiers())
         .unwrap_or_default();
 
-    println!("  {:<24} {:>6}  relics you own that can still drop it", "unmastered prime", "owned");
+    println!("  {:<24} {:>6}", "unmastered prime", "owned");
     for p in &plans {
-        let breakdown = p
-            .relics
-            .iter()
-            .map(|r| {
-                let live = if active_tiers.contains(wf_relic::tier_of(&r.relic_display)) { "*" } else { "" };
-                format!("{}{live} x{}", r.relic_display, r.owned_count)
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        println!("  {:<24} {:>6}  {breakdown}", truncate_str(&p.prime, 24), p.total_owned);
+        println!("  {:<24} {:>6}", truncate_str(&p.prime, 24), p.total_owned);
+        for g in &p.parts {
+            let need = g.build_quantity.map(|q| format!(" (need x{q})")).unwrap_or_default();
+            let breakdown = g
+                .relics
+                .iter()
+                .map(|r| {
+                    let live =
+                        if active_tiers.contains(wf_relic::tier_of(&r.relic_display)) { "*" } else { "" };
+                    format!("{}{live} x{}", r.relic_display, r.owned_count)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("      {:<16}{need}  {breakdown}", g.part.part);
+        }
     }
     println!("\n  * = a fissure of that relic's tier is active right now");
     Ok(())
