@@ -719,6 +719,14 @@ const MIN_NAME_HSPAN: f32 = 0.35;
 /// the player keeps scrolling (see ADR-0005).
 const RELIC_AGREEMENT: u32 = 2;
 
+/// How many frames must resolve the same `(code, refinement)` identity before
+/// it's marked Seen. `RelicIndex::best_match` still occasionally ties two
+/// different real codes on a single garbled read; a lone frame's identity is
+/// cheaper to reach agreement on than a full [`RELIC_AGREEMENT`]-frame count
+/// match, but requiring a second one guards Seen against acting on a single
+/// tie-broken bad match (see ADR-0009).
+const SEEN_AGREEMENT: u32 = 2;
+
 /// One relic card's resolved reading on a single frame.
 struct RelicObservation {
     /// Relic display code, e.g. "Meso B9".
@@ -1603,6 +1611,7 @@ async fn relic_scan_loop(
         };
     let mut tally: wf_ocr::Tally<(String, wf_relic::Refinement)> = wf_ocr::Tally::new();
     let mut session_applied: HashMap<(String, wf_relic::Refinement), u32> = HashMap::new();
+    let mut identity_reads: HashMap<(String, wf_relic::Refinement), u32> = HashMap::new();
     let mut was_active = false;
     // Bogus initial value (not a real deadline the watcher could ever set) so the
     // very first observed deadline always registers as a change below.
@@ -1633,6 +1642,7 @@ async fn relic_scan_loop(
             was_active = true;
             tally = wf_ocr::Tally::new();
             session_applied.clear();
+            identity_reads.clear();
             tracing::info!(
                 "relics screen opened — scanning as you scroll ({} relics known from before)",
                 relic_owned.len()
@@ -1649,10 +1659,17 @@ async fn relic_scan_loop(
             let mut changed = false;
             for obs in found {
                 let key = (obs.display.clone(), obs.refinement);
+                // Any cleanly-resolved identity marks Seen, independent of count (ADR-0009).
                 match obs.kind {
-                    ObsKind::Count(n) => tally.record(key.clone(), n),
+                    ObsKind::Count(n) => {
+                        changed |= mark_seen_if_agreed(&mut identity_reads, &mut relic_owned, &key);
+                        tally.record(key.clone(), n);
+                    }
                     ObsKind::Unowned => tally.record(key.clone(), 0), // 0 = confirmed unowned
-                    ObsKind::Abstain => continue,
+                    ObsKind::Abstain => {
+                        changed |= mark_seen_if_agreed(&mut identity_reads, &mut relic_owned, &key);
+                        continue;
+                    }
                 }
                 let Some(confirmed) = tally.confirmed(&key, RELIC_AGREEMENT) else {
                     continue;
@@ -1663,7 +1680,7 @@ async fn relic_scan_loop(
                     continue;
                 }
                 session_applied.insert(key.clone(), confirmed);
-                apply_confirmed_count(&mut relic_owned, &key, confirmed);
+                wf_relic::apply_confirmed_count(&mut relic_owned, &key.0, key.1, confirmed);
                 changed = true;
             }
             if changed {
@@ -1688,29 +1705,17 @@ async fn relic_scan_loop(
     }
 }
 
-/// Apply a confirmed `(code, refinement)` count to the owned set: a value of 0
-/// (a confirmed "unowned" eye reading) removes that entry — positive proof the
-/// player owns none — while any positive value replaces the count and refreshes
-/// its last-seen stamp (see ADR-0005).
-fn apply_confirmed_count(
-    owned: &mut wf_relic::OwnedRelics,
+/// Bump `key`'s identity-read counter and mark Seen once it reaches
+/// [`SEEN_AGREEMENT`]. Returns whether this call actually marked Seen (a new
+/// change worth persisting).
+fn mark_seen_if_agreed(
+    identity_reads: &mut std::collections::HashMap<(String, wf_relic::Refinement), u32>,
+    relic_owned: &mut wf_relic::OwnedRelics,
     key: &(String, wf_relic::Refinement),
-    value: u32,
-) {
-    let (code, refinement) = key;
-    if value == 0 {
-        if let Some(by_ref) = owned.get_mut(code) {
-            by_ref.remove(refinement);
-            if by_ref.is_empty() {
-                owned.remove(code);
-            }
-        }
-    } else {
-        owned.entry(code.clone()).or_default().insert(
-            *refinement,
-            wf_cache::Stamped { value, fetched_at: wf_cache::now_unix() },
-        );
-    }
+) -> bool {
+    let reads = identity_reads.entry(key.clone()).or_insert(0);
+    *reads += 1;
+    *reads >= SEEN_AGREEMENT && wf_relic::mark_seen(relic_owned, &key.0, key.1)
 }
 
 /// How many relic rows fit the overlay panel height.

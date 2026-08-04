@@ -3,10 +3,13 @@
 //!
 //! A relic's identity on the Void Relics screen includes its **refinement** —
 //! `Meso Z4 Relic`, `Meso Z4 Relic [Exceptional]`, `[Flawless]`, `[Radiant]` are
-//! four distinct cards. We store a confirmed, timestamped count per
-//! `(code, refinement)` (see ADR-0005); the fissure planners only ever consume
-//! the Intact projection ([`intact_counts`]), because the relic drop tables are
-//! Intact-only.
+//! four distinct cards. Each `(code, refinement)` entry tracks two independent
+//! trust tiers (see ADR-0009): **Seen** ([`mark_seen`]), set from a single
+//! clean identity read, and a **Confirmed count** ([`apply_confirmed_count`]),
+//! which still requires two agreeing frames (ADR-0005 unchanged). The fissure
+//! planners only ever consume the Intact projection ([`intact_counts`]), and
+//! only entries with a confirmed count — a Seen-but-uncounted relic doesn't
+//! feed those yet, because they need an actual number to rank by.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -33,9 +36,21 @@ pub enum Refinement {
 /// for free.
 pub type OwnedCount = Stamped<u32>;
 
-/// The persisted owned-relic set: relic display code → refinement → count.
+/// One `(code, refinement)`'s owned-relic state: two independent trust tiers
+/// (see ADR-0009). `seen` is set from a single clean identity read and never
+/// itself gates or is gated by `count`, which keeps requiring two agreeing
+/// frames to confirm (ADR-0005). An entry always has at least one of the two
+/// set — [`apply_confirmed_count`] and [`mark_seen`] remove it entirely rather
+/// than leave `{seen: false, count: None}` behind.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OwnedEntry {
+    pub seen: bool,
+    pub count: Option<OwnedCount>,
+}
+
+/// The persisted owned-relic set: relic display code → refinement → entry.
 /// Serialised to `owned-relics.json` (see [`crate::OWNED_RELICS_FILE`]).
-pub type OwnedRelics = HashMap<String, HashMap<Refinement, OwnedCount>>;
+pub type OwnedRelics = HashMap<String, HashMap<Refinement, OwnedEntry>>;
 
 /// Counts older than this are flagged stale in the UI — a hint that the entry
 /// hasn't been re-confirmed recently and may no longer match the in-game
@@ -94,17 +109,22 @@ fn strip_relic_word(s: &str) -> String {
 
 /// Project the owned set to the Intact-only `display → count` map the planners
 /// ([`crate::mastery_plan`], [`crate::sell_picks`], [`crate::farm_picks`])
-/// consume. Non-Intact copies are dropped: relic drop tables are Intact-only.
+/// consume — only entries with a confirmed count (they need an actual number
+/// to rank by; a Seen-but-uncounted relic doesn't feed these yet). Non-Intact
+/// copies are dropped: relic drop tables are Intact-only.
 pub fn intact_counts(owned: &OwnedRelics) -> HashMap<String, u32> {
     owned
         .iter()
-        .filter_map(|(code, by_ref)| by_ref.get(&Refinement::Intact).map(|s| (code.clone(), s.value)))
+        .filter_map(|(code, by_ref)| {
+            let count = by_ref.get(&Refinement::Intact)?.count.as_ref()?;
+            Some((code.clone(), count.value))
+        })
         .collect()
 }
 
 /// How long ago a relic code's Intact count was last confirmed, if it has one.
 pub fn intact_age(owned: &OwnedRelics, code: &str) -> Option<Duration> {
-    owned.get(code)?.get(&Refinement::Intact).map(|s| s.age())
+    owned.get(code)?.get(&Refinement::Intact)?.count.as_ref().map(|s| s.age())
 }
 
 /// Per-code age of each Intact count's last-seen stamp — the source for the
@@ -112,7 +132,10 @@ pub fn intact_age(owned: &OwnedRelics, code: &str) -> Option<Duration> {
 pub fn intact_ages(owned: &OwnedRelics) -> HashMap<String, Duration> {
     owned
         .iter()
-        .filter_map(|(code, by_ref)| by_ref.get(&Refinement::Intact).map(|s| (code.clone(), s.age())))
+        .filter_map(|(code, by_ref)| {
+            let count = by_ref.get(&Refinement::Intact)?.count.as_ref()?;
+            Some((code.clone(), count.age()))
+        })
         .collect()
 }
 
@@ -121,9 +144,43 @@ pub fn intact_ages(owned: &OwnedRelics) -> HashMap<String, Duration> {
 pub fn intact_age_range(owned: &OwnedRelics) -> Option<(Duration, Duration)> {
     let ages: Vec<Duration> = owned
         .values()
-        .filter_map(|by_ref| by_ref.get(&Refinement::Intact).map(|s| s.age()))
+        .filter_map(|by_ref| by_ref.get(&Refinement::Intact)?.count.as_ref().map(|s| s.age()))
         .collect();
     Some((*ages.iter().min()?, *ages.iter().max()?))
+}
+
+/// Mark `(code, refinement)` as **Seen**: the card's name+refinement matched
+/// the catalogue on a single clean read, with no "unowned" eye icon (see
+/// ADR-0009). Never touches an existing confirmed count. Returns whether this
+/// changed anything (a card that's already Seen is a no-op), so callers only
+/// pay for a save/UI refresh when the owned set actually grew.
+pub fn mark_seen(owned: &mut OwnedRelics, code: &str, refinement: Refinement) -> bool {
+    let entry = owned.entry(code.to_string()).or_default().entry(refinement).or_default();
+    if entry.seen {
+        return false;
+    }
+    entry.seen = true;
+    true
+}
+
+/// Apply a confirmed `(code, refinement)` count (see ADR-0005): a value of `0`
+/// (a confirmed "unowned" eye reading) removes the entry entirely — positive
+/// proof the player owns none, overriding any prior Seen — while a positive
+/// value replaces the count, refreshes its last-seen stamp, and implies Seen
+/// (a confirmed count is definitionally also a clean identity read).
+pub fn apply_confirmed_count(owned: &mut OwnedRelics, code: &str, refinement: Refinement, value: u32) {
+    if value == 0 {
+        if let Some(by_ref) = owned.get_mut(code) {
+            by_ref.remove(&refinement);
+            if by_ref.is_empty() {
+                owned.remove(code);
+            }
+        }
+        return;
+    }
+    let entry = owned.entry(code.to_string()).or_default().entry(refinement).or_default();
+    entry.seen = true;
+    entry.count = Some(Stamped { value, fetched_at: wf_cache::now_unix() });
 }
 
 #[cfg(test)]
@@ -155,24 +212,32 @@ mod tests {
         assert_eq!(r, Refinement::Radiant);
     }
 
+    fn counted(value: u32, fetched_at: u64) -> OwnedEntry {
+        OwnedEntry { seen: true, count: Some(Stamped { value, fetched_at }) }
+    }
+
+    fn seen_only() -> OwnedEntry {
+        OwnedEntry { seen: true, count: None }
+    }
+
     #[test]
-    fn intact_counts_drops_refined_copies() {
+    fn intact_counts_drops_refined_copies_and_uncounted_seen_entries() {
         let mut owned: OwnedRelics = HashMap::new();
         owned.insert(
             "Meso B9".to_string(),
             HashMap::from([
-                (Refinement::Intact, Stamped { value: 15, fetched_at: 100 }),
-                (Refinement::Radiant, Stamped { value: 3, fetched_at: 100 }),
+                (Refinement::Intact, counted(15, 100)),
+                (Refinement::Radiant, counted(3, 100)),
             ]),
         );
         // A relic with only refined copies contributes nothing to the Intact plan.
-        owned.insert(
-            "Axi A1".to_string(),
-            HashMap::from([(Refinement::Radiant, Stamped { value: 2, fetched_at: 100 })]),
-        );
+        owned.insert("Axi A1".to_string(), HashMap::from([(Refinement::Radiant, counted(2, 100))]));
+        // Seen but never confirmed: doesn't feed the planners yet (ADR-0009).
+        owned.insert("Lith K1".to_string(), HashMap::from([(Refinement::Intact, seen_only())]));
         let intact = intact_counts(&owned);
         assert_eq!(intact.get("Meso B9"), Some(&15));
         assert_eq!(intact.get("Axi A1"), None);
+        assert_eq!(intact.get("Lith K1"), None);
     }
 
     #[test]
@@ -181,14 +246,15 @@ mod tests {
         owned.insert(
             "Meso B9".to_string(),
             HashMap::from([
-                (Refinement::Intact, Stamped { value: 15, fetched_at: 1000 }),
-                (Refinement::Radiant, Stamped { value: 3, fetched_at: 2000 }),
+                (Refinement::Intact, counted(15, 1000)),
+                (Refinement::Radiant, seen_only()),
             ]),
         );
         let json = serde_json::to_string(&owned).unwrap();
         let back: OwnedRelics = serde_json::from_str(&json).unwrap();
-        assert_eq!(back["Meso B9"][&Refinement::Intact].value, 15);
-        assert_eq!(back["Meso B9"][&Refinement::Radiant].fetched_at, 2000);
+        assert_eq!(back["Meso B9"][&Refinement::Intact].count.as_ref().unwrap().value, 15);
+        assert!(back["Meso B9"][&Refinement::Radiant].seen);
+        assert!(back["Meso B9"][&Refinement::Radiant].count.is_none());
     }
 
     #[test]
@@ -198,5 +264,42 @@ mod tests {
         // silently misreading counts.
         let legacy = r#"{"Meso B9": 15, "Axi A1": 2}"#;
         assert!(serde_json::from_str::<OwnedRelics>(legacy).is_err());
+    }
+
+    #[test]
+    fn a_pre_seen_tier_file_does_not_deserialize_as_the_new_schema() {
+        // ADR-0005's schema has no `seen` field, so it must also fail to parse.
+        let pre_seen = r#"{"Meso B9": {"Intact": {"value": 15, "fetched_at": 1000}}}"#;
+        assert!(serde_json::from_str::<OwnedRelics>(pre_seen).is_err());
+    }
+
+    #[test]
+    fn mark_seen_creates_an_entry_and_is_idempotent() {
+        let mut owned: OwnedRelics = HashMap::new();
+        assert!(mark_seen(&mut owned, "Meso B9", Refinement::Intact));
+        assert!(owned["Meso B9"][&Refinement::Intact].seen);
+        assert!(owned["Meso B9"][&Refinement::Intact].count.is_none());
+        // Already seen: no change reported, and an existing count untouched.
+        apply_confirmed_count(&mut owned, "Meso B9", Refinement::Intact, 15);
+        assert!(!mark_seen(&mut owned, "Meso B9", Refinement::Intact));
+        assert_eq!(owned["Meso B9"][&Refinement::Intact].count.as_ref().unwrap().value, 15);
+    }
+
+    #[test]
+    fn apply_confirmed_count_implies_seen() {
+        let mut owned: OwnedRelics = HashMap::new();
+        apply_confirmed_count(&mut owned, "Meso B9", Refinement::Intact, 15);
+        let entry = &owned["Meso B9"][&Refinement::Intact];
+        assert!(entry.seen);
+        assert_eq!(entry.count.as_ref().unwrap().value, 15);
+    }
+
+    #[test]
+    fn apply_confirmed_count_zero_removes_the_entry_even_if_seen() {
+        let mut owned: OwnedRelics = HashMap::new();
+        mark_seen(&mut owned, "Meso B9", Refinement::Intact);
+        apply_confirmed_count(&mut owned, "Meso B9", Refinement::Intact, 15);
+        apply_confirmed_count(&mut owned, "Meso B9", Refinement::Intact, 0);
+        assert!(!owned.contains_key("Meso B9"));
     }
 }

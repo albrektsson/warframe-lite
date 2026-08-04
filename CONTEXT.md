@@ -57,8 +57,9 @@ the target of relic-cracking and fissure planning.
 **Owned relic**:
 A Relic the player currently holds, known only from OCR-scanning the in-game
 Void Relics screen (see ADR-0001) — never read from process memory or a login
-API. Ownership is a **Confirmed count** per (relic code, **Refinement**) pair —
-e.g. "Axi H3" Intact and "Axi H3" Radiant are counted separately — not per copy.
+API. Tracked per (relic code, **Refinement**) pair — e.g. "Axi H3" Intact and
+"Axi H3" Radiant are distinct entries — as two tiers of trust: **Seen** first,
+then a **Confirmed count** once the exact number is known (see ADR-0009).
 _Avoid_: Relic inventory (reads as authoritative/API-sourced; "owned relic"
 keeps it clear the count is scan-derived and can lag or miss entries).
 
@@ -69,12 +70,23 @@ its rare-drop odds and is shown as a bracketed suffix on the Void Relics screen
 in different refinements is tracked as distinct owned entries. Fissure planning
 uses the Intact drop tables, so only Intact copies feed the Mastery plan.
 
+**Seen**:
+The weaker of the two owned-relic trust tiers: a relic card whose name+
+refinement matched the catalogue and showed no "unowned" eye icon on a single
+clean read (see ADR-0009). Establishes that the player owns *at least one*
+copy — enough to count toward totals compared against the game's own
+"Collected N/772" — without yet claiming to know how many. Upgrades to a
+**Confirmed count** once that count clears its own, separate agreement bar;
+never itself gates or is gated by the count.
+_Avoid_: Confirmed (that word is reserved for the count tier specifically).
+
 **Confirmed count**:
 An owned-relic count trusted only after the OCR scan reads the same value on
 enough frames to agree with itself (see ADR-0005) — never from a single read.
 Corrects downward on new evidence; drops to zero only when a card is scanned
 showing the "unowned" eye icon. A count never re-confirmed on a later scan is
-kept but flagged by its **Scan age**, never silently deleted.
+kept but flagged by its **Scan age**, never silently deleted. A relic can be
+**Seen** without (yet) having one of these — the two are tracked separately.
 _Avoid_: Owned count (fine loosely, but "confirmed" marks that a lone or
 outlier OCR read is not yet believed).
 

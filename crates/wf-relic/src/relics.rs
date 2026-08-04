@@ -116,8 +116,11 @@ impl RelicIndex {
         Ok(Self::new(relics))
     }
 
-    /// Best fuzzy match for an OCR'd relic label (e.g. `"AXI H3"`). Relic codes are
-    /// short and distinct, so this matches confidently; returns `None` below 0.8.
+    /// Best fuzzy match for an OCR'd relic label (e.g. `"AXI H3"`). Relic codes
+    /// are short, so a garbled read can land exactly as close to two different
+    /// real codes (e.g. a dropped letter leaving `"meso1"` equidistant from both
+    /// `"Meso I1"` and `"Meso A1"`) — such a tie abstains (`None`) rather than
+    /// arbitrarily picking one, the same way a below-threshold score does.
     pub fn best_match(&self, query: &str) -> Option<&RelicInfo> {
         let q = normalize(query);
         if q.is_empty() {
@@ -125,14 +128,24 @@ impl RelicIndex {
         }
         let qb = q.as_bytes();
         let mut best: Option<(usize, usize)> = None;
+        let mut tied = false;
         for (i, code) in self.normalized.iter().enumerate() {
             let d = levenshtein(qb, code.as_bytes());
-            if best.is_none_or(|(_, bd)| d < bd) {
-                best = Some((i, d));
-                if d == 0 {
-                    break;
+            match best {
+                Some((_, bd)) if d < bd => {
+                    best = Some((i, d));
+                    tied = false;
+                    if d == 0 {
+                        break;
+                    }
                 }
+                Some((_, bd)) if d == bd => tied = true,
+                Some(_) => {}
+                None => best = Some((i, d)),
             }
+        }
+        if tied {
+            return None;
         }
         let (idx, dist) = best?;
         let longest = self.normalized[idx].len().max(q.len()).max(1);
@@ -540,6 +553,16 @@ mod tests {
         assert_eq!(idx.best_match("AXI H3").map(|r| r.display.as_str()), Some("Axi H3"));
         assert_eq!(idx.best_match("MES0 N11").map(|r| r.display.as_str()), Some("Meso N11"));
         assert!(idx.best_match("zzzqwx").is_none());
+    }
+
+    #[test]
+    fn best_match_abstains_on_a_tie_instead_of_guessing() {
+        // A dropped letter ("Meso I1" -> "meso1") lands exactly one edit from both
+        // real codes below — must abstain rather than arbitrarily pick one.
+        let idx = RelicIndex::new(vec![relic("Meso I1", &[]), relic("Meso A1", &[])]);
+        assert!(idx.best_match("Meso 1").is_none());
+        // An unambiguous read still resolves normally.
+        assert_eq!(idx.best_match("Meso I1").map(|r| r.display.as_str()), Some("Meso I1"));
     }
 
     #[test]
