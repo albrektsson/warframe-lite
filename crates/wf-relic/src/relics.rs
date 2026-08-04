@@ -391,6 +391,8 @@ pub struct PrimeRelicSource {
     pub owned_count: u32,
     /// Drop rarity of this part within this relic (Common/Uncommon/Rare).
     pub rarity: String,
+    /// Lowest market sell price in platinum, if resolved.
+    pub plat: Option<u32>,
 }
 
 /// One Prime Part of an unmastered prime, and the owned relics that can still
@@ -401,7 +403,10 @@ pub struct PrimePartGroup {
     /// How many `part.part` a full build needs, if known — never guessed when
     /// unknown (see ADR-0011).
     pub build_quantity: Option<u32>,
-    /// Owned relics that can drop this part, most-owned first.
+    /// Owned relics that can drop this part, cheapest first (unresolved prices
+    /// last) so a plentiful cheap relic is never overlooked in favor of a
+    /// pricier — often vaulted — one that happens to be owned too; ties broken
+    /// by most-owned, then relic display.
     pub relics: Vec<PrimeRelicSource>,
 }
 
@@ -424,8 +429,14 @@ pub struct PrimePlan {
 /// down by Prime Part, which relics (and how many of each) can drop it. Ranked
 /// by `total_owned` descending, so the primes with the most farming budget
 /// already in hand come first; parts within a prime are ranked the same way.
+///
+/// Prices come from a caller-supplied map (relic market slug →
+/// already-resolved plat, `None` where unresolved) rather than being fetched
+/// inline, keeping this pure and mirroring [`sell_picks`]; a slug missing from
+/// the map is treated the same as an explicit `None`.
 pub fn mastery_plan(
     owned: &std::collections::HashMap<String, u32>,
+    prices: &HashMap<String, Option<u32>>,
     index: &RelicIndex,
     mastery: &MasterySet,
     quantities: &PartQuantities,
@@ -444,6 +455,7 @@ pub fn mastery_plan(
         if count == 0 {
             continue;
         }
+        let plat = prices.get(&relic.slug()).copied().flatten();
         let mut seen: Vec<PrimePart> = Vec::new();
         for r in unmastered_rewards(relic, mastery) {
             let pp = prime_part(&r.item_name);
@@ -456,6 +468,7 @@ pub fn mastery_plan(
                     relic_display: relic.display.clone(),
                     owned_count: count,
                     rarity: r.rarity.clone(),
+                    plat,
                 },
             );
             prime_relic_counts.entry(pp.prime).or_default().insert(relic.display.clone(), count);
@@ -468,9 +481,12 @@ pub fn mastery_plan(
             let mut parts: Vec<PrimePartGroup> = part_map
                 .into_iter()
                 .map(|(pp, mut relics)| {
+                    // Cheapest first (unresolved last) — see `PrimePartGroup::relics`.
                     relics.sort_by(|a, b| {
-                        b.owned_count
-                            .cmp(&a.owned_count)
+                        a.plat
+                            .unwrap_or(u32::MAX)
+                            .cmp(&b.plat.unwrap_or(u32::MAX))
+                            .then_with(|| b.owned_count.cmp(&a.owned_count))
                             .then_with(|| a.relic_display.cmp(&b.relic_display))
                     });
                     let build_quantity = quantities.get(&pp);
@@ -738,7 +754,7 @@ mod tests {
             ("Lith G4".to_string(), 9),  // owned but nothing unmastered → contributes nothing
             ("Neo V9".to_string(), 3),   // owned but not in the index → ignored
         ]);
-        let plans = mastery_plan(&owned, &idx, &mastery, &PartQuantities::empty());
+        let plans = mastery_plan(&owned, &HashMap::new(), &idx, &mastery, &PartQuantities::empty());
 
         // Akstiletto Prime's Barrel and Receiver are two different parts, each
         // sourced from a different owned relic: 5 + 2 = 7 total_owned, and it
@@ -763,6 +779,39 @@ mod tests {
     }
 
     #[test]
+    fn mastery_plan_orders_relics_cheapest_first() {
+        // Same part droppable from a cheap, plentiful relic and an expensive
+        // (e.g. vaulted) one owned in smaller number — cheapest must sort
+        // first regardless of owned_count, so the guide never nudges toward
+        // burning the expensive relic when the cheap one would do.
+        let idx = RelicIndex::new(vec![
+            relic("Axi H3", &["Rubico Prime Barrel"]),
+            relic("Lith V1", &["Rubico Prime Barrel"]),
+            relic("Meso B4", &["Rubico Prime Barrel"]), // unpriced
+        ]);
+        let owned = std::collections::HashMap::from([
+            ("Axi H3".to_string(), 1),
+            ("Lith V1".to_string(), 20),
+            ("Meso B4".to_string(), 5),
+        ]);
+        let prices = std::collections::HashMap::from([
+            ("axi_h3_relic".to_string(), Some(50)),
+            ("lith_v1_relic".to_string(), Some(2)),
+            // Meso B4 deliberately absent — unresolved price.
+        ]);
+        let plans = mastery_plan(&owned, &prices, &idx, &MasterySet::default(), &PartQuantities::empty());
+
+        let rubico = plans.iter().find(|p| p.prime == "Rubico Prime").unwrap();
+        let barrel = rubico.parts.iter().find(|g| g.part.part == "Barrel").unwrap();
+        assert_eq!(
+            barrel.relics.iter().map(|r| r.relic_display.as_str()).collect::<Vec<_>>(),
+            vec!["Lith V1", "Axi H3", "Meso B4"]
+        );
+        assert_eq!(barrel.relics[0].plat, Some(2));
+        assert_eq!(barrel.relics[2].plat, None);
+    }
+
+    #[test]
     fn mastery_plan_dedups_a_relics_owned_count_across_its_own_multiple_parts() {
         // One relic dropping two different parts of the same prime must only
         // count its owned copies once toward that prime's total_owned, not
@@ -773,7 +822,7 @@ mod tests {
         )]);
         let owned = std::collections::HashMap::from([("Axi B2".to_string(), 4)]);
 
-        let plans = mastery_plan(&owned, &idx, &MasterySet::default(), &PartQuantities::empty());
+        let plans = mastery_plan(&owned, &HashMap::new(), &idx, &MasterySet::default(), &PartQuantities::empty());
 
         let loki = plans.iter().find(|p| p.prime == "Loki Prime").unwrap();
         assert_eq!(loki.total_owned, 4);
@@ -791,7 +840,7 @@ mod tests {
             2,
         )]);
 
-        let plans = mastery_plan(&owned, &idx, &MasterySet::default(), &quantities);
+        let plans = mastery_plan(&owned, &HashMap::new(), &idx, &MasterySet::default(), &quantities);
 
         let afuris = plans.iter().find(|p| p.prime == "Afuris Prime").unwrap();
         let barrel = afuris.parts.iter().find(|g| g.part.part == "Barrel").unwrap();

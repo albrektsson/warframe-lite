@@ -445,7 +445,24 @@ async fn mastery_plan_cmd(config: &Config) -> Result<()> {
             wf_relic::PartQuantities::empty()
         });
     let intact = wf_relic::intact_counts(&owned.value);
-    let plans = wf_relic::mastery_plan(&intact, &index, &mastery, &quantities);
+
+    // Price every owned relic (not the whole catalogue) so the breakdown can
+    // list cheapest first — the mastery_plan_cmd equivalent of relics_cmd's
+    // per-relic pricing.
+    let market = MarketClient::new(client.clone(), config.market_platform.clone());
+    let cache = wf_relic::price_cache();
+    let mut relic_prices: std::collections::HashMap<String, Option<u32>> = std::collections::HashMap::new();
+    for relic in index.all() {
+        if intact.get(&relic.display).copied().unwrap_or(0) == 0 {
+            continue;
+        }
+        let plat =
+            wf_relic::cached_plat(&cache, &market, &relic.slug(), wf_relic::PriceOpts::default()).await;
+        relic_prices.insert(relic.slug(), plat);
+    }
+    cache.save();
+
+    let plans = wf_relic::mastery_plan(&intact, &relic_prices, &index, &mastery, &quantities);
 
     if plans.is_empty() {
         println!("  no unmastered primes found among your scanned relics");
@@ -470,7 +487,8 @@ async fn mastery_plan_cmd(config: &Config) -> Result<()> {
                 .map(|r| {
                     let live =
                         if active_tiers.contains(wf_relic::tier_of(&r.relic_display)) { "*" } else { "" };
-                    format!("{}{live} x{}", r.relic_display, r.owned_count)
+                    let price = r.plat.map(|p| format!(" ({p}p)")).unwrap_or_default();
+                    format!("{}{live} x{}{price}", r.relic_display, r.owned_count)
                 })
                 .collect::<Vec<_>>()
                 .join(", ");

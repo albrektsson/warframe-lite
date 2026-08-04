@@ -247,7 +247,8 @@ impl Live {
         // Intact-only); refined copies are tracked but excluded here.
         let intact = owned.map(|o| wf_relic::intact_counts(&o.value));
         // mastery_plan/sell_picks/farm_picks already rank their output.
-        let plans = intact.as_ref().map(|c| wf_relic::mastery_plan(c, index, mastery, quantities));
+        let plans =
+            intact.as_ref().map(|c| wf_relic::mastery_plan(c, &prices.sell, index, mastery, quantities));
         let sell_picks = intact.as_ref().map(|c| wf_relic::sell_picks(c, &prices.sell, index, mastery));
         let farm_picks = intact.as_ref().map(|c| wf_relic::farm_picks(c, &prices.farm, index, mastery));
         let owned_age_range = owned.and_then(|o| wf_relic::intact_age_range(&o.value));
@@ -603,7 +604,8 @@ impl BrowseApp {
                                         active_tiers.contains(wf_relic::tier_of(&r.relic_display));
                                     let flag = if is_live { "*" } else { "" };
                                     let stale = stale_marker(&ages, &r.relic_display);
-                                    format!("{}{flag} x{}{stale}", r.relic_display, r.owned_count)
+                                    let price = r.plat.map(|p| format!(" ({p}p)")).unwrap_or_default();
+                                    format!("{}{flag} x{}{price}{stale}", r.relic_display, r.owned_count)
                                 })
                                 .collect::<Vec<_>>()
                                 .join(", ");
