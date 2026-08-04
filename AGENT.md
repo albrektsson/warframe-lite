@@ -18,7 +18,8 @@ A single Cargo workspace of focused crates:
   (relic crack / reward-screen markers).
 - **wf-capture** — pure-Rust X11 capture (`x11rb`) of the Warframe Xwayland
   window, plus its geometry (for monitor placement).
-- **wf-ocr** — OCR via the Tesseract CLI with Warframe-tuned preprocessing.
+- **wf-ocr** — in-process `libtesseract`/`leptonica` OCR (via `leptess`, behind a
+  small engine pool — see ADR-0008) with Warframe-tuned preprocessing.
 - **wf-relic** — fuzzy matching of OCR'd reward names to the catalogue, plat
   ranking, the centred variable-count slot layout, and mastery via DE's public
   profile API.
@@ -106,7 +107,7 @@ A single Cargo workspace of focused crates:
      reference width; the subtraction recovers how far `observed_cx` sits from
      *this* capture's own true centre, then rescales that gap back to
      reference-pixel terms).
-- OCR shells out to `tesseract` (installed via Homebrew on Bazzite); the binary is
-  overridable with the `WF_TESSERACT` env var.
+- OCR links `libtesseract`/`libleptonica` in-process via `leptess` (ADR-0008);
+  building needs `libtesseract-dev`, `libleptonica-dev`, and `clang` (bindgen).
 - Mastery needs the account id set once (`wf-lite set-account <id>`, from
   `warframe.com/api/user-data`).

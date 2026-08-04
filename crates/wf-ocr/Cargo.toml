@@ -8,3 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
+# In-process FFI bindings to libtesseract/leptonica (ADR-0008) — no subprocess
+# spawn per recognition call. Needs `libtesseract-dev`, `libleptonica-dev`, and
+# `clang` (for its bindgen build step) at build time only.
+leptess = "0.14"

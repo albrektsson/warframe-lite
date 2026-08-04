@@ -29,10 +29,18 @@ Source1:        %{name}-%{version}-vendor.tar.xz
 # rust-packaging provides the %cargo_* macros; rust + cargo do the build.
 BuildRequires:  rust-packaging
 
+# wf-ocr links libtesseract/libleptonica in-process via `leptess` (ADR-0008);
+# tesseract-devel/leptonica-devel supply the headers+.pc files linking needs,
+# clang the libclang bindgen wants.
+BuildRequires:  tesseract-devel
+BuildRequires:  leptonica-devel
+BuildRequires:  clang
+
 # libwayland-client is dlopen()'d at runtime, not linked, so it is a runtime
-# (not build) dependency; tesseract backs the relic reward OCR.
+# (not build) dependency; libtesseract/libleptonica back the relic reward OCR.
 Requires:       libwayland-client
-Requires:       tesseract
+Requires:       tesseract-libs
+Requires:       leptonica
 
 ExclusiveArch:  x86_64
 

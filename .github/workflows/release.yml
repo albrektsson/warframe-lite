@@ -33,8 +33,10 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # ratchet:Swatinem/rust-cache@v2
       - name: Install system dependencies
         # libwayland-dev for the overlay; libxkbcommon-dev for the wf-settings GUI
-        # (winit/glutin otherwise dlopen these at runtime).
-        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev
+        # (winit/glutin otherwise dlopen these at runtime); libtesseract-dev/
+        # libleptonica-dev + clang for wf-ocr's in-process `leptess` OCR pool
+        # (ADR-0008, bindgen needs clang).
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev libtesseract-dev libleptonica-dev clang
       - name: cargo build (release)
         # The lean overlay binary plus the optional companions (settings GUI and
         # tray), each a separate crate so the overlay stays dependency-light.

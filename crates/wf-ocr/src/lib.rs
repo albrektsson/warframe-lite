@@ -1,19 +1,21 @@
-//! OCR via the Tesseract CLI.
+//! OCR via an in-process `libtesseract` pool.
 //!
-//! We shell out to the `tesseract` binary rather than linking `libtesseract`,
-//! so the build stays pure-cargo and works regardless of where Tesseract comes
-//! from (Homebrew, distrobox, system) — only a reachable `tesseract` binary is
-//! required. OCR runs at most once per reward screen, so process-spawn overhead
-//! is irrelevant.
-
-use std::path::PathBuf;
-use std::process::Command;
+//! `wf-ocr` links `libtesseract`/`leptonica` through `leptess` (FFI, no
+//! subprocess) behind a small pool of independent engine instances (see
+//! [`pool`]). The relic-grid scanner OCRs the visible card grid on repeat,
+//! dozens of calls per scan cycle; `TessBaseAPI` isn't safe for concurrent
+//! calls on a single instance, so the pool preserves that per-cycle
+//! parallelism across dozens of cards instead of serialising every call
+//! behind one mutex (see ADR-0008).
 
 use anyhow::{Context, Result};
-use image::{GrayImage, RgbaImage};
+use image::{DynamicImage, GrayImage, RgbaImage};
 
 pub mod count;
+mod pool;
 pub use count::{parse_badge, Tally};
+
+use pool::Pool;
 
 /// Tesseract page-segmentation mode for a recognition call.
 #[derive(Debug, Clone, Copy)]
@@ -57,93 +59,66 @@ impl Default for Preprocess {
     }
 }
 
-/// A configured OCR engine (a located `tesseract` binary + language).
+/// A configured OCR engine: a bounded pool of in-process `libtesseract`
+/// instances sharing one language.
 pub struct Ocr {
-    bin: String,
-    lang: String,
+    pool: Pool,
 }
 
 impl Ocr {
-    /// Locate a usable `tesseract` binary (env `WF_TESSERACT`, then `PATH`, then
-    /// common install locations) and default to English.
+    /// Build an English-language engine pool, sized at roughly half the
+    /// available CPU cores (floor of 1) — enough for `scan_relic_grid`'s
+    /// per-cycle parallelism while leaving headroom for capture/overlay/tokio
+    /// work during a scan burst (see ADR-0008).
     pub fn new() -> Result<Self> {
-        let mut candidates: Vec<String> = Vec::new();
-        if let Ok(env) = std::env::var("WF_TESSERACT") {
-            candidates.push(env);
-        }
-        candidates.push("tesseract".to_string());
-        candidates.push("/home/linuxbrew/.linuxbrew/bin/tesseract".to_string());
-        candidates.push("/usr/bin/tesseract".to_string());
-
-        for bin in candidates {
-            if Command::new(&bin)
-                .arg("--version")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-            {
-                tracing::info!("using tesseract: {bin}");
-                return Ok(Self {
-                    bin,
-                    lang: "eng".to_string(),
-                });
-            }
-        }
-        anyhow::bail!(
-            "no working `tesseract` found (set WF_TESSERACT or install via `brew install tesseract`)"
-        )
-    }
-
-    /// Override the binary path and language.
-    pub fn with_bin(bin: impl Into<String>, lang: impl Into<String>) -> Self {
-        Self {
-            bin: bin.into(),
-            lang: lang.into(),
-        }
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
+        let size = (cores / 2).max(1);
+        let pool = Pool::new(size, "eng").context(
+            "no working libtesseract found (install libtesseract + its English \
+             language data, e.g. `tesseract-ocr-eng`)",
+        )?;
+        tracing::info!("libtesseract pool ready: {size} engine(s)");
+        Ok(Self { pool })
     }
 
     /// Recognise text in `img`, applying `pre` preprocessing and `mode` layout.
     ///
-    /// Skips the tesseract call entirely (returning an empty string) when the
-    /// preprocessed crop has essentially no text pixels: it's a wasted
-    /// subprocess spawn, and some tesseract builds are known to crash with
-    /// SIGFPE in `--psm 7` (single-line) row-cleanup on a near-blank image —
-    /// this is a real, reproducible crash (`Textord::CleanupSingleRowResult`)
-    /// hit while scanning the Void Relics grid, where most candidate crops on
-    /// any given frame are legitimately blank (empty grid cells, or slots that
-    /// land on artwork rather than text while the list scrolls).
+    /// Skips the pool entirely (returning an empty string) when the
+    /// preprocessed crop has essentially no text pixels: it's a wasted engine
+    /// round-trip, and some tesseract builds are known to crash with SIGFPE in
+    /// `--psm 7` (single-line) row-cleanup on a near-blank image — this is a
+    /// real, reproducible crash (`Textord::CleanupSingleRowResult`) hit while
+    /// scanning the Void Relics grid, where most candidate crops on any given
+    /// frame are legitimately blank (empty grid cells, or slots that land on
+    /// artwork rather than text while the list scrolls).
     pub fn recognize(&self, img: &RgbaImage, pre: Preprocess, mode: PageMode) -> Result<String> {
         let processed = preprocess(img, pre);
         if text_fraction(&processed) < MIN_TEXT_FRACTION {
             return Ok(String::new());
         }
-        let path = temp_png_path();
-        processed
-            .save(&path)
-            .with_context(|| format!("writing preprocessed image {}", path.display()))?;
+        let png = encode_png(processed)?;
 
-        let result = self.run_tesseract(&path, mode);
-        let _ = std::fs::remove_file(&path); // best-effort cleanup
-        result
+        let mut engine = self.pool.acquire();
+        engine
+            .set_image_from_mem(&png)
+            .map_err(|e| anyhow::anyhow!("loading crop into libtesseract: {e:?}"))?;
+        engine
+            .set_variable(leptess::Variable::TesseditPagesegMode, mode.psm())
+            .map_err(|_| anyhow::anyhow!("setting libtesseract page-segmentation mode"))?;
+        let text = engine
+            .get_utf8_text()
+            .map_err(|e| anyhow::anyhow!("reading libtesseract output: {e}"))?;
+        Ok(text.trim().to_string())
     }
+}
 
-    fn run_tesseract(&self, image_path: &std::path::Path, mode: PageMode) -> Result<String> {
-        let output = Command::new(&self.bin)
-            .arg(image_path)
-            .arg("stdout")
-            .args(["-l", &self.lang])
-            .args(["--psm", mode.psm()])
-            .output()
-            .with_context(|| format!("running {}", self.bin))?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "tesseract failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    }
+/// PNG-encode a preprocessed crop in memory for [`leptess::LepTess::set_image_from_mem`].
+fn encode_png(img: GrayImage) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    DynamicImage::ImageLuma8(img)
+        .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+        .context("encoding preprocessed crop as PNG")?;
+    Ok(buf)
 }
 
 /// Below this fraction of "text" (dark, post-binarisation) pixels, a crop is
@@ -252,14 +227,6 @@ pub fn preprocess(img: &RgbaImage, pre: Preprocess) -> GrayImage {
     out
 }
 
-fn temp_png_path() -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    std::env::temp_dir().join(format!("wf-ocr-{}-{}.png", std::process::id(), nanos))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,11 +293,11 @@ mod tests {
     }
 
     #[test]
-    fn recognize_skips_tesseract_on_blank_crop() {
-        // A blank crop must resolve to an empty string without ever invoking a
-        // `tesseract` binary — use a path that doesn't exist, so any attempt to
-        // actually run it would fail loudly rather than silently succeed.
-        let ocr = Ocr::with_bin("/nonexistent/tesseract", "eng");
+    fn recognize_skips_the_pool_on_blank_crop() {
+        // A blank crop must resolve to an empty string without ever drawing an
+        // engine from the pool — back it with an empty (test-stub) pool, so any
+        // attempt to actually acquire one panics instead of silently succeeding.
+        let ocr = Ocr { pool: pool::Pool::empty() };
         let blank = RgbaImage::from_pixel(20, 20, image::Rgba([10, 10, 10, 255]));
         let result = ocr.recognize(&blank, Preprocess::default(), PageMode::Line);
         assert_eq!(result.unwrap(), "");
