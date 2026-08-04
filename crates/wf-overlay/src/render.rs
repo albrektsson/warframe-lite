@@ -235,6 +235,34 @@ pub fn render_relic_panel(rows: &[RelicRow], font: &Font) -> Canvas {
     canvas
 }
 
+/// Live progress for an in-flight owned-relic scan, shown before enough
+/// relics have cleared their trust bar to render a real [`render_relic_panel`]
+/// guide — so the player sees the app react to opening the Relics screen
+/// immediately, rather than nothing until the first confirmed relic.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScanProgress {
+    /// Relics marked Seen this session (see ADR-0009).
+    pub seen: usize,
+    /// Relics with a Confirmed count this session (see ADR-0005).
+    pub confirmed: usize,
+}
+
+/// Render a "scanning in progress" status panel: shown from the moment the
+/// Relics screen is detected until the first real guide row is ready.
+pub fn render_relic_scanning_panel(progress: ScanProgress, font: &Font) -> Canvas {
+    let height = (PAD * 2 + 2 * LINE_H) as u32;
+    let mut canvas = Canvas::new(WIDTH, height);
+    canvas.fill_round_rect(0, 0, WIDTH, height, 12, BG);
+
+    let mut y = PAD + 14;
+    canvas.draw_text(font, "SCANNING VOID RELICS…", PAD as f32, y as f32, TITLE_PX, TITLE);
+    y += LINE_H;
+
+    let status = format!("{} seen · {} confirmed", progress.seen, progress.confirmed);
+    canvas.draw_text(font, &status, PAD as f32, y as f32, FONT_PX, DIM);
+    canvas
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()
@@ -257,6 +285,15 @@ mod tests {
         assert_eq!(canvas.width, WIDTH);
         assert!(canvas.height > 0);
         // The background alone should make many pixels non-transparent.
+        let opaque = canvas.buf.chunks_exact(4).filter(|p| p[3] > 0).count();
+        assert!(opaque > 100, "expected a visible panel background");
+    }
+
+    #[test]
+    fn renders_scanning_panel_with_progress() {
+        let font = load_font().expect("a system monospace font");
+        let canvas = render_relic_scanning_panel(ScanProgress { seen: 3, confirmed: 1 }, &font);
+        assert_eq!(canvas.width, WIDTH);
         let opaque = canvas.buf.chunks_exact(4).filter(|p| p[3] > 0).count();
         assert!(opaque > 100, "expected a visible panel background");
     }

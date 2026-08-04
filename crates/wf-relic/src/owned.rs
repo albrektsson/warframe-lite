@@ -170,17 +170,27 @@ pub fn mark_seen(owned: &mut OwnedRelics, code: &str, refinement: Refinement) ->
 /// (a confirmed count is definitionally also a clean identity read).
 pub fn apply_confirmed_count(owned: &mut OwnedRelics, code: &str, refinement: Refinement, value: u32) {
     if value == 0 {
-        if let Some(by_ref) = owned.get_mut(code) {
-            by_ref.remove(&refinement);
-            if by_ref.is_empty() {
-                owned.remove(code);
-            }
-        }
+        clear_entry(owned, code, refinement);
         return;
     }
     let entry = owned.entry(code.to_string()).or_default().entry(refinement).or_default();
     entry.seen = true;
     entry.count = Some(Stamped { value, fetched_at: wf_cache::now_unix() });
+}
+
+/// Remove one `(code, refinement)` entry entirely. Used both by a confirmed
+/// "unowned" eye reading (`apply_confirmed_count`'s `value == 0` case) and by
+/// `wf-browse`'s user-initiated clear action, for the case the scanner can
+/// never itself resolve: a refined relic's card simply disappears once its
+/// count reaches zero (no eye icon), so no future scan can clear it (see
+/// ADR-0010).
+pub fn clear_entry(owned: &mut OwnedRelics, code: &str, refinement: Refinement) {
+    if let Some(by_ref) = owned.get_mut(code) {
+        by_ref.remove(&refinement);
+        if by_ref.is_empty() {
+            owned.remove(code);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -300,6 +310,24 @@ mod tests {
         mark_seen(&mut owned, "Meso B9", Refinement::Intact);
         apply_confirmed_count(&mut owned, "Meso B9", Refinement::Intact, 15);
         apply_confirmed_count(&mut owned, "Meso B9", Refinement::Intact, 0);
+        assert!(!owned.contains_key("Meso B9"));
+    }
+
+    #[test]
+    fn clear_entry_removes_only_the_named_refinement() {
+        let mut owned: OwnedRelics = HashMap::new();
+        apply_confirmed_count(&mut owned, "Meso B9", Refinement::Intact, 15);
+        apply_confirmed_count(&mut owned, "Meso B9", Refinement::Radiant, 3);
+        clear_entry(&mut owned, "Meso B9", Refinement::Radiant);
+        assert!(owned["Meso B9"].contains_key(&Refinement::Intact));
+        assert!(!owned["Meso B9"].contains_key(&Refinement::Radiant));
+    }
+
+    #[test]
+    fn clear_entry_drops_the_code_once_its_last_refinement_is_gone() {
+        let mut owned: OwnedRelics = HashMap::new();
+        mark_seen(&mut owned, "Meso B9", Refinement::Intact);
+        clear_entry(&mut owned, "Meso B9", Refinement::Intact);
         assert!(!owned.contains_key("Meso B9"));
     }
 }

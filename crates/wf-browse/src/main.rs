@@ -3,9 +3,11 @@
 //! worth selling instead of cracking, and which owned relic's crack has the
 //! best odds of a valuable already-mastered part to sell.
 //!
-//! Strictly read-only: this never writes to `owned-relics.json`. The OCR scan
-//! of the in-game Void Relics screen (via `wf-lite overlay`) is the only
-//! source of Owned relic counts (see ADR-0001, ADR-0003).
+//! Read-only for the *values* the OCR scan of the in-game Void Relics screen
+//! produces (via `wf-lite overlay`) — the only source of Owned relic counts
+//! (see ADR-0001, ADR-0003). The Owned tab's clear/reset actions are a narrow
+//! exception (delete-only, user-initiated, see ADR-0010), for entries the
+//! scanner itself can never observe as depleted.
 //!
 //! Kept in a separate binary from `wf-lite`/`wf-settings` so each companion
 //! stays purpose-built and lean (see ADR-0002).
@@ -362,13 +364,14 @@ async fn load_data(config: &Config) -> LoadedData {
     LoadedData { index, mastery, owned, active_tiers, prices: Prices { sell: sell_prices, farm: farm_prices } }
 }
 
-/// The browser's tabs: Mastery, Relics & Plan, Sell, and Farm.
+/// The browser's tabs: Mastery, Relics & Plan, Sell, Farm, and Owned.
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
     Mastery,
     Relics,
     Sell,
     Farm,
+    Owned,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -427,6 +430,11 @@ struct BrowseApp {
     sell_sort: SellSort,
     farm_tier_filter: HashSet<String>,
     farm_sort: FarmSort,
+    /// Editable text buffer for the Owned tab's search box.
+    owned_filter: String,
+    /// Must be checked before "reset all" is clickable — a guard against an
+    /// accidental click on a destructive, ADR-0010 action.
+    reset_confirm: bool,
     /// Refreshed by the background [`poll`] task every [`POLL_INTERVAL`].
     live: Arc<Mutex<Live>>,
 }
@@ -445,6 +453,8 @@ impl BrowseApp {
             sell_sort: SellSort::Price,
             farm_tier_filter: HashSet::new(),
             farm_sort: FarmSort::Price,
+            owned_filter: String::new(),
+            reset_confirm: false,
             live,
         }
     }
@@ -727,6 +737,130 @@ impl BrowseApp {
             .weak(),
         );
     }
+
+    /// Raw owned-relic inventory, across every refinement (unlike the
+    /// Intact-only Relics/Sell/Farm tabs) — where a specific `(code,
+    /// refinement)` entry can be cleared, or the whole set reset. See
+    /// ADR-0010: a narrow, user-initiated exception to ADR-0003, needed
+    /// because a depleted refined relic's card disappears from the in-game
+    /// screen entirely (no eye icon), so no future scan can ever clear it.
+    /// Reads `owned-relics.json` fresh every frame rather than through
+    /// [`Live`] — cheap (a local file), and lets a clear/reset take effect
+    /// immediately instead of waiting for [`POLL_INTERVAL`].
+    fn owned_tab(&mut self, ui: &mut egui::Ui) {
+        let Some(owned) = wf_cache::load_blob::<wf_relic::OwnedRelics>(wf_relic::OWNED_RELICS_FILE)
+            .map(|s| s.value)
+        else {
+            ui.label(NO_OWNED_DATA_MSG);
+            return;
+        };
+
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.reset_confirm, "I understand this deletes all scanned relic data");
+            if ui
+                .add_enabled(self.reset_confirm, egui::Button::new("Reset all owned-relic data"))
+                .clicked()
+            {
+                reset_owned_relics();
+                self.reset_confirm = false;
+            }
+        });
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            ui.label("Search:");
+            ui.text_edit_singleline(&mut self.owned_filter);
+        });
+        ui.add_space(4.0);
+
+        let filter = self.owned_filter.to_ascii_lowercase();
+        let mut rows: Vec<(String, wf_relic::Refinement, wf_relic::OwnedEntry)> = owned
+            .into_iter()
+            .flat_map(|(code, by_ref)| by_ref.into_iter().map(move |(r, e)| (code.clone(), r, e)))
+            .filter(|(code, _, _)| filter.is_empty() || code.to_ascii_lowercase().contains(&filter))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0).then(refinement_rank(a.1).cmp(&refinement_rank(b.1))));
+
+        ui.label(format!("{} entries", rows.len()));
+        ui.add_space(4.0);
+
+        let mut to_clear: Option<(String, wf_relic::Refinement)> = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new("owned_grid").num_columns(5).striped(true).show(ui, |ui| {
+                ui.strong("relic");
+                ui.strong("refinement");
+                ui.strong("status");
+                ui.strong("age");
+                ui.strong("");
+                ui.end_row();
+
+                for (code, refinement, entry) in &rows {
+                    ui.label(code);
+                    ui.label(format!("{refinement:?}"));
+                    let status = match &entry.count {
+                        Some(c) => format!("x{}", c.value),
+                        None => "seen".to_string(),
+                    };
+                    ui.label(status);
+                    let age = entry
+                        .count
+                        .as_ref()
+                        .map(|c| wf_cache::format_age(c.age()))
+                        .unwrap_or_else(|| "—".to_string());
+                    ui.label(age);
+                    if ui.button("Clear").clicked() {
+                        to_clear = Some((code.clone(), *refinement));
+                    }
+                    ui.end_row();
+                }
+            });
+        });
+
+        if let Some((code, refinement)) = to_clear {
+            clear_owned_entry(&code, refinement);
+        }
+    }
+}
+
+/// Order refinements display in: Intact first, Radiant last.
+fn refinement_rank(r: wf_relic::Refinement) -> u8 {
+    match r {
+        wf_relic::Refinement::Intact => 0,
+        wf_relic::Refinement::Exceptional => 1,
+        wf_relic::Refinement::Flawless => 2,
+        wf_relic::Refinement::Radiant => 3,
+    }
+}
+
+/// Remove one `(code, refinement)` entry from `owned-relics.json` at the
+/// player's request (see ADR-0010). Best-effort: a failed load/save just
+/// leaves the entry in place for another try.
+fn clear_owned_entry(code: &str, refinement: wf_relic::Refinement) {
+    let Some(mut owned) =
+        wf_cache::load_blob::<wf_relic::OwnedRelics>(wf_relic::OWNED_RELICS_FILE).map(|s| s.value)
+    else {
+        return;
+    };
+    wf_relic::clear_entry(&mut owned, code, refinement);
+    let _ = wf_cache::save_blob(wf_relic::OWNED_RELICS_FILE, &owned);
+}
+
+/// Back up and clear all owned-relic data — the player-initiated equivalent
+/// of the scanner's own "back up and start clean" treatment for an
+/// incompatible file (ADR-0005), see ADR-0010. `owned-relics.json`'s absence
+/// is already `wf-browse`'s existing "no data yet" state, so a bare rename is
+/// enough — no need to write a fresh empty file.
+fn reset_owned_relics() {
+    let Ok(dir) = wf_cache::cache_dir() else {
+        return;
+    };
+    let path = dir.join(wf_relic::OWNED_RELICS_FILE);
+    if path.exists() {
+        let bak = path.with_extension("json.bak");
+        if std::fs::rename(&path, &bak).is_ok() {
+            tracing::info!("backed up {} to {}", path.display(), bak.display());
+        }
+    }
 }
 
 /// Whether any relic sourcing `plan` currently has an active Fissure.
@@ -805,6 +939,7 @@ impl eframe::App for BrowseApp {
                 ui.selectable_value(&mut self.tab, Tab::Relics, "Relics & Plan");
                 ui.selectable_value(&mut self.tab, Tab::Sell, "Sell");
                 ui.selectable_value(&mut self.tab, Tab::Farm, "Farm");
+                ui.selectable_value(&mut self.tab, Tab::Owned, "Owned");
             });
             ui.separator();
 
@@ -813,6 +948,7 @@ impl eframe::App for BrowseApp {
                 Tab::Relics => self.relics_tab(ui),
                 Tab::Sell => self.sell_tab(ui),
                 Tab::Farm => self.farm_tab(ui),
+                Tab::Owned => self.owned_tab(ui),
             }
         });
     }

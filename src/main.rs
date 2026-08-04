@@ -1140,8 +1140,6 @@ const OVERLAY_W: u32 = wf_overlay::render::WIDTH;
 const OVERLAY_H: u32 = 340;
 /// How long a detected reward result stays on the overlay.
 const REWARD_DISPLAY: Duration = Duration::from_secs(20);
-/// How long the owned-relic guide stays on the overlay after the last scan update.
-const RELIC_DISPLAY: Duration = Duration::from_secs(30);
 /// How long the overlay polls for the game window before falling back to the
 /// compositor's default output (lets it be launched together with the game).
 const WINDOW_WAIT: Duration = Duration::from_secs(30);
@@ -1161,7 +1159,10 @@ async fn load_mastery(config: &Config, client: &reqwest::Client) -> wf_relic::Ma
 }
 
 type RewardState = std::sync::Arc<std::sync::Mutex<Option<(std::time::Instant, Vec<wf_overlay::RewardRow>)>>>;
-type RelicState = std::sync::Arc<std::sync::Mutex<Option<(std::time::Instant, Vec<wf_overlay::RelicRow>)>>>;
+/// Live progress for an in-flight relic scan, set the moment the Relics
+/// screen is detected so the overlay reacts immediately instead of showing
+/// nothing (see [`crate::run_overlay`]'s panel priority).
+type RelicScanStatus = std::sync::Arc<std::sync::Mutex<Option<wf_overlay::ScanProgress>>>;
 /// Deadline the owned-relic scan should keep running until, shared between
 /// `relic_watch_loop` (which extends it from `EE.log`) and `relic_scan_loop`
 /// (which reads it every iteration to decide whether to scan or idle).
@@ -1179,7 +1180,7 @@ async fn run_overlay(config: Config) -> Result<()> {
     let platform = config.platform.clone();
     let refresh = Duration::from_secs(config.fissure_refresh_secs.max(15));
     let reward: RewardState = Arc::new(Mutex::new(None));
-    let relic: RelicState = Arc::new(Mutex::new(None));
+    let relic_scan_status: RelicScanStatus = Arc::new(Mutex::new(None));
 
     // Appearance/visibility knobs. `visible` is flipped at runtime by the control
     // socket (see `overlay_control`); `show_fissures` and `opacity` come from config.
@@ -1190,12 +1191,15 @@ async fn run_overlay(config: Config) -> Result<()> {
     // Build one overlay frame from the current state, honoring reward-only mode,
     // the visibility toggle, and opacity. A hidden or empty frame is a fully
     // transparent (click-through) canvas.
-    // Panel priority when shown: reward screen (time-critical, ~20s) → owned-relic
-    // guide (while/after a Relics-screen scan) → live fissures → blank.
+    // Panel priority when shown: reward screen (time-critical, ~20s) → an
+    // in-progress relic scan's live status → live fissures → blank. The ranked
+    // owned-relic guide (`wf-lite relic-guide-png`'s `render_relic_panel`) isn't
+    // shown live here — that view lives in `wf-lite browse` instead, which reads
+    // the same `owned-relics.json` without the live overlay's latency budget.
     let make_frame = {
         let font = font.clone();
         let reward = reward.clone();
-        let relic = relic.clone();
+        let relic_scan_status = relic_scan_status.clone();
         move |ws: &worldstate::WorldState, shown: bool| -> wf_overlay::Canvas {
             let blank = || wf_overlay::Canvas::new(OVERLAY_W, OVERLAY_H);
             let mut c = if !shown {
@@ -1208,14 +1212,8 @@ async fn run_overlay(config: Config) -> Result<()> {
                 .map(|(_, r)| r.clone())
             {
                 wf_overlay::render_reward_panel(&rows, &font).embed(OVERLAY_W, OVERLAY_H)
-            } else if let Some(rows) = relic
-                .lock()
-                .unwrap()
-                .as_ref()
-                .filter(|(t, _)| t.elapsed() < RELIC_DISPLAY)
-                .map(|(_, r)| r.clone())
-            {
-                wf_overlay::render_relic_panel(&rows, &font).embed(OVERLAY_W, OVERLAY_H)
+            } else if let Some(progress) = *relic_scan_status.lock().unwrap() {
+                wf_overlay::render_relic_scanning_panel(progress, &font).embed(OVERLAY_W, OVERLAY_H)
             } else if show_fissures {
                 wf_overlay::render_panel(ws, &font).embed(OVERLAY_W, OVERLAY_H)
             } else {
@@ -1305,10 +1303,7 @@ async fn run_overlay(config: Config) -> Result<()> {
                         ocr.clone(),
                         ridx,
                         wf_relic::RelicGridRegions::default_calibration(),
-                        market.clone(),
-                        cache.clone(),
-                        mastery.clone(),
-                        relic.clone(),
+                        relic_scan_status.clone(),
                     ));
                     Some(deadline)
                 } else {
@@ -1476,7 +1471,11 @@ async fn relic_watch_loop(
     // Covers the ~1min crack→screen gap, log-flush lag, and the player bringing
     // the screen up manually (Tab / progress).
     const POLL_WINDOW: Duration = Duration::from_secs(150);
-    const POLL_INTERVAL: Duration = Duration::from_secs(2);
+    // Also bounds how quickly a RelicInventoryOpen line arms relic_scan_loop's
+    // deadline — kept short so opening the Relics screen registers almost
+    // immediately. Cheap now that a reward-screen scan attempt (when active) is
+    // a single in-process OCR pass rather than a CLI subprocess (ADR-0008).
+    const POLL_INTERVAL: Duration = Duration::from_millis(500);
     // Don't re-show the same 15s screen repeatedly.
     const SHOW_DEBOUNCE: Duration = Duration::from_secs(20);
 
@@ -1559,16 +1558,12 @@ async fn relic_watch_loop(
 /// however long a scan itself takes — is what actually catches more of the
 /// list quickly, since each additional sample is another chance to catch cards
 /// at a favorable scroll offset.
-#[allow(clippy::too_many_arguments)]
 async fn relic_scan_loop(
     relic_deadline: RelicDeadline,
     ocr: std::sync::Arc<wf_ocr::Ocr>,
     relic_index: std::sync::Arc<wf_relic::RelicIndex>,
     relic_regions: wf_relic::RelicGridRegions,
-    market: MarketClient,
-    cache: std::sync::Arc<wf_relic::PriceCache>,
-    mastery: std::sync::Arc<wf_relic::MasterySet>,
-    relic: RelicState,
+    scan_status: RelicScanStatus,
 ) {
     use std::collections::HashMap;
     use std::time::Instant;
@@ -1612,6 +1607,7 @@ async fn relic_scan_loop(
     let mut tally: wf_ocr::Tally<(String, wf_relic::Refinement)> = wf_ocr::Tally::new();
     let mut session_applied: HashMap<(String, wf_relic::Refinement), u32> = HashMap::new();
     let mut identity_reads: HashMap<(String, wf_relic::Refinement), u32> = HashMap::new();
+    let mut session_seen_count: usize = 0;
     let mut was_active = false;
     // Bogus initial value (not a real deadline the watcher could ever set) so the
     // very first observed deadline always registers as a change below.
@@ -1634,6 +1630,9 @@ async fn relic_scan_loop(
         let active = deadline.is_some_and(|t| Instant::now() < t) && last_new.elapsed() <= RELIC_SCAN_IDLE;
 
         if !active {
+            if was_active {
+                *scan_status.lock().unwrap() = None;
+            }
             was_active = false;
             tokio::time::sleep(IDLE_POLL).await;
             continue;
@@ -1643,6 +1642,10 @@ async fn relic_scan_loop(
             tally = wf_ocr::Tally::new();
             session_applied.clear();
             identity_reads.clear();
+            session_seen_count = 0;
+            // Show scanning has started before the first capture even
+            // completes, rather than nothing until a relic clears its trust bar.
+            *scan_status.lock().unwrap() = Some(wf_overlay::ScanProgress::default());
             tracing::info!(
                 "relics screen opened — scanning as you scroll ({} relics known from before)",
                 relic_owned.len()
@@ -1651,8 +1654,15 @@ async fn relic_scan_loop(
 
         let (ocr2, regions2, ridx2) = (ocr.clone(), relic_regions.clone(), relic_index.clone());
         let scanned = tokio::task::spawn_blocking(move || {
-            wf_capture::capture_warframe(None)
-                .map(|cap| scan_relic_grid(&cap.image, &ocr2, &regions2, &ridx2))
+            let t0 = Instant::now();
+            let cap = wf_capture::capture_warframe(None)?;
+            let captured = t0.elapsed();
+            let found = scan_relic_grid(&cap.image, &ocr2, &regions2, &ridx2);
+            tracing::debug!(
+                "relic scan cycle: capture {captured:?}, scan {:?}",
+                t0.elapsed() - captured
+            );
+            Ok::<_, anyhow::Error>(found)
         })
         .await;
         if let Ok(Ok(found)) = scanned {
@@ -1662,12 +1672,18 @@ async fn relic_scan_loop(
                 // Any cleanly-resolved identity marks Seen, independent of count (ADR-0009).
                 match obs.kind {
                     ObsKind::Count(n) => {
-                        changed |= mark_seen_if_agreed(&mut identity_reads, &mut relic_owned, &key);
+                        if mark_seen_if_agreed(&mut identity_reads, &mut relic_owned, &key) {
+                            changed = true;
+                            session_seen_count += 1;
+                        }
                         tally.record(key.clone(), n);
                     }
                     ObsKind::Unowned => tally.record(key.clone(), 0), // 0 = confirmed unowned
                     ObsKind::Abstain => {
-                        changed |= mark_seen_if_agreed(&mut identity_reads, &mut relic_owned, &key);
+                        if mark_seen_if_agreed(&mut identity_reads, &mut relic_owned, &key) {
+                            changed = true;
+                            session_seen_count += 1;
+                        }
                         continue;
                     }
                 }
@@ -1685,20 +1701,12 @@ async fn relic_scan_loop(
             }
             if changed {
                 last_new = Instant::now();
+                *scan_status.lock().unwrap() = Some(wf_overlay::ScanProgress {
+                    seen: session_seen_count,
+                    confirmed: session_applied.len(),
+                });
                 let _ = wf_cache::save_blob(wf_relic::OWNED_RELICS_FILE, &relic_owned);
-                let intact = wf_relic::intact_counts(&relic_owned);
-                let rows =
-                    build_relic_rows(&intact, &relic_index, &mastery, &cache, &market, RELIC_ROWS)
-                        .await;
-                tracing::info!(
-                    "relic scan: {} relics owned; showing {}",
-                    relic_owned.len(),
-                    rows.iter()
-                        .map(|r| format!("{} ({})", r.name, r.top_reward))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                *relic.lock().unwrap() = Some((Instant::now(), rows));
+                tracing::info!("relic scan: {} relics owned", relic_owned.len());
             }
         }
         tokio::time::sleep(SCAN_COOLDOWN).await;
@@ -1716,38 +1724,6 @@ fn mark_seen_if_agreed(
     let reads = identity_reads.entry(key.clone()).or_insert(0);
     *reads += 1;
     *reads >= SEEN_AGREEMENT && wf_relic::mark_seen(relic_owned, &key.0, key.1)
-}
-
-/// How many relic rows fit the overlay panel height.
-const RELIC_ROWS: usize = 12;
-
-/// Build the ranked owned-relic guide rows: for each owned relic that can still
-/// drop an unmastered prime, its unmastered count + a market price, top-N by value.
-async fn build_relic_rows(
-    owned: &std::collections::HashMap<String, u32>,
-    index: &wf_relic::RelicIndex,
-    mastery: &wf_relic::MasterySet,
-    cache: &wf_relic::PriceCache,
-    market: &MarketClient,
-    max_rows: usize,
-) -> Vec<wf_overlay::RelicRow> {
-    let mut picks: Vec<wf_relic::RelicPick> = Vec::new();
-    for r in index.all() {
-        let Some(&count) = owned.get(&r.display) else {
-            continue;
-        };
-        let unmastered = r.unmastered(mastery);
-        if unmastered.is_empty() {
-            continue;
-        }
-        let plat =
-            wf_relic::cached_plat(cache, market, &r.slug(), wf_relic::PriceOpts::default()).await;
-        picks.push(wf_relic::RelicPick { display: r.display.clone(), count, unmastered, plat });
-    }
-    cache.save();
-    wf_relic::rank_relics(&mut picks);
-    picks.truncate(max_rows);
-    relic_rows(&picks)
 }
 
 /// OCR each candidate reward-name slot of an already-captured frame. Slots are

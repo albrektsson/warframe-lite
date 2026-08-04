@@ -10,8 +10,8 @@ pub mod relics;
 pub use index::ItemIndex;
 pub use mastery::MasterySet;
 pub use owned::{
-    apply_confirmed_count, intact_age, intact_age_range, intact_ages, intact_counts, mark_seen,
-    parse_refinement, OwnedCount, OwnedEntry, OwnedRelics, Refinement, STALE_AFTER,
+    apply_confirmed_count, clear_entry, intact_age, intact_age_range, intact_ages, intact_counts,
+    mark_seen, parse_refinement, OwnedCount, OwnedEntry, OwnedRelics, Refinement, STALE_AFTER,
 };
 pub use regions::{Rect, RelicGridRegions, RelicSlot, RewardRegions};
 pub use relics::{
