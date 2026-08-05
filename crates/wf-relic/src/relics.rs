@@ -6,7 +6,7 @@
 //! opening for mastery. Ownership itself is supplied by the caller (from OCR of
 //! the in-game Relics screen); this module is network/screen-agnostic and pure.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -397,6 +397,34 @@ pub fn farm_reward_names(
         }
         for r in mastered_rewards(relic, mastery) {
             if !names.contains(&r.item_name) {
+                names.push(r.item_name.clone());
+            }
+        }
+    }
+    names
+}
+
+/// Reward item names — every tradable prime part, mastered or not — from
+/// relics the player owns whose tier currently has an active Fissure. The
+/// candidate set for background price pre-warming: these are the items that
+/// could actually land on a reward screen if the player cracks one of these
+/// relics right now, so it's worth having their prices already fresh rather
+/// than fetching them cold once the screen appears.
+pub fn active_tier_reward_names(
+    owned: &HashMap<String, RelicEvidence>,
+    index: &RelicIndex,
+    active_tiers: &HashSet<String>,
+) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for relic in index.all() {
+        if !active_tiers.contains(&relic.tier) || !owned.contains_key(&relic.display) {
+            continue;
+        }
+        for r in &relic.rewards {
+            if crate::untradable_label(&r.item_name).is_none()
+                && is_prime_reward(&r.item_name)
+                && !names.contains(&r.item_name)
+            {
                 names.push(r.item_name.clone());
             }
         }
@@ -1292,6 +1320,29 @@ mod tests {
         assert!(names.contains(&"Ember Prime Systems Blueprint".to_string()));
         assert!(!names.iter().any(|n| n.contains("Trinity"))); // not mastered
         assert!(!names.iter().any(|n| n.contains("Volt"))); // not owned
+    }
+
+    #[test]
+    fn active_tier_reward_names_requires_both_owned_and_an_active_tier() {
+        let idx = RelicIndex::new(vec![
+            relic("Axi A1", &["Volt Prime Blueprint", "Volt Prime Systems Blueprint", "Forma Blueprint"]),
+            relic("Axi B2", &["Ember Prime Blueprint"]), // active tier, but not owned
+            relic("Meso C3", &["Trinity Prime Blueprint"]), // owned, but tier not active
+        ]);
+        let owned: HashMap<String, RelicEvidence> = HashMap::from([
+            ("Axi A1".to_string(), RelicEvidence::Confirmed(3)),
+            ("Meso C3".to_string(), RelicEvidence::SeenOnly),
+        ]);
+        let active_tiers: HashSet<String> = HashSet::from(["Axi".to_string()]);
+
+        let names = active_tier_reward_names(&owned, &idx, &active_tiers);
+
+        // Owned + active tier: both tradable prime rewards kept, Forma dropped.
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"Volt Prime Blueprint".to_string()));
+        assert!(names.contains(&"Volt Prime Systems Blueprint".to_string()));
+        assert!(!names.iter().any(|n| n.contains("Ember"))); // active tier, not owned
+        assert!(!names.iter().any(|n| n.contains("Trinity"))); // owned, tier not active
     }
 
     #[test]

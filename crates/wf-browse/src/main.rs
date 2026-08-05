@@ -12,13 +12,17 @@
 //! Kept in a separate binary from `wf-lite`/`wf-settings` so each companion
 //! stays purpose-built and lean (see ADR-0002).
 //!
+//! The relic catalogue, mastery, and Sell/Farm-tab prices are loaded once, but
+//! never block the window from opening: [`main`] shows it immediately and
+//! runs [`load_data`] on a background task, so every tab that depends on it
+//! (Mastery, Relics & Plan, Buy or Farm, Sell, Farm) renders a "Loading…"
+//! placeholder until it lands.
+//!
 //! The Relics & Plan, Sell, and Farm tabs' Owned relic counts and
-//! active-Fissure flag are live: a background task ([`poll`]) re-reads
-//! `owned-relics.json` and re-fetches world state every [`POLL_INTERVAL`]
-//! while the window is open, so they catch up with a scan happening in
-//! another window without a restart. Mastery, the relic catalogue, and
-//! Sell/Farm-tab prices are loaded once at launch and never touched by that
-//! timer.
+//! active-Fissure flag stay live after that: the same background task
+//! ([`poll`]) re-reads `owned-relics.json` and re-fetches world state every
+//! [`POLL_INTERVAL`] while the window is open, so they catch up with a scan
+//! happening in another window without a restart.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -46,6 +50,10 @@ const PRICE_FETCH_CONCURRENCY: usize = 8;
 /// mastery, the relic catalogue, and Sell/Farm-tab prices are loaded once at
 /// launch and never re-fetched on this timer.
 const POLL_INTERVAL: Duration = Duration::from_secs(15);
+/// Repaint cadence while [`BrowseApp::loaded`] is still `None`, so the
+/// "Loading…" placeholder resolves promptly instead of waiting out a full
+/// [`POLL_INTERVAL`] for the next scheduled repaint.
+const LOADING_REPAINT: Duration = Duration::from_millis(200);
 /// Shown on the Relics & Plan, Sell, and Farm tabs when no relic scan has
 /// happened yet.
 const NO_OWNED_DATA_MSG: &str = "no owned-relic data yet. Run `wf-lite overlay` (or the tray) and \
@@ -79,24 +87,16 @@ fn main() -> eframe::Result<()> {
     let config_path = Config::default_path().unwrap_or_else(|_| PathBuf::from("config.toml"));
     let config = Config::load(&config_path).unwrap_or_default();
 
-    // `rt` is never dropped before `run_native` returns, so the poller spawned
-    // on it below keeps running for as long as the window stays open.
+    // `rt` is never dropped before `run_native` returns, so the background
+    // loader/poller spawned on it below keeps running for as long as the
+    // window stays open.
     let rt = tokio::runtime::Runtime::new().expect("failed to start tokio runtime");
-    let LoadedData { index, mastery, quantities, owned, owned_parts, active_tiers, prices } =
-        rt.block_on(load_data(&config));
-
-    let mastery_rows = wf_relic::mastery_browser(&index, &mastery);
-    let live = Arc::new(Mutex::new(Live::compute(
-        owned.as_ref(),
-        &owned_parts,
-        &index,
-        &mastery,
-        &quantities,
-        &prices,
-        active_tiers,
-    )));
-
-    rt.spawn(poll(live.clone(), index, mastery, quantities, prices, config.platform));
+    let loaded: Arc<Mutex<Option<Loaded>>> = Arc::new(Mutex::new(None));
+    // `load_data` (catalogue/mastery/quantity fetches, plus a price lookup per
+    // owned relic) runs in the background rather than blocking the window
+    // from opening at all — see the module docs and `BrowseApp`'s "Loading…"
+    // placeholder.
+    rt.spawn(load_and_poll(loaded.clone(), config));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -109,7 +109,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             apply_theme(&cc.egui_ctx);
-            Ok(Box::new(BrowseApp::new(mastery_rows, live)))
+            Ok(Box::new(BrowseApp::new(loaded)))
         }),
     )
 }
@@ -241,11 +241,20 @@ struct Live {
     active_tiers: HashSet<String>,
 }
 
+/// Launch-time [`load_data`] plus the first [`Live::compute`] derived from
+/// it, gated behind `None` until the background load ([`load_and_poll`])
+/// finishes — every tab that needs either renders a "Loading…" placeholder
+/// until then instead of `main` blocking the window from opening on it.
+struct Loaded {
+    mastery_rows: Vec<MasteryEntry>,
+    live: Live,
+}
+
 /// Lock `m`, recovering the guard even if a previous holder panicked while
-/// holding it (rather than poisoning every future frame's render) — `Live`'s
-/// own derivation is pure and shouldn't panic, but a stale-but-working UI
-/// beats a permanent crash-loop if it ever does.
-fn lock_live(m: &Mutex<Live>) -> std::sync::MutexGuard<'_, Live> {
+/// holding it (rather than poisoning every future frame's render) — neither
+/// `Live`'s derivation nor the initial load should panic, but a
+/// stale-but-working UI beats a permanent crash-loop if either ever does.
+fn lock_loaded(m: &Mutex<Option<Loaded>>) -> std::sync::MutexGuard<'_, Option<Loaded>> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
@@ -290,12 +299,34 @@ impl Live {
     }
 }
 
+/// Run [`load_data`] in the background and populate `loaded` the moment it's
+/// ready — unblocking the Mastery/Relics & Plan/Buy or Farm/Sell/Farm tabs'
+/// "Loading…" placeholder — then hand off into [`poll`]'s ongoing refresh
+/// loop for as long as the window stays open.
+async fn load_and_poll(loaded: Arc<Mutex<Option<Loaded>>>, config: Config) {
+    let LoadedData { index, mastery, quantities, owned, owned_parts, active_tiers, prices } =
+        load_data(&config).await;
+    let mastery_rows = wf_relic::mastery_browser(&index, &mastery);
+    let live = Live::compute(
+        owned.as_ref(),
+        &owned_parts,
+        &index,
+        &mastery,
+        &quantities,
+        &prices,
+        active_tiers,
+    );
+    *lock_loaded(&loaded) = Some(Loaded { mastery_rows, live });
+
+    poll(loaded, index, mastery, quantities, prices, config.platform).await;
+}
+
 /// Re-read `owned-relics.json` and re-fetch world state every [`POLL_INTERVAL`],
-/// refreshing `live` — the only two things cheap/fast-changing enough to poll.
-/// The relic catalogue, mastery, and Sell/Farm-tab prices stay exactly as
-/// loaded at launch; only re-running the app refreshes those.
+/// refreshing `loaded`'s `live` field — the only two things cheap/fast-changing
+/// enough to poll. The relic catalogue, mastery, and Sell/Farm-tab prices stay
+/// exactly as loaded at launch; only re-running the app refreshes those.
 async fn poll(
-    live: Arc<Mutex<Live>>,
+    loaded: Arc<Mutex<Option<Loaded>>>,
     index: RelicIndex,
     mastery: MasterySet,
     quantities: PartQuantities,
@@ -323,7 +354,9 @@ async fn poll(
             &prices,
             active_tiers,
         );
-        *lock_live(&live) = fresh;
+        if let Some(l) = lock_loaded(&loaded).as_mut() {
+            l.live = fresh;
+        }
     }
 }
 
@@ -510,7 +543,6 @@ enum FarmSort {
 
 struct BrowseApp {
     tab: Tab,
-    mastery_rows: Vec<MasteryEntry>,
     /// Editable text buffer for the Mastery tab's search box.
     filter: String,
     mastery_filter: MasteryFilter,
@@ -528,15 +560,16 @@ struct BrowseApp {
     /// Must be checked before "reset all" is clickable — a guard against an
     /// accidental click on a destructive, ADR-0010 action.
     reset_confirm: bool,
-    /// Refreshed by the background [`poll`] task every [`POLL_INTERVAL`].
-    live: Arc<Mutex<Live>>,
+    /// `None` until the background [`load_and_poll`] task finishes; its
+    /// `live` field is refreshed in place afterward by [`poll`] every
+    /// [`POLL_INTERVAL`].
+    loaded: Arc<Mutex<Option<Loaded>>>,
 }
 
 impl BrowseApp {
-    fn new(mastery_rows: Vec<MasteryEntry>, live: Arc<Mutex<Live>>) -> Self {
+    fn new(loaded: Arc<Mutex<Option<Loaded>>>) -> Self {
         Self {
             tab: Tab::Mastery,
-            mastery_rows,
             filter: String::new(),
             mastery_filter: MasteryFilter::All,
             mastery_sort: MasterySort::Alphabetical,
@@ -549,11 +582,26 @@ impl BrowseApp {
             farm_sort: FarmSort::Price,
             owned_filter: String::new(),
             reset_confirm: false,
-            live,
+            loaded,
         }
     }
 
+    /// Derive `f` from the background-loaded state, or show the "Loading…"
+    /// placeholder and return `None` if [`load_and_poll`] hasn't finished yet
+    /// — the shared gate every tab that depends on [`Loaded`] opens with.
+    fn loaded_or_placeholder<T>(&self, ui: &mut egui::Ui, f: impl FnOnce(&Loaded) -> T) -> Option<T> {
+        let result = lock_loaded(&self.loaded).as_ref().map(f);
+        if result.is_none() {
+            ui.label("Loading…");
+        }
+        result
+    }
+
     fn mastery_tab(&mut self, ui: &mut egui::Ui) {
+        let Some(mastery_rows) = self.loaded_or_placeholder(ui, |l| l.mastery_rows.clone()) else {
+            return;
+        };
+
         ui.horizontal(|ui| {
             ui.label("Search:");
             ui.text_edit_singleline(&mut self.filter);
@@ -571,8 +619,7 @@ impl BrowseApp {
         ui.add_space(6.0);
 
         let filter = self.filter.to_ascii_lowercase();
-        let mut rows: Vec<&MasteryEntry> = self
-            .mastery_rows
+        let mut rows: Vec<&MasteryEntry> = mastery_rows
             .iter()
             .filter(|e| filter.is_empty() || e.prime.to_ascii_lowercase().contains(&filter))
             .filter(|e| match self.mastery_filter {
@@ -613,9 +660,10 @@ impl BrowseApp {
         // Clone the pieces this frame needs and drop the lock immediately,
         // rather than holding it across the whole render below — the only
         // other lock-holder is the background poller's brief write.
-        let (plans, owned_age_range, ages, active_tiers) = {
-            let live = lock_live(&self.live);
-            (live.plans.clone(), live.owned_age_range, live.ages.clone(), live.active_tiers.clone())
+        let Some((plans, owned_age_range, ages, active_tiers)) = self.loaded_or_placeholder(ui, |l| {
+            (l.live.plans.clone(), l.live.owned_age_range, l.live.ages.clone(), l.live.active_tiers.clone())
+        }) else {
+            return;
         };
         let Some(mut plans) = plans else {
             ui.label(NO_OWNED_DATA_MSG);
@@ -726,9 +774,10 @@ impl BrowseApp {
     /// total gap-fill cost — so buying the Set can be weighed against farming
     /// the missing pieces.
     fn buy_or_farm_tab(&mut self, ui: &mut egui::Ui) {
-        let (plans, ages) = {
-            let live = lock_live(&self.live);
-            (live.bom_plans.clone(), live.ages.clone())
+        let Some((plans, ages)) =
+            self.loaded_or_placeholder(ui, |l| (l.live.bom_plans.clone(), l.live.ages.clone()))
+        else {
+            return;
         };
 
         if plans.is_empty() {
@@ -780,9 +829,10 @@ impl BrowseApp {
     }
 
     fn sell_tab(&mut self, ui: &mut egui::Ui) {
-        let (picks, owned_age_range, ages) = {
-            let live = lock_live(&self.live);
-            (live.sell_picks.clone(), live.owned_age_range, live.ages.clone())
+        let Some((picks, owned_age_range, ages)) = self.loaded_or_placeholder(ui, |l| {
+            (l.live.sell_picks.clone(), l.live.owned_age_range, l.live.ages.clone())
+        }) else {
+            return;
         };
         let Some(mut picks) = picks else {
             ui.label(NO_OWNED_DATA_MSG);
@@ -854,9 +904,10 @@ impl BrowseApp {
     }
 
     fn farm_tab(&mut self, ui: &mut egui::Ui) {
-        let (picks, owned_age_range, ages) = {
-            let live = lock_live(&self.live);
-            (live.farm_picks.clone(), live.owned_age_range, live.ages.clone())
+        let Some((picks, owned_age_range, ages)) = self.loaded_or_placeholder(ui, |l| {
+            (l.live.farm_picks.clone(), l.live.owned_age_range, l.live.ages.clone())
+        }) else {
+            return;
         };
         let Some(mut picks) = picks else {
             ui.label(NO_OWNED_DATA_MSG);
@@ -1155,8 +1206,12 @@ impl eframe::App for BrowseApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Keep repainting at the poll cadence even with no user input, so the
         // Relics & Plan/Sell/Farm tabs pick up the background poller's
-        // updates without needing a mouse move to trigger a redraw.
-        ui.ctx().request_repaint_after(POLL_INTERVAL);
+        // updates without needing a mouse move to trigger a redraw. While the
+        // initial background load hasn't landed yet, repaint much faster so
+        // the "Loading…" placeholders resolve promptly instead of waiting out
+        // a full POLL_INTERVAL.
+        let still_loading = lock_loaded(&self.loaded).is_none();
+        ui.ctx().request_repaint_after(if still_loading { LOADING_REPAINT } else { POLL_INTERVAL });
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {

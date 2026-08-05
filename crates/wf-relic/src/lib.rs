@@ -24,9 +24,10 @@ pub use regions::{
     InventoryGridRegions, InventorySlot, Rect, RelicGridRegions, RelicSlot, RewardRegions,
 };
 pub use relics::{
-    farm_picks, farm_reward_names, mastery_browser, mastery_plan, rank as rank_relics, sell_picks,
-    tier_of, vaulted_rewards, FarmPick, MasteryEntry, PartsOwnedSummary, PrimePartGroup, PrimePlan,
-    PrimeRelicSource, RelicIndex, RelicInfo, RelicPick, OWNED_RELICS_FILE,
+    active_tier_reward_names, farm_picks, farm_reward_names, mastery_browser, mastery_plan,
+    rank as rank_relics, sell_picks, tier_of, vaulted_rewards, FarmPick, MasteryEntry,
+    PartsOwnedSummary, PrimePartGroup, PrimePlan, PrimeRelicSource, RelicIndex, RelicInfo,
+    RelicPick, OWNED_RELICS_FILE,
 };
 
 use std::collections::HashMap;
@@ -334,6 +335,43 @@ async fn cached_price(
         }
         _ => stale.map(|s| s.value), // timeout or error → serve stale if we have it
     }
+}
+
+/// Caps how many lookups [`prewarm_reward_prices`] fires at once. Unlike
+/// [`evaluate_cached`]'s handful of on-screen rewards (fine to fetch
+/// unbounded), a tier's worth of owned relics can be dozens of distinct
+/// reward items — an unbounded burst against warframe.market would be
+/// inconsiderate, so this bounds it the same way the `wf-browse` GUI already
+/// bounds its own bulk price warm-up.
+const PREWARM_CONCURRENCY: usize = 8;
+
+/// Warm the price cache for `names` (reward item names, e.g. "Mirage Prime
+/// Blueprint" — not slugs) without needing a reward screen's OCR'd slot list:
+/// resolves each to its catalogue slug and fetches/caches its price the same
+/// way [`evaluate_cached`] does, at bounded concurrency (see
+/// [`PREWARM_CONCURRENCY`]). Used to pre-warm prices as soon as a fissure
+/// starts (see [`relics::active_tier_reward_names`]) rather than only once
+/// the reward screen actually appears, so a fresh price is more likely to
+/// already be on disk inside the short selection window.
+pub async fn prewarm_reward_prices(
+    names: &[String],
+    index: &ItemIndex,
+    market: &MarketClient,
+    cache: &PriceCache,
+    opts: PriceOpts,
+) {
+    use futures::stream::StreamExt;
+
+    let slugs: Vec<&str> = names
+        .iter()
+        .filter_map(|n| index.best_match(n).filter(|m| is_prime(m.item)).map(|m| m.item.slug.as_str()))
+        .collect();
+    futures::stream::iter(slugs)
+        .for_each_concurrent(PREWARM_CONCURRENCY, |slug| async move {
+            cached_price(cache, market, slug, opts).await;
+        })
+        .await;
+    cache.save();
 }
 
 /// Lowest sell price (platinum) for `slug` via the disk price cache: fresh →

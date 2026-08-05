@@ -1261,6 +1261,19 @@ type RelicDeadline = std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>
 /// iteration by [`inventory_scan_loop`].
 type InventoryDeadline = std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>;
 
+/// Shared handles the renderer loop needs to background-warm the price cache
+/// when a relic tier the player owns becomes crackable (see
+/// [`prewarm_new_tiers`]) — the four pieces of the "Relic auto-detection"
+/// block's state that pricing actually needs, `None` (via the caller's
+/// `Option<PrewarmCtx>`) when that block couldn't load the relic catalogue.
+#[derive(Clone)]
+struct PrewarmCtx {
+    market: MarketClient,
+    cache: std::sync::Arc<wf_relic::PriceCache>,
+    relic_index: std::sync::Arc<wf_relic::RelicIndex>,
+    item_index: std::sync::Arc<wf_relic::ItemIndex>,
+}
+
 /// Show the live overlay as a `wlr-layer-shell` surface: live Fissures normally,
 /// automatically swapping to the relic reward result for a few seconds when a
 /// fissure reward is detected in the log.
@@ -1336,35 +1349,15 @@ async fn run_overlay(config: Config) -> Result<()> {
     // KDE global shortcut bound to those commands can hide the overlay on demand.
     spawn_control_listener(visible.clone());
 
-    // Renderer: rebuild the frame each second (ETAs tick, reward panel expires,
-    // visibility may have toggled) and push it to the layer surface.
-    {
-        let client = client.clone();
-        let visible = visible.clone();
-        tokio::spawn(async move {
-            let mut cached = ws;
-            let mut last_fetch = tokio::time::Instant::now();
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                if last_fetch.elapsed() >= refresh {
-                    match worldstate::fetch(&client, &platform).await {
-                        Ok(fresh) => cached = fresh,
-                        Err(e) => tracing::warn!("worldstate refresh failed: {e:#}"),
-                    }
-                    last_fetch = tokio::time::Instant::now();
-                }
-                let frame = make_frame(&cached, visible.load(Ordering::Relaxed));
-                if tx.send(frame).is_err() {
-                    break; // overlay closed
-                }
-            }
-        });
-    }
-
     // Relic auto-detection: needs tesseract, an EE.log, and the item catalogue.
+    // Built before the renderer loop below so the renderer can wire up
+    // background fissure-start price pre-warming (`prewarm_ctx`) from the
+    // same catalogues/cache/market this block already loads.
+    let mut prewarm_ctx: Option<PrewarmCtx> = None;
     match (wf_ocr::Ocr::new(), config.resolve_ee_log()) {
         (Ok(ocr), Ok(ee_log)) => match wf_relic::ItemIndex::load_cached(&client, CATALOGUE_TTL).await {
             Ok(index) => {
+                let index = Arc::new(index);
                 let cache = Arc::new(wf_relic::price_cache());
                 let mastery = Arc::new(load_mastery(&config, &client).await);
                 // Relic drop tables for the owned-relic guide (best-effort).
@@ -1401,6 +1394,16 @@ async fn run_overlay(config: Config) -> Result<()> {
                 let market = MarketClient::new(client.clone(), config.market_platform.clone());
                 let ocr = Arc::new(ocr);
                 let reward = reward.clone();
+
+                // Background price pre-warm (see `prewarm_new_tiers` and the
+                // renderer loop below): only possible once the relic drop
+                // tables have loaded, since it needs a relic's reward pool.
+                prewarm_ctx = relic_index.clone().map(|relic_index| PrewarmCtx {
+                    market: market.clone(),
+                    cache: cache.clone(),
+                    relic_index,
+                    item_index: index.clone(),
+                });
 
                 // The owned-relic scan runs in its own tightly-looped task (see
                 // relic_scan_loop) so it isn't throttled by relic_watch_loop's
@@ -1443,7 +1446,7 @@ async fn run_overlay(config: Config) -> Result<()> {
                     if let Err(e) = relic_watch_loop(
                         ee_log,
                         ocr,
-                        Arc::new(index),
+                        index,
                         market,
                         cache,
                         mastery,
@@ -1463,6 +1466,50 @@ async fn run_overlay(config: Config) -> Result<()> {
         },
         (Err(e), _) => println!("  relic auto-detect: OFF ({e})"),
         (_, Err(e)) => println!("  relic auto-detect: OFF (no EE.log: {e:#})"),
+    }
+
+    // Renderer: rebuild the frame each second (ETAs tick, reward panel expires,
+    // visibility may have toggled) and push it to the layer surface. Also
+    // drives fissure-start price pre-warming off this same worldstate refresh
+    // (see `prewarm_ctx`) rather than polling warframestat.us a second time.
+    {
+        let client = client.clone();
+        let visible = visible.clone();
+        tokio::spawn(async move {
+            let mut cached = ws;
+            let mut last_fetch = tokio::time::Instant::now();
+            // Tiers a pre-warm has already been dispatched for this session —
+            // re-checked against `active` below so a tier that goes quiet and
+            // later starts again (a fresh fissure of the same era) re-triggers
+            // pre-warming instead of being skipped forever.
+            let mut warmed_tiers: std::collections::HashSet<String> = std::collections::HashSet::new();
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if last_fetch.elapsed() >= refresh {
+                    match worldstate::fetch(&client, &platform).await {
+                        Ok(fresh) => {
+                            if let Some(ctx) = &prewarm_ctx {
+                                let active = fresh.active_fissure_tiers();
+                                warmed_tiers.retain(|t| active.contains(t));
+                                let new_tiers: std::collections::HashSet<String> =
+                                    active.difference(&warmed_tiers).cloned().collect();
+                                if !new_tiers.is_empty() {
+                                    warmed_tiers.extend(new_tiers.iter().cloned());
+                                    tokio::spawn(prewarm_new_tiers(ctx.clone(), new_tiers));
+                                }
+                            }
+                            cached = fresh;
+                        }
+                        Err(e) => tracing::warn!("worldstate refresh failed: {e:#}"),
+                    }
+                    last_fetch = tokio::time::Instant::now();
+                }
+                let frame = make_frame(&cached, visible.load(Ordering::Relaxed));
+                if tx.send(frame).is_err() {
+                    break; // overlay closed
+                }
+            }
+        });
     }
 
     // Place the overlay on the game's monitor, hugging its window corner. Poll
@@ -1570,6 +1617,38 @@ async fn wait_for_window(timeout: Duration) -> Option<(i32, i32, u32, u32)> {
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+}
+
+/// Load the current owned-relic set from disk and warm the price cache for
+/// every tradable reward of an owned relic whose tier is in `tiers` (see
+/// [`wf_relic::active_tier_reward_names`]) — the actual pre-warm work behind
+/// the renderer loop's newly-active-tier dispatch. Spawned as its own
+/// detached task each time new tiers appear, so a slow warframe.market
+/// response never delays the next rendered frame.
+/// [`wf_relic::PriceOpts::fetch_timeout`] used for pre-warming, well past
+/// [`wf_relic::PriceOpts::default`]'s 2.5s — that default is tuned for the
+/// ~15s reward-screen selection window, but a pre-warm runs minutes ahead of
+/// it with no such deadline, so a slow warframe.market response should get a
+/// real chance to land here instead of timing out and leaving the item to
+/// warm cold later anyway.
+const PREWARM_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
+
+async fn prewarm_new_tiers(ctx: PrewarmCtx, tiers: std::collections::HashSet<String>) {
+    let owned = wf_cache::load_blob::<wf_relic::OwnedRelics>(wf_relic::OWNED_RELICS_FILE)
+        .map(|s| s.value)
+        .unwrap_or_default();
+    let evidence = wf_relic::owned_evidence(&owned);
+    let names = wf_relic::active_tier_reward_names(&evidence, &ctx.relic_index, &tiers);
+    if names.is_empty() {
+        return;
+    }
+    tracing::info!(
+        "fissure pre-warm: tier(s) {} active — warming {} reward price(s)",
+        tiers.iter().cloned().collect::<Vec<_>>().join(", "),
+        names.len()
+    );
+    let opts = wf_relic::PriceOpts { fetch_timeout: PREWARM_FETCH_TIMEOUT, ..wf_relic::PriceOpts::default() };
+    wf_relic::prewarm_reward_prices(&names, &ctx.item_index, &ctx.market, &ctx.cache, opts).await;
 }
 
 /// How long a relic-inventory-open event keeps [`relic_scan_loop`] scanning
