@@ -197,6 +197,17 @@ fn rarity_color(rarity: &str) -> egui::Color32 {
     }
 }
 
+/// A small filled circle in a drop's rarity color — drawn rather than a
+/// bundled bitmap, since neither WFCD dataset this app already draws from
+/// (`warframe-drop-data`, `warframe-items`) ships a rarity icon asset to
+/// bundle; this reproduces the same color the in-game reward screen uses.
+fn rarity_pip(ui: &mut egui::Ui, rarity: &str) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        ui.painter().circle_filled(rect.center(), 4.0, rarity_color(rarity));
+    }
+}
+
 /// Launch-time-resolved market prices for the Sell tab (relic slug → plat),
 /// the Farm tab (mastered reward name → plat), and each unmastered built
 /// Prime's Set (built prime name → plat). Bundled because all three are
@@ -505,6 +516,8 @@ struct BrowseApp {
     mastery_filter: MasteryFilter,
     mastery_sort: MasterySort,
     relics_sort: RelicsSort,
+    /// Editable text buffer for the Relics & Plan tab's search box.
+    relics_filter: String,
     sell_tier_filter: HashSet<String>,
     sell_status_filter: SellFilter,
     sell_sort: SellSort,
@@ -528,6 +541,7 @@ impl BrowseApp {
             mastery_filter: MasteryFilter::All,
             mastery_sort: MasterySort::Alphabetical,
             relics_sort: RelicsSort::MostOwned,
+            relics_filter: String::new(),
             sell_tier_filter: HashSet::new(),
             sell_status_filter: SellFilter::All,
             sell_sort: SellSort::Price,
@@ -609,6 +623,10 @@ impl BrowseApp {
         };
 
         ui.horizontal(|ui| {
+            ui.label("Search:");
+            ui.text_edit_singleline(&mut self.relics_filter);
+        });
+        ui.horizontal(|ui| {
             ui.label("Sort:");
             ui.selectable_value(&mut self.relics_sort, RelicsSort::MostOwned, "Most owned");
             ui.selectable_value(&mut self.relics_sort, RelicsSort::ActionableNow, "Actionable now");
@@ -620,6 +638,19 @@ impl BrowseApp {
 
         if plans.is_empty() {
             ui.label("no unmastered primes found among your scanned relics");
+            return;
+        }
+
+        let filter = self.relics_filter.to_ascii_lowercase();
+        plans.retain(|p| {
+            filter.is_empty()
+                || p.prime.to_ascii_lowercase().contains(&filter)
+                || p.parts.iter().any(|g| {
+                    g.part.part.to_ascii_lowercase().contains(&filter)
+                        || g.relics.iter().any(|r| r.relic_display.to_ascii_lowercase().contains(&filter))
+                })
+        });
+        if show_if_filtered_empty(ui, &plans) {
             return;
         }
 
@@ -652,10 +683,14 @@ impl BrowseApp {
 
                         for g in &p.parts {
                             let need = owned_need_cell(g.owned, g.build_quantity);
-                            let breakdown = g
-                                .relics
-                                .iter()
-                                .map(|r| {
+                            ui.label(&g.part.part);
+                            ui.label(need);
+                            ui.horizontal_wrapped(|ui| {
+                                for (i, r) in g.relics.iter().enumerate() {
+                                    if i > 0 {
+                                        ui.label(",");
+                                    }
+                                    rarity_pip(ui, &r.rarity);
                                     let is_live =
                                         active_tiers.contains(wf_relic::tier_of(&r.relic_display));
                                     let flag = if is_live { "*" } else { "" };
@@ -665,13 +700,9 @@ impl BrowseApp {
                                         wf_relic::RelicEvidence::Confirmed(n) => format!("x{n}"),
                                         wf_relic::RelicEvidence::SeenOnly => "seen".to_string(),
                                     };
-                                    format!("{}{flag} {qty}{price}{stale}", r.relic_display)
-                                })
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            ui.label(&g.part.part);
-                            ui.label(need);
-                            ui.label(breakdown);
+                                    ui.label(format!("{}{flag} {qty}{price}{stale}", r.relic_display));
+                                }
+                            });
                             ui.end_row();
                         }
                     });
@@ -880,7 +911,10 @@ impl BrowseApp {
                     ui.label(p.count.to_string());
                     ui.label(&p.best_reward);
                     ui.label(plat);
-                    ui.colored_label(rarity_color(&p.rarity), &p.rarity);
+                    ui.horizontal(|ui| {
+                        rarity_pip(ui, &p.rarity);
+                        ui.colored_label(rarity_color(&p.rarity), &p.rarity);
+                    });
                     ui.label(age_cell(&ages, &p.display));
                     ui.end_row();
                 }
