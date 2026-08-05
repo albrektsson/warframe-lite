@@ -33,7 +33,8 @@ use eframe::egui;
 use futures::stream::{self, StreamExt};
 use wf_config::Config;
 use wf_relic::{
-    FarmPick, ItemIndex, MasteryEntry, MasterySet, PartQuantities, PrimePlan, RelicIndex, RelicPick,
+    EquipmentCategory, FarmPick, ItemIndex, MasteryEntry, MasterySet, PartMarketInfo, PartQuantities,
+    PrimePart, PrimePlan, RelicIndex, RelicPick, CATEGORY_ORDER,
 };
 
 const CATALOGUE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -257,6 +258,10 @@ struct Live {
     /// Per-relic-code Intact scan age, for the per-relic freshness markers.
     ages: HashMap<String, Duration>,
     active_tiers: HashSet<String>,
+    /// The scanned owned-Prime-Part set, for the Mastery tab's part-level
+    /// owned/need cell — refreshed on the same poll cadence as every other
+    /// scan-derived field here, unlike the launch-time-only [`Loaded::quantities`].
+    owned_parts: wf_relic::OwnedPrimeParts,
 }
 
 /// Launch-time [`load_data`] plus the first [`Live::compute`] derived from
@@ -270,6 +275,10 @@ struct Loaded {
     /// quantities never change after launch, and the Mastery tab's wishlist
     /// checkboxes need every part label per prime ([`PartQuantities::parts_for`]).
     quantities: Arc<PartQuantities>,
+    /// Vaulted status + ducat value per Prime Part, for the Mastery tab's
+    /// tree — resolved once at launch (see [`wf_relic::part_market_info`]),
+    /// shared with the poller for the same reason as `quantities`.
+    part_market: Arc<HashMap<PrimePart, PartMarketInfo>>,
 }
 
 /// Lock `m`, recovering the guard even if a previous holder panicked while
@@ -316,7 +325,16 @@ impl Live {
         );
         let owned_age_range = owned.and_then(|o| wf_relic::intact_age_range(&o.value));
         let ages = owned.map(|o| wf_relic::intact_ages(&o.value)).unwrap_or_default();
-        Self { plans, sell_picks, farm_picks, bom_plans, owned_age_range, ages, active_tiers }
+        Self {
+            plans,
+            sell_picks,
+            farm_picks,
+            bom_plans,
+            owned_age_range,
+            ages,
+            active_tiers,
+            owned_parts: owned_parts.clone(),
+        }
     }
 }
 
@@ -325,9 +343,10 @@ impl Live {
 /// "Loading…" placeholder — then hand off into [`poll`]'s ongoing refresh
 /// loop for as long as the window stays open.
 async fn load_and_poll(loaded: Arc<Mutex<Option<Loaded>>>, config: Config) {
-    let LoadedData { index, mastery, quantities, owned, owned_parts, active_tiers, prices } =
+    let LoadedData { index, mastery, quantities, owned, owned_parts, active_tiers, prices, part_market } =
         load_data(&config).await;
     let quantities = Arc::new(quantities);
+    let part_market = Arc::new(part_market);
     let mastery_rows = wf_relic::mastery_browser(&index, &mastery);
     let live = Live::compute(
         owned.as_ref(),
@@ -338,7 +357,8 @@ async fn load_and_poll(loaded: Arc<Mutex<Option<Loaded>>>, config: Config) {
         &prices,
         active_tiers,
     );
-    *lock_loaded(&loaded) = Some(Loaded { mastery_rows, live, quantities: quantities.clone() });
+    *lock_loaded(&loaded) =
+        Some(Loaded { mastery_rows, live, quantities: quantities.clone(), part_market: part_market.clone() });
 
     poll(loaded, index, mastery, quantities, prices, config.platform).await;
 }
@@ -396,6 +416,10 @@ struct LoadedData {
     owned_parts: wf_relic::OwnedPrimeParts,
     active_tiers: HashSet<String>,
     prices: Prices,
+    /// Vaulted status + ducat value per Prime Part, resolved once against the
+    /// item catalogue for the Mastery tab's tree — see
+    /// [`wf_relic::part_market_info`].
+    part_market: HashMap<PrimePart, PartMarketInfo>,
 }
 
 /// Look up a bounded-concurrency batch of market prices, keyed by whatever
@@ -498,6 +522,8 @@ async fn load_data(config: &Config) -> LoadedData {
 
     cache.save();
 
+    let part_market = wf_relic::part_market_info(&quantities, &item_index);
+
     LoadedData {
         index,
         mastery,
@@ -506,6 +532,7 @@ async fn load_data(config: &Config) -> LoadedData {
         owned_parts,
         active_tiers,
         prices: Prices { sell: sell_prices, farm: farm_prices, set: set_prices },
+        part_market,
     }
 }
 
@@ -631,9 +658,17 @@ impl BrowseApp {
         result
     }
 
+    /// The Mastery tab: a 3-level tree — category (fixed WFinfo order) →
+    /// Prime → part — matching WFinfo's Equipment window. Both levels are
+    /// collapsed by default ([`egui::CollapsingHeader`], no expand/collapse
+    /// interaction existed anywhere in `wf-browse` before this); the
+    /// Show/Sort controls apply *within* each category, not across them, so
+    /// the category order itself never moves.
     fn mastery_tab(&mut self, ui: &mut egui::Ui) {
-        let Some((mastery_rows, quantities)) =
-            self.loaded_or_placeholder(ui, |l| (l.mastery_rows.clone(), l.quantities.clone()))
+        let Some((mastery_rows, quantities, part_market, owned_parts)) =
+            self.loaded_or_placeholder(ui, |l| {
+                (l.mastery_rows.clone(), l.quantities.clone(), l.part_market.clone(), l.live.owned_parts.clone())
+            })
         else {
             return;
         };
@@ -654,57 +689,137 @@ impl BrowseApp {
         });
         ui.add_space(6.0);
 
+        // Search reaches part names too (not just Prime names) — a match
+        // anywhere in a Prime's part list keeps that Prime (and its parent
+        // category) in the tree, auto-expanded below so the match is never
+        // hidden inside a collapsed branch.
         let filter = self.filter.to_ascii_lowercase();
-        let mut rows: Vec<&MasteryEntry> = mastery_rows
+        let matches = |e: &MasteryEntry| -> bool {
+            filter.is_empty()
+                || e.prime.to_ascii_lowercase().contains(&filter)
+                || quantities
+                    .parts_for(&e.prime)
+                    .iter()
+                    .any(|(part, _)| part.to_ascii_lowercase().contains(&filter))
+        };
+
+        let rows: Vec<&MasteryEntry> = mastery_rows
             .iter()
-            .filter(|e| filter.is_empty() || e.prime.to_ascii_lowercase().contains(&filter))
+            .filter(|e| matches(e))
             .filter(|e| match self.mastery_filter {
                 MasteryFilter::All => true,
                 MasteryFilter::MasteredOnly => e.mastered,
                 MasteryFilter::UnmasteredOnly => !e.mastered,
             })
             .collect();
-        if self.mastery_sort == MasterySort::UnmasteredFirst {
-            rows.sort_by_key(|e| e.mastered);
-        } // Alphabetical: mastery_rows is already alphabetical.
 
         let mastered = rows.iter().filter(|e| e.mastered).count();
         ui.label(format!("{mastered} / {} mastered", rows.len()));
         ui.add_space(4.0);
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("mastery_grid").num_columns(3).striped(true).show(ui, |ui| {
-                ui.strong("prime");
-                ui.strong("status");
-                ui.strong("wishlist");
-                ui.end_row();
+        let mut by_category: HashMap<EquipmentCategory, Vec<&MasteryEntry>> = HashMap::new();
+        for entry in rows {
+            by_category.entry(quantities.category_for(&entry.prime)).or_default().push(entry);
+        }
+        // Non-matching branches never render at all, same as the flat list's
+        // filtering did before — an empty category (every Prime filtered out)
+        // is simply skipped rather than shown collapsed-and-empty.
+        let force_open = (!filter.is_empty()).then_some(true);
 
-                for entry in &rows {
-                    ui.label(&entry.prime);
-                    let (text, color) = if entry.mastered {
-                        ("✓ mastered", MASTERED_COLOR)
-                    } else {
-                        ("— unmastered", UNMASTERED_COLOR)
-                    };
-                    ui.colored_label(color, text);
-                    // One checkbox per Prime Part (Systems, Chassis, …), reusing
-                    // `tier_filter_ui`'s row-of-checkboxes pattern — wishlisting
-                    // is per-part (CONTEXT.md's "Wishlisted part"), one level
-                    // below this row's whole-Prime granularity (see ADR-0004).
-                    ui.horizontal(|ui| {
-                        for (part, _quantity) in quantities.parts_for(&entry.prime) {
-                            let pp = wf_relic::PrimePart { prime: entry.prime.clone(), part: part.clone() };
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for category in CATEGORY_ORDER {
+                let Some(mut entries) = by_category.remove(&category) else { continue };
+                if self.mastery_sort == MasterySort::UnmasteredFirst {
+                    entries.sort_by_key(|e| e.mastered);
+                } // Alphabetical: mastery_rows is already alphabetical.
+
+                let category_mastered = entries.iter().filter(|e| e.mastered).count();
+                egui::CollapsingHeader::new(format!(
+                    "{}  ({category_mastered}/{})",
+                    category.label(),
+                    entries.len()
+                ))
+                .id_salt(("mastery_category", category.label()))
+                .default_open(false)
+                .open(force_open)
+                .show(ui, |ui| {
+                    for entry in entries {
+                        self.mastery_prime_row(ui, entry, &quantities, &part_market, &owned_parts, force_open);
+                    }
+                });
+            }
+        });
+    }
+
+    /// One Prime's row in the Mastery tab's tree: a collapsed-by-default
+    /// header carrying today's mastered/unmastered dim-or-checkmark
+    /// treatment, expanding to a part-level table with the owned/need cell
+    /// (reused from the Relics & Plan tab), a vaulted badge and ducat value
+    /// (both already fetched via the item catalogue, never shown in
+    /// `wf-browse` before this), and the existing per-part wishlist checkbox.
+    fn mastery_prime_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        entry: &MasteryEntry,
+        quantities: &PartQuantities,
+        part_market: &HashMap<PrimePart, PartMarketInfo>,
+        owned_parts: &wf_relic::OwnedPrimeParts,
+        force_open: Option<bool>,
+    ) {
+        let (status_text, status_color) = if entry.mastered {
+            ("✓ mastered", MASTERED_COLOR)
+        } else {
+            ("— unmastered", UNMASTERED_COLOR)
+        };
+        let header = egui::RichText::new(format!("{}  {status_text}", entry.prime)).color(status_color);
+
+        let mut parts = quantities.parts_for(&entry.prime);
+        parts.sort();
+
+        egui::CollapsingHeader::new(header)
+            .id_salt(("mastery_prime", &entry.prime))
+            .default_open(false)
+            .open(force_open)
+            .show(ui, |ui| {
+                egui::Grid::new(format!("mastery_parts_grid_{}", entry.prime))
+                    .num_columns(5)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("part");
+                        ui.strong("owned / need");
+                        ui.strong("vaulted");
+                        ui.strong("ducats");
+                        ui.strong("wishlist");
+                        ui.end_row();
+
+                        for (part, quantity) in &parts {
+                            let pp = PrimePart { prime: entry.prime.clone(), part: part.clone() };
+                            ui.label(part);
+
+                            let owned = wf_relic::owned_parts::get(owned_parts, &pp);
+                            ui.label(owned_need_cell(owned, Some(*quantity)));
+
+                            let info = part_market.get(&pp);
+                            if info.is_some_and(|i| i.vaulted) {
+                                ui.colored_label(STALE_COLOR, "vaulted");
+                            } else {
+                                ui.label("");
+                            }
+                            ui.label(
+                                info.and_then(|i| i.ducats)
+                                    .map(|d| format!("{d}d"))
+                                    .unwrap_or_else(|| "—".to_string()),
+                            );
+
                             let key = wf_relic::wishlist::key(&pp);
                             let mut checked = self.wishlist.contains(&key);
-                            if ui.checkbox(&mut checked, &part).changed() {
+                            if ui.checkbox(&mut checked, "").changed() {
                                 self.set_wishlisted(&key, checked);
                             }
+                            ui.end_row();
                         }
                     });
-                    ui.end_row();
-                }
             });
-        });
     }
 
     fn relics_tab(&mut self, ui: &mut egui::Ui) {

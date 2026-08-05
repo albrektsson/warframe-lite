@@ -6,6 +6,7 @@ pub mod index;
 pub mod mastery;
 pub mod owned;
 pub mod owned_parts;
+pub mod part_market;
 pub mod part_quantities;
 pub mod regions;
 pub mod relics;
@@ -20,7 +21,8 @@ pub use owned::{
     RelicEvidence, Refinement, STALE_AFTER,
 };
 pub use owned_parts::{OwnedPrimeParts, OWNED_PRIME_PARTS_FILE};
-pub use part_quantities::PartQuantities;
+pub use part_market::{reward_label, resolve as part_market_info, PartMarketInfo};
+pub use part_quantities::{EquipmentCategory, PartQuantities, CATEGORY_ORDER};
 pub use regions::{
     InventoryGridRegions, InventorySlot, Rect, RelicGridRegions, RelicSlot, RewardRegions,
 };
