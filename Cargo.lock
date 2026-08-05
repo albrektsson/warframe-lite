@@ -4077,6 +4077,7 @@ name = "wf-gridscan"
 version = "0.0.1"
 dependencies = [
  "image",
+ "tokio",
  "wf-ocr",
 ]
 

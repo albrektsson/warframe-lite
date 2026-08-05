@@ -477,15 +477,8 @@ async fn mastery_plan_cmd(config: &Config) -> Result<()> {
     }
     cache.save();
 
-    let plans = wf_relic::mastery_plan(
-        &evidence,
-        &relic_prices,
-        &std::collections::HashMap::new(),
-        &index,
-        &mastery,
-        &quantities,
-        &owned_parts,
-    );
+    let ctx = wf_relic::RelicContext { index: &index, mastery: &mastery, quantities: &quantities, owned_parts: &owned_parts };
+    let plans = wf_relic::mastery_plan(&evidence, &relic_prices, &std::collections::HashMap::new(), &ctx);
 
     if plans.is_empty() {
         println!("  no unmastered primes found among your scanned relics");
@@ -1898,103 +1891,55 @@ async fn relic_watch_loop(
 /// however long a scan itself takes — is what actually catches more of the
 /// list quickly, since each additional sample is another chance to catch cards
 /// at a favorable scroll offset.
-async fn relic_scan_loop(
-    relic_deadline: RelicDeadline,
+/// [`wf_gridscan::ScanLoopBody`] for the Void Relics screen: on top of the
+/// shared deadline/idle/cadence skeleton, tracks per-session tally/identity
+/// bookkeeping and the overlay's scan-progress indicator (see ADR-0009's
+/// Seen tier for why relic tracking needs `identity_reads`/`session_seen_count`
+/// where the simpler Inventory/Sell scanner does not).
+struct RelicScanBody {
     ocr: std::sync::Arc<wf_ocr::Ocr>,
     relic_index: std::sync::Arc<wf_relic::RelicIndex>,
     relic_regions: wf_relic::RelicGridRegions,
     scan_status: RelicScanStatus,
-) {
-    use std::collections::HashMap;
-    use std::time::Instant;
-
-    // End a scan once no new relic has been seen for this long (the player
-    // stopped scrolling / left the screen), capped at RELIC_SCAN_WINDOW.
-    const RELIC_SCAN_IDLE: Duration = Duration::from_secs(12);
-    // Between-scan gap while actively scanning — a scan itself already takes
-    // well over this, so it mainly just yields rather than limiting throughput.
-    const SCAN_COOLDOWN: Duration = Duration::from_millis(100);
-    // How often to check for a new deadline while idle (no need to poll fast
-    // when there's nothing to do).
-    const IDLE_POLL: Duration = Duration::from_millis(400);
-
     // `relic_owned` is the cumulative, disk-persisted owned set, keyed per
-    // (code, refinement) (see ADR-0005) — it survives restarts and Relics-screen
-    // visits, so the mastery planner (`wf-lite mastery-plan`) has data even
-    // outside a live scan. Within the *current* continuous scan (cleared each
-    // fresh open), `tally` votes across frames and only confirms a count once
-    // enough frames agree, and `session_applied` records which confirmed value
-    // we've already written this session so a stable count refreshes its
-    // last-seen stamp once, not on every frame.
-    let owned_path = wf_cache::cache_dir().ok().map(|d| d.join(wf_relic::OWNED_RELICS_FILE));
-    let mut relic_owned: wf_relic::OwnedRelics =
-        match wf_cache::load_blob::<wf_relic::OwnedRelics>(wf_relic::OWNED_RELICS_FILE) {
-            Some(s) => s.value,
-            None => {
-                // Absent, or a legacy/foreign format we can no longer trust — back
-                // up any existing file and start clean (ADR-0005).
-                if let Some(p) = &owned_path {
-                    if p.exists() {
-                        let bak = p.with_extension("json.bak");
-                        if std::fs::rename(p, &bak).is_ok() {
-                            tracing::info!("backed up unrecognised {} to {}", p.display(), bak.display());
-                        }
-                    }
-                }
-                wf_relic::OwnedRelics::default()
-            }
-        };
-    let mut tally: wf_ocr::Tally<(String, wf_relic::Refinement)> = wf_ocr::Tally::new();
-    let mut session_applied: HashMap<(String, wf_relic::Refinement), u32> = HashMap::new();
-    let mut identity_reads: HashMap<(String, wf_relic::Refinement), u32> = HashMap::new();
-    let mut session_seen_count: usize = 0;
-    let mut was_active = false;
-    // Bogus initial value (not a real deadline the watcher could ever set) so the
-    // very first observed deadline always registers as a change below.
-    let mut last_seen_deadline: Option<Instant> = Some(Instant::now() - RELIC_SCAN_IDLE * 2);
-    let mut last_new = Instant::now() - RELIC_SCAN_IDLE * 2;
+    // (code, refinement) (see ADR-0005) — it survives restarts and
+    // Relics-screen visits, so the mastery planner (`wf-lite mastery-plan`)
+    // has data even outside a live scan. Within the *current* continuous scan
+    // (cleared each fresh open), `tally` votes across frames and only
+    // confirms a count once enough frames agree, and `session_applied`
+    // records which confirmed value we've already written this session so a
+    // stable count refreshes its last-seen stamp once, not on every frame.
+    relic_owned: wf_relic::OwnedRelics,
+    tally: wf_ocr::Tally<(String, wf_relic::Refinement)>,
+    session_applied: std::collections::HashMap<(String, wf_relic::Refinement), u32>,
+    identity_reads: std::collections::HashMap<(String, wf_relic::Refinement), u32>,
+    session_seen_count: usize,
+}
 
-    loop {
-        let deadline = *relic_deadline.lock().unwrap();
-        // relic_watch_loop just (re)armed the window from a fresh EE.log event —
-        // treat that as activity so the idle check below doesn't see a `last_new`
-        // that's stale from long before the Relics screen was ever opened (this
-        // task runs for the overlay's whole lifetime, so without this, "idle"
-        // would already be true the instant a deadline first appears).
-        if deadline != last_seen_deadline {
-            last_seen_deadline = deadline;
-            if deadline.is_some() {
-                last_new = Instant::now();
-            }
-        }
-        let active = deadline.is_some_and(|t| Instant::now() < t) && last_new.elapsed() <= RELIC_SCAN_IDLE;
+impl wf_gridscan::ScanLoopBody for RelicScanBody {
+    fn activate(&mut self) {
+        self.tally = wf_ocr::Tally::new();
+        self.session_applied.clear();
+        self.identity_reads.clear();
+        self.session_seen_count = 0;
+        // Show scanning has started before the first capture even completes,
+        // rather than nothing until a relic clears its trust bar.
+        *self.scan_status.lock().unwrap() = Some(wf_overlay::ScanProgress::default());
+        tracing::info!(
+            "relics screen opened — scanning as you scroll ({} relics known from before)",
+            self.relic_owned.len()
+        );
+    }
 
-        if !active {
-            if was_active {
-                *scan_status.lock().unwrap() = None;
-            }
-            was_active = false;
-            tokio::time::sleep(IDLE_POLL).await;
-            continue;
-        }
-        if !was_active {
-            was_active = true;
-            tally = wf_ocr::Tally::new();
-            session_applied.clear();
-            identity_reads.clear();
-            session_seen_count = 0;
-            // Show scanning has started before the first capture even
-            // completes, rather than nothing until a relic clears its trust bar.
-            *scan_status.lock().unwrap() = Some(wf_overlay::ScanProgress::default());
-            tracing::info!(
-                "relics screen opened — scanning as you scroll ({} relics known from before)",
-                relic_owned.len()
-            );
-        }
+    fn deactivate(&mut self) {
+        *self.scan_status.lock().unwrap() = None;
+    }
 
-        let (ocr2, regions2, ridx2) = (ocr.clone(), relic_regions.clone(), relic_index.clone());
+    async fn tick(&mut self) -> bool {
+        let (ocr2, regions2, ridx2) =
+            (self.ocr.clone(), self.relic_regions.clone(), self.relic_index.clone());
         let scanned = tokio::task::spawn_blocking(move || {
-            let t0 = Instant::now();
+            let t0 = std::time::Instant::now();
             let cap = wf_capture::capture_warframe(None)?;
             let captured = t0.elapsed();
             let found = scan_relic_grid(&cap.image, &ocr2, &regions2, &ridx2);
@@ -2005,52 +1950,73 @@ async fn relic_scan_loop(
             Ok::<_, anyhow::Error>(found)
         })
         .await;
-        if let Ok(Ok(found)) = scanned {
-            let mut changed = false;
-            for obs in found {
-                let key = (obs.display.clone(), obs.refinement);
-                // Any cleanly-resolved identity marks Seen, independent of count (ADR-0009).
-                match obs.kind {
-                    ObsKind::Count(n) => {
-                        if mark_seen_if_agreed(&mut identity_reads, &mut relic_owned, &key) {
-                            changed = true;
-                            session_seen_count += 1;
-                        }
-                        tally.record(key.clone(), n);
+        let Ok(Ok(found)) = scanned else {
+            return false;
+        };
+
+        let mut changed = false;
+        for obs in found {
+            let key = (obs.display.clone(), obs.refinement);
+            // Any cleanly-resolved identity marks Seen, independent of count (ADR-0009).
+            match obs.kind {
+                ObsKind::Count(n) => {
+                    if mark_seen_if_agreed(&mut self.identity_reads, &mut self.relic_owned, &key) {
+                        changed = true;
+                        self.session_seen_count += 1;
                     }
-                    ObsKind::Unowned => tally.record(key.clone(), 0), // 0 = confirmed unowned
-                    ObsKind::Abstain => {
-                        if mark_seen_if_agreed(&mut identity_reads, &mut relic_owned, &key) {
-                            changed = true;
-                            session_seen_count += 1;
-                        }
-                        continue;
-                    }
+                    self.tally.record(key.clone(), n);
                 }
-                let Some(confirmed) = tally.confirmed(&key, RELIC_AGREEMENT) else {
-                    continue;
-                };
-                // Write each confirmed value once per session; a stable count then
-                // just refreshes nothing until it actually changes.
-                if session_applied.get(&key) == Some(&confirmed) {
+                ObsKind::Unowned => self.tally.record(key.clone(), 0), // 0 = confirmed unowned
+                ObsKind::Abstain => {
+                    if mark_seen_if_agreed(&mut self.identity_reads, &mut self.relic_owned, &key) {
+                        changed = true;
+                        self.session_seen_count += 1;
+                    }
                     continue;
                 }
-                session_applied.insert(key.clone(), confirmed);
-                wf_relic::apply_confirmed_count(&mut relic_owned, &key.0, key.1, confirmed);
+            }
+            let relic_owned = &mut self.relic_owned;
+            if wf_gridscan::confirm_once(&self.tally, &mut self.session_applied, &key, RELIC_AGREEMENT, |confirmed| {
+                wf_relic::apply_confirmed_count(relic_owned, &key.0, key.1, confirmed);
+            }) {
                 changed = true;
             }
-            if changed {
-                last_new = Instant::now();
-                *scan_status.lock().unwrap() = Some(wf_overlay::ScanProgress {
-                    seen: session_seen_count,
-                    confirmed: session_applied.len(),
-                });
-                let _ = wf_cache::save_blob(wf_relic::OWNED_RELICS_FILE, &relic_owned);
-                tracing::info!("relic scan: {} relics owned", relic_owned.len());
-            }
         }
-        tokio::time::sleep(SCAN_COOLDOWN).await;
+        if changed {
+            *self.scan_status.lock().unwrap() = Some(wf_overlay::ScanProgress {
+                seen: self.session_seen_count,
+                confirmed: self.session_applied.len(),
+            });
+            let _ = wf_cache::save_blob(wf_relic::OWNED_RELICS_FILE, &self.relic_owned);
+            tracing::info!("relic scan: {} relics owned", self.relic_owned.len());
+        }
+        changed
     }
+}
+
+async fn relic_scan_loop(
+    relic_deadline: RelicDeadline,
+    ocr: std::sync::Arc<wf_ocr::Ocr>,
+    relic_index: std::sync::Arc<wf_relic::RelicIndex>,
+    relic_regions: wf_relic::RelicGridRegions,
+    scan_status: RelicScanStatus,
+) {
+    // Absent, or a legacy/foreign format we can no longer trust — back up any
+    // existing file and start clean (ADR-0005).
+    let relic_owned: wf_relic::OwnedRelics = wf_cache::load_blob_or_reset(wf_relic::OWNED_RELICS_FILE);
+
+    let body = RelicScanBody {
+        ocr,
+        relic_index,
+        relic_regions,
+        scan_status,
+        relic_owned,
+        tally: wf_ocr::Tally::new(),
+        session_applied: std::collections::HashMap::new(),
+        identity_reads: std::collections::HashMap::new(),
+        session_seen_count: 0,
+    };
+    wf_gridscan::run_scan_loop(relic_deadline, wf_gridscan::ScanCadence::default(), body).await;
 }
 
 /// Bump `key`'s identity-read counter and mark Seen once it reaches
@@ -2066,78 +2032,36 @@ fn mark_seen_if_agreed(
     *reads >= SEEN_AGREEMENT && wf_relic::mark_seen(relic_owned, &key.0, key.1)
 }
 
-/// Scan the Inventory/Sell screen's Prime Parts grid on its own tight
-/// cadence, mirroring [`relic_scan_loop`] — same continuous-scroll,
-/// phase-anchored sampling rationale (see [`wf_relic::InventoryGridRegions`]),
-/// same disk-persisted cumulative owned set. Simpler than the relic loop in
-/// one respect: no Seen tier (see issue #37's catalog-matching decision —
-/// this screen's badge is always a single-frame passive read, so a
-/// Seen/Confirmed split has nothing to distinguish), so a card only ever
-/// needs [`INVENTORY_AGREEMENT`] agreeing frames before its count is applied.
-async fn inventory_scan_loop(
-    inventory_deadline: InventoryDeadline,
+/// [`wf_gridscan::ScanLoopBody`] for the Inventory/Sell screen's Prime Parts
+/// grid — simpler than [`RelicScanBody`] in one respect: no Seen tier (see
+/// issue #37's catalog-matching decision — this screen's badge is always a
+/// single-frame passive read, so a Seen/Confirmed split has nothing to
+/// distinguish), so a card only ever needs [`INVENTORY_AGREEMENT`] agreeing
+/// frames before its count is applied.
+struct InventoryScanBody {
     ocr: std::sync::Arc<wf_ocr::Ocr>,
     quantities: std::sync::Arc<wf_relic::PartQuantities>,
     inventory_regions: wf_relic::InventoryGridRegions,
-) {
-    use std::collections::HashMap;
-    use std::time::Instant;
+    owned: wf_relic::OwnedPrimeParts,
+    tally: wf_ocr::Tally<wf_relic::PrimePart>,
+    session_applied: std::collections::HashMap<wf_relic::PrimePart, u32>,
+}
 
-    // Same cadence knobs as `relic_scan_loop` — see its doc comment for why.
-    const SCAN_IDLE: Duration = Duration::from_secs(12);
-    const SCAN_COOLDOWN: Duration = Duration::from_millis(100);
-    const IDLE_POLL: Duration = Duration::from_millis(400);
+impl wf_gridscan::ScanLoopBody for InventoryScanBody {
+    fn activate(&mut self) {
+        self.tally = wf_ocr::Tally::new();
+        self.session_applied.clear();
+        tracing::info!(
+            "inventory/sell screen opened — scanning as you scroll ({} parts known from before)",
+            self.owned.values().map(|m| m.len()).sum::<usize>()
+        );
+    }
 
-    let owned_path = wf_cache::cache_dir().ok().map(|d| d.join(wf_relic::OWNED_PRIME_PARTS_FILE));
-    let mut owned: wf_relic::OwnedPrimeParts =
-        match wf_cache::load_blob::<wf_relic::OwnedPrimeParts>(wf_relic::OWNED_PRIME_PARTS_FILE) {
-            Some(s) => s.value,
-            None => {
-                if let Some(p) = &owned_path {
-                    if p.exists() {
-                        let bak = p.with_extension("json.bak");
-                        if std::fs::rename(p, &bak).is_ok() {
-                            tracing::info!("backed up unrecognised {} to {}", p.display(), bak.display());
-                        }
-                    }
-                }
-                wf_relic::OwnedPrimeParts::default()
-            }
-        };
-    let mut tally: wf_ocr::Tally<wf_relic::PrimePart> = wf_ocr::Tally::new();
-    let mut session_applied: HashMap<wf_relic::PrimePart, u32> = HashMap::new();
-    let mut was_active = false;
-    let mut last_seen_deadline: Option<Instant> = Some(Instant::now() - SCAN_IDLE * 2);
-    let mut last_new = Instant::now() - SCAN_IDLE * 2;
-
-    loop {
-        let deadline = *inventory_deadline.lock().unwrap();
-        if deadline != last_seen_deadline {
-            last_seen_deadline = deadline;
-            if deadline.is_some() {
-                last_new = Instant::now();
-            }
-        }
-        let active = deadline.is_some_and(|t| Instant::now() < t) && last_new.elapsed() <= SCAN_IDLE;
-
-        if !active {
-            was_active = false;
-            tokio::time::sleep(IDLE_POLL).await;
-            continue;
-        }
-        if !was_active {
-            was_active = true;
-            tally = wf_ocr::Tally::new();
-            session_applied.clear();
-            tracing::info!(
-                "inventory/sell screen opened — scanning as you scroll ({} parts known from before)",
-                owned.values().map(|m| m.len()).sum::<usize>()
-            );
-        }
-
-        let (ocr2, regions2, quantities2) = (ocr.clone(), inventory_regions.clone(), quantities.clone());
+    async fn tick(&mut self) -> bool {
+        let (ocr2, regions2, quantities2) =
+            (self.ocr.clone(), self.inventory_regions.clone(), self.quantities.clone());
         let scanned = tokio::task::spawn_blocking(move || {
-            let t0 = Instant::now();
+            let t0 = std::time::Instant::now();
             let cap = wf_capture::capture_warframe(None)?;
             let captured = t0.elapsed();
             let found = scan_inventory_grid(&cap.image, &ocr2, &regions2, &quantities2);
@@ -2148,34 +2072,61 @@ async fn inventory_scan_loop(
             Ok::<_, anyhow::Error>(found)
         })
         .await;
-        if let Ok(Ok(found)) = scanned {
-            let mut changed = false;
-            for obs in found {
-                let ObsKind::Count(n) = obs.kind else {
-                    continue; // abstain — no vote (Unowned never occurs on this screen)
-                };
-                tally.record(obs.part.clone(), n);
-                let Some(confirmed) = tally.confirmed(&obs.part, INVENTORY_AGREEMENT) else {
-                    continue;
-                };
-                if session_applied.get(&obs.part) == Some(&confirmed) {
-                    continue;
-                }
-                session_applied.insert(obs.part.clone(), confirmed);
-                wf_relic::owned_parts::apply_count(&mut owned, &obs.part, confirmed);
+        let Ok(Ok(found)) = scanned else {
+            return false;
+        };
+
+        let mut changed = false;
+        for obs in found {
+            let ObsKind::Count(n) = obs.kind else {
+                continue; // abstain — no vote (Unowned never occurs on this screen)
+            };
+            self.tally.record(obs.part.clone(), n);
+            let owned = &mut self.owned;
+            if wf_gridscan::confirm_once(
+                &self.tally,
+                &mut self.session_applied,
+                &obs.part,
+                INVENTORY_AGREEMENT,
+                |confirmed| wf_relic::owned_parts::apply_count(owned, &obs.part, confirmed),
+            ) {
                 changed = true;
             }
-            if changed {
-                last_new = Instant::now();
-                let _ = wf_cache::save_blob(wf_relic::OWNED_PRIME_PARTS_FILE, &owned);
-                tracing::info!(
-                    "inventory scan: {} parts owned",
-                    owned.values().map(|m| m.len()).sum::<usize>()
-                );
-            }
         }
-        tokio::time::sleep(SCAN_COOLDOWN).await;
+        if changed {
+            let _ = wf_cache::save_blob(wf_relic::OWNED_PRIME_PARTS_FILE, &self.owned);
+            tracing::info!(
+                "inventory scan: {} parts owned",
+                self.owned.values().map(|m| m.len()).sum::<usize>()
+            );
+        }
+        changed
     }
+}
+
+/// Scan the Inventory/Sell screen's Prime Parts grid on its own tight
+/// cadence, mirroring [`relic_scan_loop`] — same continuous-scroll,
+/// phase-anchored sampling rationale (see [`wf_relic::InventoryGridRegions`]),
+/// same disk-persisted cumulative owned set (see [`InventoryScanBody`]).
+async fn inventory_scan_loop(
+    inventory_deadline: InventoryDeadline,
+    ocr: std::sync::Arc<wf_ocr::Ocr>,
+    quantities: std::sync::Arc<wf_relic::PartQuantities>,
+    inventory_regions: wf_relic::InventoryGridRegions,
+) {
+    // Absent, or a legacy/foreign format we can no longer trust — back up any
+    // existing file and start clean (ADR-0005).
+    let owned: wf_relic::OwnedPrimeParts = wf_cache::load_blob_or_reset(wf_relic::OWNED_PRIME_PARTS_FILE);
+
+    let body = InventoryScanBody {
+        ocr,
+        quantities,
+        inventory_regions,
+        owned,
+        tally: wf_ocr::Tally::new(),
+        session_applied: std::collections::HashMap::new(),
+    };
+    wf_gridscan::run_scan_loop(inventory_deadline, wf_gridscan::ScanCadence::default(), body).await;
 }
 
 /// OCR each candidate reward-name slot of an already-captured frame. Slots are

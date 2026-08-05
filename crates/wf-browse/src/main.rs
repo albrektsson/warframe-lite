@@ -298,13 +298,12 @@ impl Live {
         // the richer evidence map (see wf_relic::owned_evidence).
         let counts = owned.map(|o| wf_relic::owned_counts(&o.value));
         let evidence = owned.map(|o| wf_relic::owned_evidence(&o.value));
+        let ctx = wf_relic::RelicContext { index, mastery, quantities, owned_parts };
         // mastery_plan/sell_picks/farm_picks already rank their output.
-        let plans = evidence.as_ref().map(|e| {
-            wf_relic::mastery_plan(e, &prices.sell, &prices.set, index, mastery, quantities, owned_parts)
-        });
-        let sell_picks = counts.as_ref().map(|c| {
-            wf_relic::sell_picks(c, &prices.sell, index, mastery, quantities, owned_parts)
-        });
+        let plans = evidence
+            .as_ref()
+            .map(|e| wf_relic::mastery_plan(e, &prices.sell, &prices.set, &ctx));
+        let sell_picks = counts.as_ref().map(|c| wf_relic::sell_picks(c, &prices.sell, &ctx));
         let farm_picks = counts.as_ref().map(|c| wf_relic::farm_picks(c, &prices.farm, index, mastery));
         let bom_plans = wf_relic::buy_or_farm_plan(
             &evidence.unwrap_or_default(),

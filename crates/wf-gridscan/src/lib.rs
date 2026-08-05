@@ -19,6 +19,9 @@ use std::hash::Hash;
 
 use image::RgbaImage;
 
+mod scan_loop;
+pub use scan_loop::{confirm_once, run_scan_loop, ScanCadence, ScanDeadline, ScanLoopBody};
+
 /// An ownership-signal detector: does this slot's search window show a
 /// positive "unowned" icon (e.g. the Void Relics screen's eye)?
 type OwnershipSignal<'a> = dyn Fn(&RgbaImage, &Rect) -> bool + Sync + 'a;

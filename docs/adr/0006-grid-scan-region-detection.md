@@ -64,3 +64,15 @@ resolution, badge geometry, an optional ownership-signal fn). Only the card
 geometry (`RelicGridRegions`/`InventoryGridRegions`) and the eye-icon
 ownership signal (relic-specific; the Inventory/Sell screen has none) stay
 outside `wf-gridscan`, in `wf-relic` and `src/main.rs` respectively.
+
+**Extended by issue #38**, one level up from a single frame's scan: the
+deadline/idle/cadence bookkeeping wrapped around each screen's scan cycle
+(`relic_scan_loop`/`inventory_scan_loop` in `src/main.rs`) was also a
+line-for-line duplicate, so it moved into `wf-gridscan` too, as
+`scan_loop::run_scan_loop` plus a `ScanLoopBody` trait (`activate`/
+`deactivate`/`tick`) each screen implements, and a `confirm_once` helper for
+the shared "tally votes, apply once confirmed this session" pattern. What
+stays screen-specific — captured behind `ScanLoopBody::tick` — is each
+screen's own confirmed-observation handling: the relic scanner's Seen tier
+(ADR-0009) on top of the shared tally/agreement bookkeeping, which the
+simpler Inventory/Sell scanner doesn't need.

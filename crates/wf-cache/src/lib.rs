@@ -87,6 +87,27 @@ pub fn load_blob<V: DeserializeOwned>(name: &str) -> Option<Stamped<V>> {
     serde_json::from_slice::<Stamped<V>>(&bytes).ok()
 }
 
+/// [`load_blob`], but absent or unparseable (a legacy/foreign format we can no
+/// longer trust) falls back to `V::default()` — backing up whatever's on disk
+/// under a `.bak` suffix first rather than silently discarding it (ADR-0005's
+/// "back up and start clean" precedent, reused for every schema this applies
+/// to since).
+pub fn load_blob_or_reset<V: DeserializeOwned + Default>(name: &str) -> V {
+    if let Some(s) = load_blob::<V>(name) {
+        return s.value;
+    }
+    if let Ok(dir) = cache_dir() {
+        let path = dir.join(name);
+        if path.exists() {
+            let bak = path.with_extension("json.bak");
+            if std::fs::rename(&path, &bak).is_ok() {
+                tracing::info!("backed up unrecognised {} to {}", path.display(), bak.display());
+            }
+        }
+    }
+    V::default()
+}
+
 /// A persisted `key → timestamped value` map.
 pub struct KeyedCache<V> {
     path: PathBuf,

@@ -281,6 +281,16 @@ pub fn vaulted_rewards(relics: &RelicIndex, items: &ItemIndex) -> HashMap<String
         .collect()
 }
 
+/// The relic/mastery/part catalogue and owned-parts scan, bundled by
+/// reference: these four always travel together, unchanged, through every
+/// planning call in a request (see [`sell_picks`], [`mastery_plan`]).
+pub struct RelicContext<'a> {
+    pub index: &'a RelicIndex,
+    pub mastery: &'a MasterySet,
+    pub quantities: &'a PartQuantities,
+    pub owned_parts: &'a crate::OwnedPrimeParts,
+}
+
 /// Every owned relic — mastered or not — as a priced, ranked [`RelicPick`],
 /// for the Sell tab: deciding which relics are worth selling rather than
 /// cracking. Unlike [`mastery_plan`] (and the full-catalogue guide behind
@@ -292,18 +302,16 @@ pub fn vaulted_rewards(relics: &RelicIndex, items: &ItemIndex) -> HashMap<String
 /// inline, keeping this pure; a slug missing from the map is treated the same
 /// as an explicit `None` — the relic still appears, unpriced.
 ///
-/// `quantities` and `owned_parts` populate each pick's [`RelicPick::parts_owned`]
-/// display-only summary — they play no role in `rank`'s plat/unmastered-driven
-/// ordering.
+/// `ctx.quantities` and `ctx.owned_parts` populate each pick's
+/// [`RelicPick::parts_owned`] display-only summary — they play no role in
+/// `rank`'s plat/unmastered-driven ordering.
 pub fn sell_picks(
     owned: &HashMap<String, u32>,
     prices: &HashMap<String, Option<u32>>,
-    index: &RelicIndex,
-    mastery: &MasterySet,
-    quantities: &PartQuantities,
-    owned_parts: &crate::OwnedPrimeParts,
+    ctx: &RelicContext,
 ) -> Vec<RelicPick> {
-    let mut picks: Vec<RelicPick> = index
+    let mut picks: Vec<RelicPick> = ctx
+        .index
         .all()
         .iter()
         .filter_map(|relic| {
@@ -315,9 +323,9 @@ pub fn sell_picks(
             Some(RelicPick {
                 display: relic.display.clone(),
                 count,
-                unmastered: relic.unmastered(mastery),
+                unmastered: relic.unmastered(ctx.mastery),
                 plat,
-                parts_owned: worst_off_part(relic, mastery, quantities, owned_parts),
+                parts_owned: worst_off_part(relic, ctx.mastery, ctx.quantities, ctx.owned_parts),
             })
         })
         .collect();
@@ -669,7 +677,7 @@ pub(crate) fn all_relic_sources(
 /// mirroring [`sell_picks`]; a key missing from either map is treated the same
 /// as an explicit `None`.
 ///
-/// `owned_parts` is the Inventory/Sell screen's scanned owned-Prime-Part
+/// `ctx.owned_parts` is the Inventory/Sell screen's scanned owned-Prime-Part
 /// counts (see [`crate::OwnedPrimeParts`]), used only to populate each
 /// [`PrimePartGroup::owned`] — it plays no role in which primes/parts appear
 /// or how they're ranked (that's still driven entirely by `owned`, the
@@ -678,12 +686,9 @@ pub fn mastery_plan(
     owned: &HashMap<String, RelicEvidence>,
     prices: &HashMap<String, Option<u32>>,
     set_prices: &HashMap<String, Option<u32>>,
-    index: &RelicIndex,
-    mastery: &MasterySet,
-    quantities: &PartQuantities,
-    owned_parts: &crate::OwnedPrimeParts,
+    ctx: &RelicContext,
 ) -> Vec<PrimePlan> {
-    let (by_prime, prime_relic_evidence) = relic_sourced_parts(owned, prices, index, mastery);
+    let (by_prime, prime_relic_evidence) = relic_sourced_parts(owned, prices, ctx.index, ctx.mastery);
 
     let mut plans: Vec<PrimePlan> = by_prime
         .into_iter()
@@ -699,8 +704,8 @@ pub fn mastery_plan(
                             .then_with(|| evidence_rank(b.evidence).cmp(&evidence_rank(a.evidence)))
                             .then_with(|| a.relic_display.cmp(&b.relic_display))
                     });
-                    let build_quantity = quantities.get(&pp);
-                    let owned = crate::owned_parts::get(owned_parts, &pp);
+                    let build_quantity = ctx.quantities.get(&pp);
+                    let owned = crate::owned_parts::get(ctx.owned_parts, &pp);
                     PrimePartGroup { part: pp, build_quantity, owned, relics }
                 })
                 .collect();
@@ -875,10 +880,12 @@ mod tests {
         let picks = sell_picks(
             &owned,
             &prices,
-            &idx,
-            &mastery,
-            &PartQuantities::empty(),
-            &crate::OwnedPrimeParts::new(),
+            &RelicContext {
+                index: &idx,
+                mastery: &mastery,
+                quantities: &PartQuantities::empty(),
+                owned_parts: &crate::OwnedPrimeParts::new(),
+            },
         );
 
         assert_eq!(picks.len(), 1);
@@ -897,10 +904,12 @@ mod tests {
         let picks = sell_picks(
             &owned,
             &prices,
-            &idx,
-            &MasterySet::default(),
-            &PartQuantities::empty(),
-            &crate::OwnedPrimeParts::new(),
+            &RelicContext {
+                index: &idx,
+                mastery: &MasterySet::default(),
+                quantities: &PartQuantities::empty(),
+                owned_parts: &crate::OwnedPrimeParts::new(),
+            },
         );
 
         assert_eq!(picks.len(), 1);
@@ -927,10 +936,12 @@ mod tests {
         let picks = sell_picks(
             &owned,
             &prices,
-            &idx,
-            &MasterySet::default(),
-            &PartQuantities::empty(),
-            &crate::OwnedPrimeParts::new(),
+            &RelicContext {
+                index: &idx,
+                mastery: &MasterySet::default(),
+                quantities: &PartQuantities::empty(),
+                owned_parts: &crate::OwnedPrimeParts::new(),
+            },
         );
 
         assert_eq!(picks.iter().map(|p| p.display.as_str()).collect::<Vec<_>>(), vec!["Meso B2", "Axi A1"]);
@@ -946,10 +957,12 @@ mod tests {
         let picks = sell_picks(
             &owned,
             &HashMap::new(),
-            &idx,
-            &mastery,
-            &PartQuantities::empty(),
-            &crate::OwnedPrimeParts::new(),
+            &RelicContext {
+                index: &idx,
+                mastery: &mastery,
+                quantities: &PartQuantities::empty(),
+                owned_parts: &crate::OwnedPrimeParts::new(),
+            },
         );
 
         assert_eq!(picks[0].parts_owned, None);
@@ -976,8 +989,16 @@ mod tests {
             2,
         );
 
-        let picks =
-            sell_picks(&owned, &HashMap::new(), &idx, &MasterySet::default(), &quantities, &owned_parts);
+        let picks = sell_picks(
+            &owned,
+            &HashMap::new(),
+            &RelicContext {
+                index: &idx,
+                mastery: &MasterySet::default(),
+                quantities: &quantities,
+                owned_parts: &owned_parts,
+            },
+        );
 
         let summary = picks[0].parts_owned.as_ref().unwrap();
         assert_eq!(summary.part.part, "Link"); // unscanned always sorts worst
@@ -1009,8 +1030,16 @@ mod tests {
             2,
         );
 
-        let picks =
-            sell_picks(&owned, &HashMap::new(), &idx, &MasterySet::default(), &quantities, &owned_parts);
+        let picks = sell_picks(
+            &owned,
+            &HashMap::new(),
+            &RelicContext {
+                index: &idx,
+                mastery: &MasterySet::default(),
+                quantities: &quantities,
+                owned_parts: &owned_parts,
+            },
+        );
 
         let summary = picks[0].parts_owned.as_ref().unwrap();
         assert_eq!(summary.part.part, "Barrel");
@@ -1084,10 +1113,12 @@ mod tests {
             &owned,
             &HashMap::new(),
             &HashMap::new(),
-            &idx,
-            &mastery,
-            &PartQuantities::empty(),
-            &crate::OwnedPrimeParts::new(),
+            &RelicContext {
+                index: &idx,
+                mastery: &mastery,
+                quantities: &PartQuantities::empty(),
+                owned_parts: &crate::OwnedPrimeParts::new(),
+            },
         );
 
         // Akstiletto Prime's Barrel and Receiver are two different parts, each
@@ -1137,10 +1168,12 @@ mod tests {
             &owned,
             &prices,
             &HashMap::new(),
-            &idx,
-            &MasterySet::default(),
-            &PartQuantities::empty(),
-            &crate::OwnedPrimeParts::new(),
+            &RelicContext {
+                index: &idx,
+                mastery: &MasterySet::default(),
+                quantities: &PartQuantities::empty(),
+                owned_parts: &crate::OwnedPrimeParts::new(),
+            },
         );
 
         let rubico = plans.iter().find(|p| p.prime == "Rubico Prime").unwrap();
@@ -1168,10 +1201,12 @@ mod tests {
             &owned,
             &HashMap::new(),
             &HashMap::new(),
-            &idx,
-            &MasterySet::default(),
-            &PartQuantities::empty(),
-            &crate::OwnedPrimeParts::new(),
+            &RelicContext {
+                index: &idx,
+                mastery: &MasterySet::default(),
+                quantities: &PartQuantities::empty(),
+                owned_parts: &crate::OwnedPrimeParts::new(),
+            },
         );
 
         let loki = plans.iter().find(|p| p.prime == "Loki Prime").unwrap();
@@ -1195,10 +1230,12 @@ mod tests {
             &owned,
             &HashMap::new(),
             &HashMap::new(),
-            &idx,
-            &MasterySet::default(),
-            &quantities,
-            &crate::OwnedPrimeParts::new(),
+            &RelicContext {
+                index: &idx,
+                mastery: &MasterySet::default(),
+                quantities: &quantities,
+                owned_parts: &crate::OwnedPrimeParts::new(),
+            },
         );
 
         let afuris = plans.iter().find(|p| p.prime == "Afuris Prime").unwrap();
@@ -1223,10 +1260,12 @@ mod tests {
             &owned,
             &HashMap::new(),
             &HashMap::new(),
-            &idx,
-            &MasterySet::default(),
-            &PartQuantities::empty(),
-            &owned_parts,
+            &RelicContext {
+                index: &idx,
+                mastery: &MasterySet::default(),
+                quantities: &PartQuantities::empty(),
+                owned_parts: &owned_parts,
+            },
         );
 
         let afuris = plans.iter().find(|p| p.prime == "Afuris Prime").unwrap();
@@ -1249,10 +1288,12 @@ mod tests {
             &owned,
             &HashMap::new(),
             &HashMap::new(),
-            &idx,
-            &MasterySet::default(),
-            &PartQuantities::empty(),
-            &crate::OwnedPrimeParts::new(),
+            &RelicContext {
+                index: &idx,
+                mastery: &MasterySet::default(),
+                quantities: &PartQuantities::empty(),
+                owned_parts: &crate::OwnedPrimeParts::new(),
+            },
         );
 
         let afentis = plans.iter().find(|p| p.prime == "Afentis Prime").unwrap();
@@ -1287,10 +1328,12 @@ mod tests {
             &evidence,
             &HashMap::new(),
             &HashMap::new(),
-            &idx,
-            &MasterySet::default(),
-            &PartQuantities::empty(),
-            &crate::OwnedPrimeParts::new(),
+            &RelicContext {
+                index: &idx,
+                mastery: &MasterySet::default(),
+                quantities: &PartQuantities::empty(),
+                owned_parts: &crate::OwnedPrimeParts::new(),
+            },
         );
 
         let kompressa = plans.iter().find(|p| p.prime == "Kompressa Prime").unwrap();
