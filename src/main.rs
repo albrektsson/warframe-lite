@@ -1227,6 +1227,26 @@ const CATALOGUE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 /// Mastery data is refreshed at most this often (it changes slowly).
 const MASTERY_TTL: Duration = Duration::from_secs(24 * 3600);
 
+/// Ceiling on the worldstate-refresh backoff (see `worldstate_retry_interval`)
+/// — long enough to stop hammering a struggling warframestat.us, short enough
+/// that fissures come back within a reasonable window once it recovers.
+const WORLDSTATE_RETRY_CAP: Duration = Duration::from_secs(600);
+
+/// Retry interval for the overlay's worldstate refresh loop, given how many
+/// fetches have failed in a row: `base` on a clean run, doubling per
+/// consecutive failure and capped at [`WORLDSTATE_RETRY_CAP`] (issue #40 — a
+/// struggling/erroring API shouldn't be polled at the steady-state cadence
+/// forever). Resets to `base` the moment a fetch succeeds.
+fn worldstate_retry_interval(base: Duration, consecutive_failures: u32) -> Duration {
+    if consecutive_failures == 0 {
+        return base;
+    }
+    // Cap the shift, not just the result: `1u32 << 32` panics, and this many
+    // consecutive failures already blows past the cap many times over.
+    let multiplier = 1u32 << consecutive_failures.min(16);
+    base.checked_mul(multiplier).unwrap_or(WORLDSTATE_RETRY_CAP).min(WORLDSTATE_RETRY_CAP)
+}
+
 /// Load the player's mastered set (cached) if an account id is configured,
 /// otherwise an empty set (mastery indicators simply off).
 async fn load_mastery(config: &Config, client: &reqwest::Client) -> wf_relic::MasterySet {
@@ -1351,9 +1371,20 @@ async fn run_overlay(config: Config) -> Result<()> {
         config.overlay.margin_y,
         if show_fissures { "on" } else { "reward-only" },
     );
-    let ws = worldstate::fetch(&client, &platform)
-        .await
-        .context("initial worldstate fetch")?;
+    // A failed initial fetch (warframestat.us down/erroring right at launch —
+    // see issue #40) must never take the overlay down with it: start with an
+    // empty world-state and let the refresh loop below fill it in once the API
+    // recovers, backing off its retry cadence the same way it would for any
+    // later failure (`consecutive_failures` seeds at 1 here, not 0).
+    let mut consecutive_failures: u32 = 0;
+    let ws = match worldstate::fetch(&client, &platform).await {
+        Ok(ws) => ws,
+        Err(e) => {
+            tracing::warn!("initial worldstate fetch failed: {e:#} — starting with empty fissures");
+            consecutive_failures = 1;
+            worldstate::WorldState::default()
+        }
+    };
     let initial = make_frame(&ws, visible.load(Ordering::Relaxed));
 
     let (tx, rx) = mpsc::channel();
@@ -1497,11 +1528,14 @@ async fn run_overlay(config: Config) -> Result<()> {
             // later starts again (a fresh fissure of the same era) re-triggers
             // pre-warming instead of being skipped forever.
             let mut warmed_tiers: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut consecutive_failures = consecutive_failures;
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                if last_fetch.elapsed() >= refresh {
+                let interval = worldstate_retry_interval(refresh, consecutive_failures);
+                if last_fetch.elapsed() >= interval {
                     match worldstate::fetch(&client, &platform).await {
                         Ok(fresh) => {
+                            consecutive_failures = 0;
                             if let Some(ctx) = &prewarm_ctx {
                                 let active = fresh.active_fissure_tiers();
                                 warmed_tiers.retain(|t| active.contains(t));
@@ -1514,7 +1548,14 @@ async fn run_overlay(config: Config) -> Result<()> {
                             }
                             cached = fresh;
                         }
-                        Err(e) => tracing::warn!("worldstate refresh failed: {e:#}"),
+                        Err(e) => {
+                            consecutive_failures += 1;
+                            let next = worldstate_retry_interval(refresh, consecutive_failures);
+                            tracing::warn!(
+                                "worldstate refresh failed: {e:#} — backing off to {}s",
+                                next.as_secs()
+                            );
+                        }
                     }
                     last_fetch = tokio::time::Instant::now();
                 }
@@ -2222,5 +2263,31 @@ mod clipboard_tests {
     #[test]
     fn falls_back_to_name_when_plat_unresolved() {
         assert_eq!(clipboard_text(&row("Volnus Prime Blueprint", None)), "Volnus Prime Blueprint");
+    }
+}
+
+#[cfg(test)]
+mod worldstate_retry_tests {
+    use super::worldstate_retry_interval;
+    use std::time::Duration;
+
+    #[test]
+    fn no_failures_uses_the_base_interval() {
+        assert_eq!(worldstate_retry_interval(Duration::from_secs(60), 0), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn doubles_per_consecutive_failure() {
+        let base = Duration::from_secs(60);
+        assert_eq!(worldstate_retry_interval(base, 1), Duration::from_secs(120));
+        assert_eq!(worldstate_retry_interval(base, 2), Duration::from_secs(240));
+        assert_eq!(worldstate_retry_interval(base, 3), Duration::from_secs(480));
+    }
+
+    #[test]
+    fn caps_at_ten_minutes() {
+        let base = Duration::from_secs(60);
+        assert_eq!(worldstate_retry_interval(base, 4), Duration::from_secs(600));
+        assert_eq!(worldstate_retry_interval(base, 30), Duration::from_secs(600));
     }
 }
