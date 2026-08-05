@@ -68,6 +68,26 @@ impl PartQuantities {
         self.map.get(&(part.prime.clone(), part.part.clone())).copied()
     }
 
+    /// Every known `(part label, build quantity)` pair for `prime` — the full
+    /// component list independent of any relic drop table (see the module
+    /// doc), the basis for a full-BOM view. Empty when `prime` isn't in the
+    /// catalogue.
+    pub fn parts_for(&self, prime: &str) -> Vec<(String, u32)> {
+        self.map
+            .iter()
+            .filter(|((p, _), _)| p == prime)
+            .map(|((_, part), &quantity)| (part.clone(), quantity))
+            .collect()
+    }
+
+    /// Every distinct Prime name in this catalogue, sorted alphabetically.
+    pub fn primes(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.map.keys().map(|(p, _)| p.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
     /// Whether `prime` is a known Prime item name in this catalogue — the
     /// authoritative check [`crate::mastery::inventory_prime_part`] uses to
     /// accept or reject an OCR'd Inventory/Sell card label, replacing a raw
@@ -221,6 +241,29 @@ mod tests {
             quantities.get(&PrimePart { prime: "Afuris Prime".to_string(), part: "Link".to_string() }),
             Some(1)
         );
+    }
+
+    #[test]
+    fn parts_for_returns_every_component_for_a_known_prime_and_empty_for_unknown() {
+        let quantities = PartQuantities::from_entries_for_test(vec![
+            ("Afuris Prime".to_string(), "Barrel".to_string(), 2),
+            ("Afuris Prime".to_string(), "Link".to_string(), 1),
+            ("Loki Prime".to_string(), "Systems".to_string(), 1),
+        ]);
+        let mut afuris = quantities.parts_for("Afuris Prime");
+        afuris.sort();
+        assert_eq!(afuris, vec![("Barrel".to_string(), 2), ("Link".to_string(), 1)]);
+        assert!(quantities.parts_for("Nonexistent Prime").is_empty());
+    }
+
+    #[test]
+    fn primes_is_sorted_and_deduped() {
+        let quantities = PartQuantities::from_entries_for_test(vec![
+            ("Loki Prime".to_string(), "Systems".to_string(), 1),
+            ("Afuris Prime".to_string(), "Barrel".to_string(), 2),
+            ("Afuris Prime".to_string(), "Link".to_string(), 1),
+        ]);
+        assert_eq!(quantities.primes(), vec!["Afuris Prime", "Loki Prime"]);
     }
 
     #[test]

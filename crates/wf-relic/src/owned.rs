@@ -7,9 +7,12 @@
 //! trust tiers (see ADR-0009): **Seen** ([`mark_seen`]), set from a single
 //! clean identity read, and a **Confirmed count** ([`apply_confirmed_count`]),
 //! which still requires two agreeing frames (ADR-0005 unchanged). The fissure
-//! planners only ever consume the Intact projection ([`intact_counts`]), and
+//! planners only ever consume the confirmed-count projection ([`owned_counts`]), and
 //! only entries with a confirmed count — a Seen-but-uncounted relic doesn't
-//! feed those yet, because they need an actual number to rank by.
+//! feed those yet, because they need an actual number to rank by. Confirmed
+//! counts are summed across every refinement ([`owned_counts`]) since a
+//! relic's reward *set* doesn't depend on refinement — only drop chances do —
+//! so a Radiant-only confirmed copy counts exactly like an Intact one.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -107,22 +110,60 @@ fn strip_relic_word(s: &str) -> String {
     t.to_string()
 }
 
-/// Project the owned set to the Intact-only `display → count` map the planners
-/// ([`crate::mastery_plan`], [`crate::sell_picks`], [`crate::farm_picks`])
-/// consume — only entries with a confirmed count (they need an actual number
-/// to rank by; a Seen-but-uncounted relic doesn't feed these yet). Non-Intact
-/// copies are dropped: relic drop tables are Intact-only.
-pub fn intact_counts(owned: &OwnedRelics) -> HashMap<String, u32> {
-    owned
-        .iter()
-        .filter_map(|(code, by_ref)| {
-            let count = by_ref.get(&Refinement::Intact)?.count.as_ref()?;
-            Some((code.clone(), count.value))
+/// Project the owned set to a `display → count` map the planners
+/// ([`crate::sell_picks`], [`crate::farm_picks`]) consume — summing the
+/// confirmed count across every refinement of a relic (a relic's reward *set*
+/// is refinement-independent; only drop chances differ), and dropping codes
+/// with no confirmed count anywhere (they need an actual number to rank by; a
+/// Seen-but-uncounted relic doesn't feed these — see [`owned_evidence`] for
+/// the richer view [`crate::mastery_plan`]/[`crate::bom::buy_or_farm_plan`]
+/// use instead).
+pub fn owned_counts(owned: &OwnedRelics) -> HashMap<String, u32> {
+    owned_evidence(owned)
+        .into_iter()
+        .filter_map(|(code, evidence)| match evidence {
+            RelicEvidence::Confirmed(n) => Some((code, n)),
+            RelicEvidence::SeenOnly => None,
         })
         .collect()
 }
 
-/// How long ago a relic code's Intact count was last confirmed, if it has one.
+/// A relic's ownership trust tier for planning purposes (see ADR-0009):
+/// either a confirmed total count (summed across every refinement) or, absent
+/// any confirmed count, that the relic has merely been seen at least once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelicEvidence {
+    SeenOnly,
+    Confirmed(u32),
+}
+
+/// Project the owned set to a `display → evidence` map: [`RelicEvidence::Confirmed`]
+/// with the confirmed count summed across every refinement when any
+/// refinement has one, else [`RelicEvidence::SeenOnly`] when any refinement
+/// has been seen without ever being confirmed, else the code is absent
+/// entirely. Used by planners that want to surface a part reachable only
+/// through a seen-but-unconfirmed relic rather than silently dropping it.
+pub fn owned_evidence(owned: &OwnedRelics) -> HashMap<String, RelicEvidence> {
+    owned
+        .iter()
+        .filter_map(|(code, by_ref)| {
+            let confirmed: u32 = by_ref.values().filter_map(|e| e.count.as_ref()).map(|c| c.value).sum();
+            if confirmed > 0 {
+                return Some((code.clone(), RelicEvidence::Confirmed(confirmed)));
+            }
+            if by_ref.values().any(|e| e.seen) {
+                return Some((code.clone(), RelicEvidence::SeenOnly));
+            }
+            None
+        })
+        .collect()
+}
+
+/// How long ago a relic code's Intact count was last confirmed, if it has
+/// one. Intact-scoped: a relic whose only confirmed count is a refined copy
+/// (which now still counts toward planning via [`owned_counts`]/
+/// [`owned_evidence`]) has no Intact freshness marker here — a known,
+/// acceptable gap in the staleness indicator, not a planning-correctness bug.
 pub fn intact_age(owned: &OwnedRelics, code: &str) -> Option<Duration> {
     owned.get(code)?.get(&Refinement::Intact)?.count.as_ref().map(|s| s.age())
 }
@@ -231,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn intact_counts_drops_refined_copies_and_uncounted_seen_entries() {
+    fn owned_counts_sums_confirmed_counts_across_refinements() {
         let mut owned: OwnedRelics = HashMap::new();
         owned.insert(
             "Meso B9".to_string(),
@@ -240,14 +281,35 @@ mod tests {
                 (Refinement::Radiant, counted(3, 100)),
             ]),
         );
-        // A relic with only refined copies contributes nothing to the Intact plan.
+        // A relic with only refined copies still counts — refinement doesn't
+        // change the reward set, only drop chances.
         owned.insert("Axi A1".to_string(), HashMap::from([(Refinement::Radiant, counted(2, 100))]));
-        // Seen but never confirmed: doesn't feed the planners yet (ADR-0009).
+        // Seen but never confirmed: doesn't feed owned_counts (ADR-0009) — see
+        // owned_evidence for the richer view that does surface this.
         owned.insert("Lith K1".to_string(), HashMap::from([(Refinement::Intact, seen_only())]));
-        let intact = intact_counts(&owned);
-        assert_eq!(intact.get("Meso B9"), Some(&15));
-        assert_eq!(intact.get("Axi A1"), None);
-        assert_eq!(intact.get("Lith K1"), None);
+        let counts = owned_counts(&owned);
+        assert_eq!(counts.get("Meso B9"), Some(&18));
+        assert_eq!(counts.get("Axi A1"), Some(&2));
+        assert_eq!(counts.get("Lith K1"), None);
+    }
+
+    #[test]
+    fn owned_evidence_prefers_confirmed_over_seen_only_and_reports_seen_only_when_never_counted() {
+        let mut owned: OwnedRelics = HashMap::new();
+        // Confirmed (summed) even though one refinement is only seen.
+        owned.insert(
+            "Meso B9".to_string(),
+            HashMap::from([
+                (Refinement::Intact, counted(15, 100)),
+                (Refinement::Radiant, seen_only()),
+            ]),
+        );
+        // Seen on one refinement, never confirmed on any.
+        owned.insert("Axi A22".to_string(), HashMap::from([(Refinement::Intact, seen_only())]));
+        let evidence = owned_evidence(&owned);
+        assert_eq!(evidence.get("Meso B9"), Some(&RelicEvidence::Confirmed(15)));
+        assert_eq!(evidence.get("Axi A22"), Some(&RelicEvidence::SeenOnly));
+        assert_eq!(evidence.get("Nonexistent"), None);
     }
 
     #[test]

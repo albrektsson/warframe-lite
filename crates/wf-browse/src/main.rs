@@ -197,13 +197,15 @@ fn rarity_color(rarity: &str) -> egui::Color32 {
     }
 }
 
-/// Launch-time-resolved market prices for the Sell tab (relic slug → plat)
-/// and the Farm tab (mastered reward name → plat). Bundled because both are
+/// Launch-time-resolved market prices for the Sell tab (relic slug → plat),
+/// the Farm tab (mastered reward name → plat), and each unmastered built
+/// Prime's Set (built prime name → plat). Bundled because all three are
 /// fetched once in [`load_data`] and travel together everywhere after —
-/// [`LoadedData`], [`Live::compute`], and [`poll`] all need both at once.
+/// [`LoadedData`], [`Live::compute`], and [`poll`] all need them at once.
 struct Prices {
     sell: HashMap<String, Option<u32>>,
     farm: HashMap<String, Option<u32>>,
+    set: HashMap<String, Option<u32>>,
 }
 
 /// The Relics & Plan / Sell / Farm tabs' data — refreshed periodically by
@@ -216,6 +218,10 @@ struct Live {
     sell_picks: Option<Vec<RelicPick>>,
     /// `None` when no relics have been scanned yet.
     farm_picks: Option<Vec<FarmPick>>,
+    /// The Buy-or-Farm tab's full-BOM view — always populated (driven by
+    /// `PartQuantities`/mastery, not owned-relic evidence), unlike the other
+    /// three fields above.
+    bom_plans: Vec<wf_relic::BomPlan>,
     /// Freshest and stalest Intact scan ages `(newest, oldest)`, for the summary
     /// line; `None` when nothing has been scanned.
     owned_age_range: Option<(Duration, Duration)>,
@@ -245,20 +251,31 @@ impl Live {
         prices: &Prices,
         active_tiers: HashSet<String>,
     ) -> Self {
-        // The planners consume the Intact-only projection (relic drop tables are
-        // Intact-only); refined copies are tracked but excluded here.
-        let intact = owned.map(|o| wf_relic::intact_counts(&o.value));
+        // sell_picks/farm_picks only rank relics with a confirmed count;
+        // mastery_plan additionally surfaces seen-but-unconfirmed relics via
+        // the richer evidence map (see wf_relic::owned_evidence).
+        let counts = owned.map(|o| wf_relic::owned_counts(&o.value));
+        let evidence = owned.map(|o| wf_relic::owned_evidence(&o.value));
         // mastery_plan/sell_picks/farm_picks already rank their output.
-        let plans = intact
-            .as_ref()
-            .map(|c| wf_relic::mastery_plan(c, &prices.sell, index, mastery, quantities, owned_parts));
-        let sell_picks = intact.as_ref().map(|c| {
+        let plans = evidence.as_ref().map(|e| {
+            wf_relic::mastery_plan(e, &prices.sell, &prices.set, index, mastery, quantities, owned_parts)
+        });
+        let sell_picks = counts.as_ref().map(|c| {
             wf_relic::sell_picks(c, &prices.sell, index, mastery, quantities, owned_parts)
         });
-        let farm_picks = intact.as_ref().map(|c| wf_relic::farm_picks(c, &prices.farm, index, mastery));
+        let farm_picks = counts.as_ref().map(|c| wf_relic::farm_picks(c, &prices.farm, index, mastery));
+        let bom_plans = wf_relic::buy_or_farm_plan(
+            &evidence.unwrap_or_default(),
+            &prices.sell,
+            &prices.set,
+            index,
+            mastery,
+            quantities,
+            owned_parts,
+        );
         let owned_age_range = owned.and_then(|o| wf_relic::intact_age_range(&o.value));
         let ages = owned.map(|o| wf_relic::intact_ages(&o.value)).unwrap_or_default();
-        Self { plans, sell_picks, farm_picks, owned_age_range, ages, active_tiers }
+        Self { plans, sell_picks, farm_picks, bom_plans, owned_age_range, ages, active_tiers }
     }
 }
 
@@ -371,36 +388,49 @@ async fn load_data(config: &Config) -> LoadedData {
         .map(|ws| ws.active_fissure_tiers())
         .unwrap_or_default();
 
+    let market = wf_data::market::MarketClient::new(client.clone(), config.market_platform.clone());
+    let cache = wf_relic::price_cache();
+    let item_index = ItemIndex::load_cached(&client, CATALOGUE_TTL).await.unwrap_or_else(|e| {
+        tracing::warn!("item catalogue load failed: {e:#}");
+        ItemIndex::new(Vec::new())
+    });
+
     let mut sell_prices = HashMap::new();
     let mut farm_prices = HashMap::new();
     if let Some(owned) = &owned {
-        // Prices are only needed for relics with an Intact count (what the tabs
-        // rank); refined-only copies don't drive the guide.
-        let intact = wf_relic::intact_counts(&owned.value);
-        let market = wf_data::market::MarketClient::new(client.clone(), config.market_platform.clone());
-        let cache = wf_relic::price_cache();
+        // Prices are only needed for relics with a confirmed count (what the
+        // tabs rank); seen-only copies don't drive the guide.
+        let counts = wf_relic::owned_counts(&owned.value);
 
         let relic_slugs: Vec<String> = index
             .all()
             .iter()
-            .filter(|relic| intact.get(&relic.display).copied().unwrap_or(0) > 0)
+            .filter(|relic| counts.get(&relic.display).copied().unwrap_or(0) > 0)
             .map(|relic| relic.slug())
             .collect();
         sell_prices = fetch_prices(relic_slugs, &cache, &market, |slug| (slug.clone(), slug)).await;
 
-        let item_index = ItemIndex::load_cached(&client, CATALOGUE_TTL).await.unwrap_or_else(|e| {
-            tracing::warn!("item catalogue load failed: {e:#}");
-            ItemIndex::new(Vec::new())
-        });
-        let reward_names = wf_relic::farm_reward_names(&intact, &index, &mastery);
+        let reward_names = wf_relic::farm_reward_names(&counts, &index, &mastery);
         let resolved: Vec<(String, String)> = reward_names
             .into_iter()
             .filter_map(|name| item_index.best_match(&name).map(|m| (name, m.item.slug.clone())))
             .collect();
         farm_prices = fetch_prices(resolved, &cache, &market, |(name, slug)| (name, slug)).await;
-
-        cache.save();
     }
+
+    // Set prices are needed for the Buy-or-Farm tab regardless of whether any
+    // relics have been scanned yet — it's driven by PartQuantities/mastery,
+    // not owned-relic evidence.
+    let unmastered = wf_relic::unmastered_primes(&quantities, &mastery);
+    let resolved_sets: Vec<(String, String)> = unmastered
+        .into_iter()
+        .filter_map(|prime| {
+            item_index.best_match(&format!("{prime} Set")).map(|m| (prime, m.item.slug.clone()))
+        })
+        .collect();
+    let set_prices = fetch_prices(resolved_sets, &cache, &market, |(prime, slug)| (prime, slug)).await;
+
+    cache.save();
 
     LoadedData {
         index,
@@ -409,15 +439,16 @@ async fn load_data(config: &Config) -> LoadedData {
         owned,
         owned_parts,
         active_tiers,
-        prices: Prices { sell: sell_prices, farm: farm_prices },
+        prices: Prices { sell: sell_prices, farm: farm_prices, set: set_prices },
     }
 }
 
-/// The browser's tabs: Mastery, Relics & Plan, Sell, Farm, and Owned.
+/// The browser's tabs: Mastery, Relics & Plan, Buy or Farm, Sell, Farm, and Owned.
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
     Mastery,
     Relics,
+    BuyOrFarm,
     Sell,
     Farm,
     Owned,
@@ -608,6 +639,7 @@ impl BrowseApp {
                 ui.horizontal(|ui| {
                     ui.strong(&p.prime);
                     ui.weak(format!("owned {}", p.total_owned));
+                    ui.weak(format!("Set: {}", plat_str(p.set_plat)));
                 });
                 egui::Grid::new(format!("relics_plan_grid_{}", p.prime))
                     .num_columns(3)
@@ -629,7 +661,11 @@ impl BrowseApp {
                                     let flag = if is_live { "*" } else { "" };
                                     let stale = stale_marker(&ages, &r.relic_display);
                                     let price = r.plat.map(|p| format!(" ({p}p)")).unwrap_or_default();
-                                    format!("{}{flag} x{}{price}{stale}", r.relic_display, r.owned_count)
+                                    let qty = match r.evidence {
+                                        wf_relic::RelicEvidence::Confirmed(n) => format!("x{n}"),
+                                        wf_relic::RelicEvidence::SeenOnly => "seen".to_string(),
+                                    };
+                                    format!("{}{flag} {qty}{price}{stale}", r.relic_display)
                                 })
                                 .collect::<Vec<_>>()
                                 .join(", ");
@@ -651,6 +687,65 @@ impl BrowseApp {
             .small()
             .weak(),
         );
+    }
+
+    /// The full-BOM "Buy or Farm" tab: every part of every unmastered Prime,
+    /// split into what's still missing (with its cheapest sourcing relic and
+    /// price) and what's already covered, plus each Prime's Set price and
+    /// total gap-fill cost — so buying the Set can be weighed against farming
+    /// the missing pieces.
+    fn buy_or_farm_tab(&mut self, ui: &mut egui::Ui) {
+        let (plans, ages) = {
+            let live = lock_live(&self.live);
+            (live.bom_plans.clone(), live.ages.clone())
+        };
+
+        if plans.is_empty() {
+            ui.label("no unmastered primes found");
+            return;
+        }
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for p in &plans {
+                let total = p.covered + p.gaps.len();
+                ui.horizontal(|ui| {
+                    ui.strong(&p.prime);
+                    ui.weak(format!("{}/{total} parts covered", p.covered));
+                    ui.weak(format!("Set: {}", plat_str(p.set_plat)));
+                    ui.weak(format!("cost to fill: {}", plat_str(p.cost_to_fill)));
+                });
+                if p.gaps.is_empty() {
+                    ui.weak("all parts covered");
+                } else {
+                    egui::Grid::new(format!("buy_or_farm_grid_{}", p.prime))
+                        .num_columns(3)
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.strong("part");
+                            ui.strong("owned / need");
+                            ui.strong("cheapest relic");
+                            ui.end_row();
+
+                            for g in &p.gaps {
+                                let need = owned_need_cell(g.owned, g.build_quantity);
+                                let relic = g
+                                    .relics
+                                    .first()
+                                    .map(|r| {
+                                        let stale = stale_marker(&ages, &r.relic_display);
+                                        format!("{} ({}){stale}", r.relic_display, plat_str(r.plat))
+                                    })
+                                    .unwrap_or_else(|| "—".to_string());
+                                ui.label(&g.part.part);
+                                ui.label(need);
+                                ui.label(relic);
+                                ui.end_row();
+                            }
+                        });
+                }
+                ui.add_space(6.0);
+            }
+        });
     }
 
     fn sell_tab(&mut self, ui: &mut egui::Ui) {
@@ -714,7 +809,7 @@ impl BrowseApp {
                 ui.end_row();
 
                 for p in &picks {
-                    let plat = p.plat.map(|v| format!("{v}p")).unwrap_or_else(|| "—".into());
+                    let plat = plat_str(p.plat);
                     ui.label(&p.display);
                     ui.label(p.count.to_string());
                     ui.label(plat);
@@ -780,7 +875,7 @@ impl BrowseApp {
                 ui.end_row();
 
                 for p in &picks {
-                    let plat = p.plat.map(|v| format!("{v}p")).unwrap_or_else(|| "—".into());
+                    let plat = plat_str(p.plat);
                     ui.label(&p.display);
                     ui.label(p.count.to_string());
                     ui.label(&p.best_reward);
@@ -982,6 +1077,12 @@ fn stale_marker(ages: &HashMap<String, Duration>, display: &str) -> String {
     }
 }
 
+/// Render a resolved plat price, or `"—"` when unresolved — the shared
+/// convention across the Relics & Plan, Sell, Farm, and Buy-or-Farm tabs.
+fn plat_str(v: Option<u32>) -> String {
+    v.map(|v| format!("{v}p")).unwrap_or_else(|| "—".into())
+}
+
 /// The Relics & Plan tab's combined `owned / need` cell, e.g. `"— / x1"`
 /// (never scanned) or `"1 / x1"` (confirmed). Never renders `0` for an
 /// unscanned part — unknown stays `—` (see ADR-0011's precedent, applied to
@@ -1027,6 +1128,7 @@ impl eframe::App for BrowseApp {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Mastery, "Mastery");
                 ui.selectable_value(&mut self.tab, Tab::Relics, "Relics & Plan");
+                ui.selectable_value(&mut self.tab, Tab::BuyOrFarm, "Buy or Farm");
                 ui.selectable_value(&mut self.tab, Tab::Sell, "Sell");
                 ui.selectable_value(&mut self.tab, Tab::Farm, "Farm");
                 ui.selectable_value(&mut self.tab, Tab::Owned, "Owned");
@@ -1036,6 +1138,7 @@ impl eframe::App for BrowseApp {
             match self.tab {
                 Tab::Mastery => self.mastery_tab(ui),
                 Tab::Relics => self.relics_tab(ui),
+                Tab::BuyOrFarm => self.buy_or_farm_tab(ui),
                 Tab::Sell => self.sell_tab(ui),
                 Tab::Farm => self.farm_tab(ui),
                 Tab::Owned => self.owned_tab(ui),

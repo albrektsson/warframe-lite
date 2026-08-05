@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::index::{levenshtein, normalize};
 use crate::mastery::{built_name, prime_part, MasterySet, PrimePart};
+use crate::owned::RelicEvidence;
 use crate::part_quantities::PartQuantities;
 
 const RELICS_URL: &str =
@@ -455,8 +456,9 @@ pub fn mastery_browser(index: &RelicIndex, mastery: &MasterySet) -> Vec<MasteryE
 pub struct PrimeRelicSource {
     /// Relic label, e.g. "Axi H3".
     pub relic_display: String,
-    /// How many the player owns.
-    pub owned_count: u32,
+    /// Ownership evidence: a confirmed total count, or merely seen with no
+    /// confirmed count yet (see [`RelicEvidence`]).
+    pub evidence: RelicEvidence,
     /// Drop rarity of this part within this relic (Common/Uncommon/Rare).
     pub rarity: String,
     /// Lowest market sell price in platinum, if resolved.
@@ -492,50 +494,50 @@ pub struct PrimePlan {
     pub prime: String,
     /// This prime's parts, each with their own sourcing relics.
     pub parts: Vec<PrimePartGroup>,
-    /// Sum of owned counts across all distinct sourcing relics (a relic
-    /// counted once even if it drops more than one of this prime's parts) —
+    /// Sum of confirmed owned counts across all distinct sourcing relics (a
+    /// relic counted once even if it drops more than one of this prime's
+    /// parts, and a seen-only relic with no confirmed count contributing 0) —
     /// a rough farming budget.
     pub total_owned: u32,
+    /// Lowest market sell price in platinum for the whole built-prime Set, if
+    /// resolved.
+    pub set_plat: Option<u32>,
 }
 
-/// Build a fissure-planning view from an owned-relic count map (relic display →
-/// count): for every unmastered prime the player's relics can still drop, broken
-/// down by Prime Part, which relics (and how many of each) can drop it. Ranked
-/// by `total_owned` descending, so the primes with the most farming budget
-/// already in hand come first; parts within a prime are ranked the same way.
-///
-/// Prices come from a caller-supplied map (relic market slug →
-/// already-resolved plat, `None` where unresolved) rather than being fetched
-/// inline, keeping this pure and mirroring [`sell_picks`]; a slug missing from
-/// the map is treated the same as an explicit `None`.
-///
-/// `owned_parts` is the Inventory/Sell screen's scanned owned-Prime-Part
-/// counts (see [`crate::OwnedPrimeParts`]), used only to populate each
-/// [`PrimePartGroup::owned`] — it plays no role in which primes/parts appear
-/// or how they're ranked (that's still driven entirely by `owned`, the
-/// owned-*relic* counts).
-pub fn mastery_plan(
-    owned: &std::collections::HashMap<String, u32>,
+/// A relic's evidence rank for sort tie-breaking: `Confirmed` outranks
+/// `SeenOnly`, and among `Confirmed` a higher count outranks a lower one.
+pub(crate) fn evidence_rank(evidence: RelicEvidence) -> (u8, u32) {
+    match evidence {
+        RelicEvidence::Confirmed(n) => (1, n),
+        RelicEvidence::SeenOnly => (0, 0),
+    }
+}
+
+pub(crate) type RelicGroups =
+    std::collections::HashMap<String, std::collections::HashMap<PrimePart, Vec<PrimeRelicSource>>>;
+pub(crate) type PrimeRelicEvidence =
+    std::collections::HashMap<String, std::collections::HashMap<String, RelicEvidence>>;
+
+/// Walk every relic the player has any evidence for (confirmed or seen-only),
+/// grouping its still-unmastered rewards by [`PrimePart`] — the shared core of
+/// [`mastery_plan`] and [`crate::bom::buy_or_farm_plan`], which both need "which
+/// relics can still drop this prime's parts" but differ in which primes/parts
+/// they surface. Also returns, per prime, each contributing relic's evidence
+/// (deduped per relic even when it drops more than one of that prime's parts)
+/// so callers can derive a farming-budget total without re-walking relics.
+pub(crate) fn relic_sourced_parts(
+    owned: &HashMap<String, RelicEvidence>,
     prices: &HashMap<String, Option<u32>>,
     index: &RelicIndex,
     mastery: &MasterySet,
-    quantities: &PartQuantities,
-    owned_parts: &crate::OwnedPrimeParts,
-) -> Vec<PrimePlan> {
-    let mut by_prime: std::collections::HashMap<String, std::collections::HashMap<PrimePart, Vec<PrimeRelicSource>>> =
-        std::collections::HashMap::new();
-    // Dedup a relic's contribution to a prime's `total_owned` even when it
-    // drops more than one of that prime's parts.
-    let mut prime_relic_counts: std::collections::HashMap<String, std::collections::HashMap<String, u32>> =
-        std::collections::HashMap::new();
+) -> (RelicGroups, PrimeRelicEvidence) {
+    let mut by_prime: RelicGroups = std::collections::HashMap::new();
+    let mut prime_relic_evidence: PrimeRelicEvidence = std::collections::HashMap::new();
 
     for relic in index.all() {
-        let Some(&count) = owned.get(&relic.display) else {
+        let Some(&evidence) = owned.get(&relic.display) else {
             continue;
         };
-        if count == 0 {
-            continue;
-        }
         let plat = prices.get(&relic.slug()).copied().flatten();
         let mut seen: Vec<PrimePart> = Vec::new();
         for r in unmastered_rewards(relic, mastery) {
@@ -545,16 +547,82 @@ pub fn mastery_plan(
             }
             seen.push(pp.clone());
             by_prime.entry(pp.prime.clone()).or_default().entry(pp.clone()).or_default().push(
-                PrimeRelicSource {
-                    relic_display: relic.display.clone(),
-                    owned_count: count,
-                    rarity: r.rarity.clone(),
-                    plat,
-                },
+                PrimeRelicSource { relic_display: relic.display.clone(), evidence, rarity: r.rarity.clone(), plat },
             );
-            prime_relic_counts.entry(pp.prime).or_default().insert(relic.display.clone(), count);
+            prime_relic_evidence.entry(pp.prime).or_default().insert(relic.display.clone(), evidence);
         }
     }
+    (by_prime, prime_relic_evidence)
+}
+
+/// One relic that can drop a given [`PrimePart`], regardless of whether the
+/// player owns it — a candidate to buy or farm, not a report of what's
+/// already held (contrast [`PrimeRelicSource`]).
+#[derive(Debug, Clone)]
+pub struct RelicOption {
+    pub relic_display: String,
+    /// Lowest market sell price in platinum, if resolved.
+    pub plat: Option<u32>,
+}
+
+/// Every relic in the catalogue that can still drop each still-unmastered
+/// [`PrimePart`] — ownership-independent, so it can name a relic to go buy or
+/// farm even when the player owns none of it yet (unlike
+/// [`relic_sourced_parts`], which only walks relics the player has evidence
+/// for). Cheapest first within each part.
+pub(crate) fn all_relic_sources(
+    prices: &HashMap<String, Option<u32>>,
+    index: &RelicIndex,
+    mastery: &MasterySet,
+) -> HashMap<PrimePart, Vec<RelicOption>> {
+    let mut by_part: HashMap<PrimePart, Vec<RelicOption>> = HashMap::new();
+    for relic in index.all() {
+        let plat = prices.get(&relic.slug()).copied().flatten();
+        let mut seen: Vec<PrimePart> = Vec::new();
+        for r in unmastered_rewards(relic, mastery) {
+            let pp = prime_part(&r.item_name);
+            if seen.contains(&pp) {
+                continue;
+            }
+            seen.push(pp.clone());
+            by_part.entry(pp).or_default().push(RelicOption { relic_display: relic.display.clone(), plat });
+        }
+    }
+    for options in by_part.values_mut() {
+        options.sort_by(|a, b| {
+            a.plat.unwrap_or(u32::MAX).cmp(&b.plat.unwrap_or(u32::MAX)).then_with(|| a.relic_display.cmp(&b.relic_display))
+        });
+    }
+    by_part
+}
+
+/// Build a fissure-planning view from an owned-relic evidence map (relic display →
+/// [`RelicEvidence`]): for every unmastered prime the player's relics can still drop,
+/// broken down by Prime Part, which relics (and their evidence) can drop it. Ranked
+/// by `total_owned` descending, so the primes with the most farming budget
+/// already in hand come first; parts within a prime are ranked the same way.
+///
+/// Prices come from caller-supplied maps (relic market slug → already-resolved
+/// plat, built-prime name → already-resolved Set plat; `None` where
+/// unresolved) rather than being fetched inline, keeping this pure and
+/// mirroring [`sell_picks`]; a key missing from either map is treated the same
+/// as an explicit `None`.
+///
+/// `owned_parts` is the Inventory/Sell screen's scanned owned-Prime-Part
+/// counts (see [`crate::OwnedPrimeParts`]), used only to populate each
+/// [`PrimePartGroup::owned`] — it plays no role in which primes/parts appear
+/// or how they're ranked (that's still driven entirely by `owned`, the
+/// owned-*relic* evidence).
+pub fn mastery_plan(
+    owned: &HashMap<String, RelicEvidence>,
+    prices: &HashMap<String, Option<u32>>,
+    set_prices: &HashMap<String, Option<u32>>,
+    index: &RelicIndex,
+    mastery: &MasterySet,
+    quantities: &PartQuantities,
+    owned_parts: &crate::OwnedPrimeParts,
+) -> Vec<PrimePlan> {
+    let (by_prime, prime_relic_evidence) = relic_sourced_parts(owned, prices, index, mastery);
 
     let mut plans: Vec<PrimePlan> = by_prime
         .into_iter()
@@ -567,7 +635,7 @@ pub fn mastery_plan(
                         a.plat
                             .unwrap_or(u32::MAX)
                             .cmp(&b.plat.unwrap_or(u32::MAX))
-                            .then_with(|| b.owned_count.cmp(&a.owned_count))
+                            .then_with(|| evidence_rank(b.evidence).cmp(&evidence_rank(a.evidence)))
                             .then_with(|| a.relic_display.cmp(&b.relic_display))
                     });
                     let build_quantity = quantities.get(&pp);
@@ -576,8 +644,19 @@ pub fn mastery_plan(
                 })
                 .collect();
             parts.sort_by(|a, b| a.part.part.cmp(&b.part.part));
-            let total_owned = prime_relic_counts.get(&prime).map(|m| m.values().sum()).unwrap_or(0);
-            PrimePlan { prime, parts, total_owned }
+            let total_owned = prime_relic_evidence
+                .get(&prime)
+                .map(|m| {
+                    m.values()
+                        .map(|e| match e {
+                            RelicEvidence::Confirmed(n) => *n,
+                            RelicEvidence::SeenOnly => 0,
+                        })
+                        .sum()
+                })
+                .unwrap_or(0);
+            let set_plat = set_prices.get(&prime).copied().flatten();
+            PrimePlan { prime, parts, total_owned, set_plat }
         })
         .collect();
     plans.sort_by(|a, b| b.total_owned.cmp(&a.total_owned).then_with(|| a.prime.cmp(&b.prime)));
@@ -934,14 +1013,15 @@ mod tests {
         ]);
         let mastery =
             MasterySet::from_xp([("/Lotus/Powersuits/Ember/EmberPrime".to_string(), 9_000_000)]);
-        let owned = std::collections::HashMap::from([
-            ("Axi A1".to_string(), 5),
-            ("Meso N11".to_string(), 2),
-            ("Lith G4".to_string(), 9),  // owned but nothing unmastered → contributes nothing
-            ("Neo V9".to_string(), 3),   // owned but not in the index → ignored
+        let owned = HashMap::from([
+            ("Axi A1".to_string(), RelicEvidence::Confirmed(5)),
+            ("Meso N11".to_string(), RelicEvidence::Confirmed(2)),
+            ("Lith G4".to_string(), RelicEvidence::Confirmed(9)), // owned but nothing unmastered → contributes nothing
+            ("Neo V9".to_string(), RelicEvidence::Confirmed(3)),  // owned but not in the index → ignored
         ]);
         let plans = mastery_plan(
             &owned,
+            &HashMap::new(),
             &HashMap::new(),
             &idx,
             &mastery,
@@ -958,7 +1038,7 @@ mod tests {
         let barrel = aksti.parts.iter().find(|g| g.part.part == "Barrel").unwrap();
         assert_eq!(barrel.relics.len(), 1);
         assert_eq!(barrel.relics[0].relic_display, "Axi A1");
-        assert_eq!(barrel.relics[0].owned_count, 5);
+        assert_eq!(barrel.relics[0].evidence, RelicEvidence::Confirmed(5));
         let receiver = aksti.parts.iter().find(|g| g.part.part == "Receiver").unwrap();
         assert_eq!(receiver.relics[0].relic_display, "Meso N11");
         assert_eq!(plans[0].prime, "Akstiletto Prime");
@@ -982,10 +1062,10 @@ mod tests {
             relic("Lith V1", &["Rubico Prime Barrel"]),
             relic("Meso B4", &["Rubico Prime Barrel"]), // unpriced
         ]);
-        let owned = std::collections::HashMap::from([
-            ("Axi H3".to_string(), 1),
-            ("Lith V1".to_string(), 20),
-            ("Meso B4".to_string(), 5),
+        let owned = HashMap::from([
+            ("Axi H3".to_string(), RelicEvidence::Confirmed(1)),
+            ("Lith V1".to_string(), RelicEvidence::Confirmed(20)),
+            ("Meso B4".to_string(), RelicEvidence::Confirmed(5)),
         ]);
         let prices = std::collections::HashMap::from([
             ("axi_h3_relic".to_string(), Some(50)),
@@ -995,6 +1075,7 @@ mod tests {
         let plans = mastery_plan(
             &owned,
             &prices,
+            &HashMap::new(),
             &idx,
             &MasterySet::default(),
             &PartQuantities::empty(),
@@ -1020,10 +1101,11 @@ mod tests {
             "Axi B2",
             &["Loki Prime Systems Blueprint", "Loki Prime Chassis Blueprint"],
         )]);
-        let owned = std::collections::HashMap::from([("Axi B2".to_string(), 4)]);
+        let owned = HashMap::from([("Axi B2".to_string(), RelicEvidence::Confirmed(4))]);
 
         let plans = mastery_plan(
             &owned,
+            &HashMap::new(),
             &HashMap::new(),
             &idx,
             &MasterySet::default(),
@@ -1034,13 +1116,14 @@ mod tests {
         let loki = plans.iter().find(|p| p.prime == "Loki Prime").unwrap();
         assert_eq!(loki.total_owned, 4);
         assert_eq!(loki.parts.len(), 2);
-        assert!(loki.parts.iter().all(|g| g.relics.len() == 1 && g.relics[0].owned_count == 4));
+        assert!(loki.parts.iter().all(|g| g.relics.len() == 1
+            && g.relics[0].evidence == RelicEvidence::Confirmed(4)));
     }
 
     #[test]
     fn mastery_plan_carries_build_quantity_when_known_and_none_when_unknown() {
         let idx = RelicIndex::new(vec![relic("Axi C3", &["Afuris Prime Barrel", "Afuris Prime Link"])]);
-        let owned = std::collections::HashMap::from([("Axi C3".to_string(), 1)]);
+        let owned = HashMap::from([("Axi C3".to_string(), RelicEvidence::Confirmed(1))]);
         let quantities = PartQuantities::from_entries_for_test(vec![(
             "Afuris Prime".to_string(),
             "Barrel".to_string(),
@@ -1049,6 +1132,7 @@ mod tests {
 
         let plans = mastery_plan(
             &owned,
+            &HashMap::new(),
             &HashMap::new(),
             &idx,
             &MasterySet::default(),
@@ -1066,7 +1150,7 @@ mod tests {
     #[test]
     fn mastery_plan_carries_owned_part_count_when_scanned_and_none_when_unscanned() {
         let idx = RelicIndex::new(vec![relic("Axi C3", &["Afuris Prime Barrel", "Afuris Prime Link"])]);
-        let owned = std::collections::HashMap::from([("Axi C3".to_string(), 1)]);
+        let owned = HashMap::from([("Axi C3".to_string(), RelicEvidence::Confirmed(1))]);
         let mut owned_parts = crate::OwnedPrimeParts::new();
         crate::owned_parts::apply_count(
             &mut owned_parts,
@@ -1076,6 +1160,7 @@ mod tests {
 
         let plans = mastery_plan(
             &owned,
+            &HashMap::new(),
             &HashMap::new(),
             &idx,
             &MasterySet::default(),
@@ -1089,6 +1174,68 @@ mod tests {
         // Never scanned — unknown, not zero.
         let link = afuris.parts.iter().find(|g| g.part.part == "Link").unwrap();
         assert_eq!(link.owned, None);
+    }
+
+    #[test]
+    fn mastery_plan_includes_a_seen_only_relic_with_no_confirmed_copy() {
+        // A relic that's only been Seen (never confirmed, ADR-0009) must still
+        // surface its part — with SeenOnly evidence, not silently omitted, and
+        // it must not count toward the farming-budget total.
+        let idx = RelicIndex::new(vec![relic("Axi A22", &["Afentis Prime Blueprint"])]);
+        let owned = HashMap::from([("Axi A22".to_string(), RelicEvidence::SeenOnly)]);
+
+        let plans = mastery_plan(
+            &owned,
+            &HashMap::new(),
+            &HashMap::new(),
+            &idx,
+            &MasterySet::default(),
+            &PartQuantities::empty(),
+            &crate::OwnedPrimeParts::new(),
+        );
+
+        let afentis = plans.iter().find(|p| p.prime == "Afentis Prime").unwrap();
+        assert_eq!(afentis.total_owned, 0);
+        let blueprint = afentis.parts.iter().find(|g| g.part.part == "Blueprint").unwrap();
+        assert_eq!(blueprint.relics[0].evidence, RelicEvidence::SeenOnly);
+    }
+
+    #[test]
+    fn mastery_plan_surfaces_a_part_whose_only_confirmed_copy_is_radiant() {
+        // Regression test for the reported bug: Kompressa Prime's Barrel was
+        // missing because the only confirmed copy of its sourcing relic (Lith
+        // K12) was Radiant-refined, and the old Intact-only projection
+        // dropped it. Goes through the real owned::owned_evidence projection
+        // (not a hand-built RelicEvidence) so a regression in that plumbing
+        // would also be caught here.
+        let idx = RelicIndex::new(vec![relic("Lith K12", &["Kompressa Prime Barrel"])]);
+        let mut owned: crate::owned::OwnedRelics = HashMap::new();
+        owned.insert(
+            "Lith K12".to_string(),
+            HashMap::from([(
+                crate::owned::Refinement::Radiant,
+                crate::owned::OwnedEntry {
+                    seen: true,
+                    count: Some(wf_cache::Stamped { value: 1, fetched_at: 0 }),
+                },
+            )]),
+        );
+        let evidence = crate::owned::owned_evidence(&owned);
+
+        let plans = mastery_plan(
+            &evidence,
+            &HashMap::new(),
+            &HashMap::new(),
+            &idx,
+            &MasterySet::default(),
+            &PartQuantities::empty(),
+            &crate::OwnedPrimeParts::new(),
+        );
+
+        let kompressa = plans.iter().find(|p| p.prime == "Kompressa Prime").unwrap();
+        let barrel = kompressa.parts.iter().find(|g| g.part.part == "Barrel").unwrap();
+        assert_eq!(barrel.relics[0].evidence, RelicEvidence::Confirmed(1));
+        assert_eq!(kompressa.total_owned, 1);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Relic reward evaluation: turn OCR'd reward names into a ranked, priced list
 //! so the overlay can highlight the most valuable pick.
 
+pub mod bom;
 pub mod index;
 pub mod mastery;
 pub mod owned;
@@ -9,11 +10,13 @@ pub mod part_quantities;
 pub mod regions;
 pub mod relics;
 
+pub use bom::{buy_or_farm_plan, unmastered_primes, BomGap, BomPlan};
 pub use index::ItemIndex;
 pub use mastery::{inventory_prime_part, MasterySet, PrimePart};
 pub use owned::{
-    apply_confirmed_count, clear_entry, intact_age, intact_age_range, intact_ages, intact_counts,
-    mark_seen, parse_refinement, OwnedCount, OwnedEntry, OwnedRelics, Refinement, STALE_AFTER,
+    apply_confirmed_count, clear_entry, intact_age, intact_age_range, intact_ages, mark_seen,
+    owned_counts, owned_evidence, parse_refinement, OwnedCount, OwnedEntry, OwnedRelics,
+    RelicEvidence, Refinement, STALE_AFTER,
 };
 pub use owned_parts::{OwnedPrimeParts, OWNED_PRIME_PARTS_FILE};
 pub use part_quantities::PartQuantities;

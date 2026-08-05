@@ -447,7 +447,7 @@ async fn mastery_plan_cmd(config: &Config) -> Result<()> {
             tracing::warn!("part quantity load failed: {e:#}");
             wf_relic::PartQuantities::empty()
         });
-    let intact = wf_relic::intact_counts(&owned.value);
+    let evidence = wf_relic::owned_evidence(&owned.value);
     let owned_parts = wf_cache::load_blob::<wf_relic::OwnedPrimeParts>(wf_relic::OWNED_PRIME_PARTS_FILE)
         .map(|s| s.value)
         .unwrap_or_default();
@@ -459,7 +459,7 @@ async fn mastery_plan_cmd(config: &Config) -> Result<()> {
     let cache = wf_relic::price_cache();
     let mut relic_prices: std::collections::HashMap<String, Option<u32>> = std::collections::HashMap::new();
     for relic in index.all() {
-        if intact.get(&relic.display).copied().unwrap_or(0) == 0 {
+        if !evidence.contains_key(&relic.display) {
             continue;
         }
         let plat =
@@ -468,8 +468,15 @@ async fn mastery_plan_cmd(config: &Config) -> Result<()> {
     }
     cache.save();
 
-    let plans =
-        wf_relic::mastery_plan(&intact, &relic_prices, &index, &mastery, &quantities, &owned_parts);
+    let plans = wf_relic::mastery_plan(
+        &evidence,
+        &relic_prices,
+        &std::collections::HashMap::new(),
+        &index,
+        &mastery,
+        &quantities,
+        &owned_parts,
+    );
 
     if plans.is_empty() {
         println!("  no unmastered primes found among your scanned relics");
@@ -495,7 +502,11 @@ async fn mastery_plan_cmd(config: &Config) -> Result<()> {
                     let live =
                         if active_tiers.contains(wf_relic::tier_of(&r.relic_display)) { "*" } else { "" };
                     let price = r.plat.map(|p| format!(" ({p}p)")).unwrap_or_default();
-                    format!("{}{live} x{}{price}", r.relic_display, r.owned_count)
+                    let qty = match r.evidence {
+                        wf_relic::RelicEvidence::Confirmed(n) => format!("x{n}"),
+                        wf_relic::RelicEvidence::SeenOnly => "seen".to_string(),
+                    };
+                    format!("{}{live} {qty}{price}", r.relic_display)
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
