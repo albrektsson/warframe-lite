@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::index::{levenshtein, normalize};
+use crate::index::{levenshtein, normalize, ItemIndex};
 use crate::mastery::{built_name, prime_part, MasterySet, PrimePart};
 use crate::owned::RelicEvidence;
 use crate::part_quantities::PartQuantities;
@@ -246,6 +246,39 @@ pub const OWNED_RELICS_FILE: &str = "owned-relics.json";
 /// The era prefix of a relic display label, e.g. `"Axi H3"` → `"Axi"`.
 pub fn tier_of(relic_display: &str) -> &str {
     relic_display.split_whitespace().next().unwrap_or("")
+}
+
+/// Reward catalogue name → vaulted status, joining each relic's drop table
+/// against the item catalogue's per-relic `vaulted` flag — a free read over
+/// data both `RelicIndex` and `ItemIndex` already have cached, no new network
+/// call. A reward is vaulted only when **every** relic that can drop it
+/// resolves (by [`RelicInfo::slug`]) to a catalogue entry with
+/// `vaulted == true` — the strict, conservative reading, since a live scan
+/// resolves reward names but not which specific relic on a mixed-squad
+/// screen produced them. A reward with no known source relic is absent from
+/// the map (unknown ≠ vaulted).
+pub fn vaulted_rewards(relics: &RelicIndex, items: &ItemIndex) -> HashMap<String, bool> {
+    let mut sources: HashMap<String, Vec<&RelicInfo>> = HashMap::new();
+    for relic in relics.all() {
+        for r in &relic.rewards {
+            // Resolve through the catalogue (rather than keying on the raw
+            // relics.json name) so the map's keys line up exactly with
+            // `RewardEval::matched_name`, which is always a catalogue name.
+            let Some(m) = items.best_match(&r.item_name) else {
+                continue;
+            };
+            sources.entry(m.item.name.clone()).or_default().push(relic);
+        }
+    }
+    sources
+        .into_iter()
+        .map(|(name, srcs)| {
+            let vaulted = srcs
+                .iter()
+                .all(|r| items.by_slug(&r.slug()).is_some_and(|i| i.vaulted));
+            (name, vaulted)
+        })
+        .collect()
 }
 
 /// Every owned relic — mastered or not — as a priced, ranked [`RelicPick`],
@@ -1340,5 +1373,42 @@ mod tests {
 
         assert_eq!(picks.len(), 1);
         assert_eq!(picks[0].plat, None);
+    }
+
+    fn catalogue_item(slug: &str, name: &str, vaulted: bool) -> wf_data::items::Item {
+        wf_data::items::Item {
+            slug: slug.to_string(),
+            name: name.to_string(),
+            ducats: None,
+            tags: vec!["prime".to_string()],
+            vaulted,
+        }
+    }
+
+    #[test]
+    fn vaulted_rewards_requires_every_source_relic_vaulted() {
+        let relics = RelicIndex::new(vec![
+            // Sole source of Ember Prime Blueprint, and it's vaulted.
+            relic("Meso E1", &["Ember Prime Blueprint"]),
+            // Two sources of Trinity Prime Blueprint: one vaulted, one not.
+            relic("Axi A1", &["Trinity Prime Blueprint"]),
+            relic("Neo N1", &["Trinity Prime Blueprint"]),
+        ]);
+        let items = ItemIndex::new(vec![
+            catalogue_item("meso_e1_relic", "Meso E1", true),
+            catalogue_item("axi_a1_relic", "Axi A1", true),
+            catalogue_item("neo_n1_relic", "Neo N1", false),
+            catalogue_item("ember_prime_blueprint", "Ember Prime Blueprint", false),
+            catalogue_item("trinity_prime_blueprint", "Trinity Prime Blueprint", false),
+        ]);
+
+        let vaulted = vaulted_rewards(&relics, &items);
+
+        // Every source relic vaulted -> vaulted.
+        assert_eq!(vaulted.get("Ember Prime Blueprint"), Some(&true));
+        // At least one source relic not vaulted -> not vaulted.
+        assert_eq!(vaulted.get("Trinity Prime Blueprint"), Some(&false));
+        // No known source relic at all -> absent, not a panic.
+        assert_eq!(vaulted.get("Volt Prime Blueprint"), None);
     }
 }

@@ -124,12 +124,15 @@ pub struct RewardRow {
     /// guessed `0`) or when the row is mastered (see [`render_reward_panel`]:
     /// only rendered on unmastered rows).
     pub owned_count: Option<u32>,
+    /// Whether every relic that can drop this reward is itself vaulted.
+    pub vaulted: bool,
 }
 
 // Reward panel palette.
 const BEST_BG: Color = Color::rgba(40, 70, 45, 235);
 const PLAT: Color = Color::rgb(120, 200, 255);
 const MASTERED: Color = Color::rgb(130, 200, 140);
+const VAULTED: Color = Color::rgb(235, 165, 70);
 
 // Mastery emblem (laurel wreath): reserved left-column width + gap, and the drawn
 // wreath size.
@@ -137,6 +140,10 @@ const MARK_W: u32 = 20;
 const MARK_GAP: u32 = 6;
 const MARK_INNER_W: u32 = 18;
 const MARK_H: u32 = 16;
+
+// Vaulted badge: reserved column width (in chars, "VLT" + a gap) right before
+// the plat column.
+const VAULT_COLS: f32 = 4.0;
 
 /// Render the relic reward-choice result panel: each choice with its plat/ducat
 /// value, the best-plat row highlighted.
@@ -152,10 +159,13 @@ pub fn render_reward_panel(rows: &[RewardRow], font: &Font) -> Canvas {
 
     let charw = font.metrics('0', FONT_PX).advance_width;
     let plat_x = WIDTH as f32 - PAD as f32 - 6.0 * charw; // "NNNNp"
+    // Reserve a column for the vaulted badge so it never collides with a long
+    // name, whether or not the row is actually vaulted.
+    let vault_x = plat_x - VAULT_COLS * charw;
     // Reserve a left column for the mastery emblem so names stay aligned whether or
     // not a row is mastered.
     let name_x = PAD as f32 + MARK_W as f32 + MARK_GAP as f32;
-    let name_cols = ((plat_x - name_x) / charw).floor() as usize;
+    let name_cols = ((vault_x - name_x) / charw).floor() as usize;
 
     for r in rows {
         // Highlight the best-plat row.
@@ -190,6 +200,11 @@ pub fn render_reward_panel(rows: &[RewardRow], font: &Font) -> Canvas {
                 let name_w = Canvas::text_width(font, &truncated_label, FONT_PX);
                 canvas.draw_text(font, &suffix, name_x + name_w, y as f32, FONT_PX, DIM);
             }
+        }
+
+        // Vaulted badge, in its own reserved column right before the plat value.
+        if r.vaulted {
+            canvas.draw_text(font, "VLT", vault_x, y as f32, FONT_PX, VAULTED);
         }
 
         let plat = r.plat.map(|p| format!("{p}p")).unwrap_or_else(|| "—".into());
@@ -330,6 +345,7 @@ mod tests {
             best_plat: false,
             mastered,
             owned_count,
+            vaulted: false,
         };
 
         // Drawing the "✓3" suffix changes the rendered pixels versus the same

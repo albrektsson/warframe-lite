@@ -5,6 +5,7 @@
 //! every subcommand is dispatched from `main`. `status` shows live Void Fissures
 //! and a bare `<market_slug>` prices that item.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -253,10 +254,17 @@ async fn relic_eval(config: &Config) -> Result<()> {
     println!("  catalogue: {} items", index.len());
     let market = MarketClient::new(client.clone(), config.market_platform.clone());
     let cache = wf_relic::price_cache();
+    let vaulted = load_vaulted(&client, &index).await;
 
-    let evals =
-        wf_relic::evaluate_cached(&names, &index, &market, &cache, wf_relic::PriceOpts::default())
-            .await;
+    let evals = wf_relic::evaluate_cached(
+        &names,
+        &index,
+        &market,
+        &cache,
+        wf_relic::PriceOpts::default(),
+        &vaulted,
+    )
+    .await;
     let mastery = load_mastery(config, &client).await;
     print_reward_table(&evals, &mastery);
     Ok(())
@@ -662,9 +670,16 @@ async fn relic_file(config: &Config) -> Result<()> {
 
     let market = MarketClient::new(client.clone(), config.market_platform.clone());
     let cache = wf_relic::price_cache();
-    let evals =
-        wf_relic::evaluate_cached(&names, &index, &market, &cache, wf_relic::PriceOpts::default())
-            .await;
+    let vaulted = load_vaulted(&client, &index).await;
+    let evals = wf_relic::evaluate_cached(
+        &names,
+        &index,
+        &market,
+        &cache,
+        wf_relic::PriceOpts::default(),
+        &vaulted,
+    )
+    .await;
     let mastery = load_mastery(config, &client).await;
     print_reward_table(&evals, &mastery);
     Ok(())
@@ -1015,9 +1030,16 @@ async fn relic_scan(config: &Config) -> Result<()> {
 
     let market = MarketClient::new(client.clone(), config.market_platform.clone());
     let cache = wf_relic::price_cache();
-    let evals =
-        wf_relic::evaluate_cached(&names, &index, &market, &cache, wf_relic::PriceOpts::default())
-            .await;
+    let vaulted = load_vaulted(&client, &index).await;
+    let evals = wf_relic::evaluate_cached(
+        &names,
+        &index,
+        &market,
+        &cache,
+        wf_relic::PriceOpts::default(),
+        &vaulted,
+    )
+    .await;
     let mastery = load_mastery(config, &client).await;
     print_reward_table(&evals, &mastery);
     Ok(())
@@ -1053,6 +1075,7 @@ fn reward_rows(
                 best_plat: Some(i) == bp,
                 mastered,
                 owned_count,
+                vaulted: e.vaulted,
             }
         })
         .collect()
@@ -1071,9 +1094,16 @@ async fn reward_png(config: &Config) -> Result<()> {
     let index = wf_relic::ItemIndex::load_cached(&client, CATALOGUE_TTL).await?;
     let market = MarketClient::new(client.clone(), config.market_platform.clone());
     let cache = wf_relic::price_cache();
-    let evals =
-        wf_relic::evaluate_cached(&names, &index, &market, &cache, wf_relic::PriceOpts::default())
-            .await;
+    let vaulted = load_vaulted(&client, &index).await;
+    let evals = wf_relic::evaluate_cached(
+        &names,
+        &index,
+        &market,
+        &cache,
+        wf_relic::PriceOpts::default(),
+        &vaulted,
+    )
+    .await;
 
     let mastery = load_mastery(config, &client).await;
     let owned_parts = wf_cache::load_blob::<wf_relic::OwnedPrimeParts>(wf_relic::OWNED_PRIME_PARTS_FILE)
@@ -1198,6 +1228,21 @@ async fn load_mastery(config: &Config, client: &reqwest::Client) -> wf_relic::Ma
     match &config.account_id {
         Some(id) => wf_relic::mastery::load_cached(client, id, MASTERY_TTL).await,
         None => wf_relic::MasterySet::default(),
+    }
+}
+
+/// Best-effort reward-name → vaulted-status lookup (see
+/// [`wf_relic::vaulted_rewards`]): loads the cached relic drop tables and
+/// joins them against `items`. An empty map (no vaulted badges shown) is
+/// returned if the relic tables can't be loaded, so the reward panel still
+/// renders normally.
+async fn load_vaulted(client: &reqwest::Client, items: &wf_relic::ItemIndex) -> HashMap<String, bool> {
+    match wf_relic::RelicIndex::load_cached(client, CATALOGUE_TTL).await {
+        Ok(relics) => wf_relic::vaulted_rewards(&relics, items),
+        Err(e) => {
+            tracing::warn!("relic table load failed ({e:#}); vaulted status unavailable");
+            HashMap::new()
+        }
     }
 }
 
@@ -1327,6 +1372,16 @@ async fn run_overlay(config: Config) -> Result<()> {
                     .await
                     .ok()
                     .map(Arc::new);
+                // Reward-name → vaulted-status lookup (best-effort, empty if the
+                // relic drop tables above didn't load) — computed once here since
+                // it's a pure join over already-cached catalogues, not something
+                // to redo on every reward-screen detection.
+                let vaulted: Arc<HashMap<String, bool>> = Arc::new(
+                    relic_index
+                        .as_ref()
+                        .map(|ri| wf_relic::vaulted_rewards(ri, &index))
+                        .unwrap_or_default(),
+                );
                 // Prime Part build quantities, doubling as the Inventory/Sell
                 // scanner's catalog-matching authority (see
                 // `wf_relic::inventory_prime_part`) — best-effort, same as
@@ -1392,6 +1447,7 @@ async fn run_overlay(config: Config) -> Result<()> {
                         market,
                         cache,
                         mastery,
+                        vaulted,
                         reward,
                         wf_relic::RewardRegions::default_calibration(),
                         relic_deadline,
@@ -1541,6 +1597,7 @@ async fn relic_watch_loop(
     market: MarketClient,
     cache: std::sync::Arc<wf_relic::PriceCache>,
     mastery: std::sync::Arc<wf_relic::MasterySet>,
+    vaulted: std::sync::Arc<HashMap<String, bool>>,
     reward: RewardState,
     regions: wf_relic::RewardRegions,
     relic_deadline: Option<RelicDeadline>,
@@ -1641,9 +1698,15 @@ async fn relic_watch_loop(
             }
         }
 
-        let evals =
-            wf_relic::evaluate_cached(&names, &index, &market, &cache, wf_relic::PriceOpts::default())
-                .await;
+        let evals = wf_relic::evaluate_cached(
+            &names,
+            &index,
+            &market,
+            &cache,
+            wf_relic::PriceOpts::default(),
+            &vaulted,
+        )
+        .await;
         // Re-read fresh each time: the Inventory/Sell scanner (a separate
         // task) can update this file independently of this loop's cadence.
         let owned_parts =

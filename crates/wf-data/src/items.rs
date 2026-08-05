@@ -21,6 +21,10 @@ pub struct Item {
     pub ducats: Option<u32>,
     /// Tags such as "prime", "component", "blueprint".
     pub tags: Vec<String>,
+    /// Whether the item is vaulted (permanently removed from active drop
+    /// tables).
+    #[serde(default)]
+    pub vaulted: bool,
 }
 
 #[derive(Deserialize)]
@@ -35,6 +39,8 @@ struct RawItem {
     ducats: Option<u32>,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default)]
+    vaulted: bool,
     #[serde(default)]
     i18n: HashMap<String, RawI18n>,
 }
@@ -57,6 +63,7 @@ impl RawItem {
             name,
             ducats: self.ducats,
             tags: self.tags,
+            vaulted: self.vaulted,
         })
     }
 }

@@ -72,6 +72,12 @@ impl ItemIndex {
         self.items.is_empty()
     }
 
+    /// Catalogue entry for an exact market slug (e.g. a relic's
+    /// `"axi_h3_relic"`), if present.
+    pub fn by_slug(&self, slug: &str) -> Option<&Item> {
+        self.items.iter().find(|i| i.slug == slug)
+    }
+
     /// Best fuzzy match for `query`, or `None` if nothing clears the threshold.
     pub fn best_match(&self, query: &str) -> Option<Match<'_>> {
         let q = normalize(query);
@@ -155,6 +161,7 @@ mod tests {
             name: name.to_string(),
             ducats,
             tags: vec![],
+            vaulted: false,
         }
     }
 

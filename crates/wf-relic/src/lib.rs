@@ -25,10 +25,11 @@ pub use regions::{
 };
 pub use relics::{
     farm_picks, farm_reward_names, mastery_browser, mastery_plan, rank as rank_relics, sell_picks,
-    tier_of, FarmPick, MasteryEntry, PartsOwnedSummary, PrimePartGroup, PrimePlan, PrimeRelicSource,
-    RelicIndex, RelicInfo, RelicPick, OWNED_RELICS_FILE,
+    tier_of, vaulted_rewards, FarmPick, MasteryEntry, PartsOwnedSummary, PrimePartGroup, PrimePlan,
+    PrimeRelicSource, RelicIndex, RelicInfo, RelicPick, OWNED_RELICS_FILE,
 };
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use wf_data::market::{MarketClient, PriceSummary};
@@ -77,6 +78,9 @@ pub struct RewardEval {
     pub ducats: Option<u32>,
     /// Lowest active sell price in platinum, if resolved.
     pub plat: Option<u32>,
+    /// Whether every relic that can drop this reward is itself vaulted (see
+    /// [`vaulted_rewards`]).
+    pub vaulted: bool,
 }
 
 impl RewardEval {
@@ -88,6 +92,7 @@ impl RewardEval {
             score: 0.0,
             ducats: None,
             plat: None,
+            vaulted: false,
         }
     }
 
@@ -101,6 +106,7 @@ impl RewardEval {
             score: 1.0,
             ducats: None,
             plat: None,
+            vaulted: false,
         }
     }
 }
@@ -129,6 +135,7 @@ pub async fn evaluate(
     names: &[String],
     index: &ItemIndex,
     market: &MarketClient,
+    vaulted: &HashMap<String, bool>,
 ) -> Vec<RewardEval> {
     let mut out = Vec::with_capacity(names.len());
     for name in names {
@@ -149,6 +156,7 @@ pub async fn evaluate(
                 };
                 out.push(RewardEval {
                     ocr: name.clone(),
+                    vaulted: vaulted.get(&m.item.name).copied().unwrap_or(false),
                     matched_name: Some(m.item.name.clone()),
                     slug: Some(slug),
                     score: m.score,
@@ -173,6 +181,7 @@ pub async fn evaluate_cached(
     market: &MarketClient,
     cache: &PriceCache,
     opts: PriceOpts,
+    vaulted: &HashMap<String, bool>,
 ) -> Vec<RewardEval> {
     let resolutions: Vec<Resolution> = names.iter().map(|n| resolve(n, index)).collect();
 
@@ -189,7 +198,7 @@ pub async fn evaluate_cached(
         .iter()
         .zip(resolutions)
         .zip(prices)
-        .map(|((ocr, res), price)| build_eval(ocr.clone(), res, price))
+        .map(|((ocr, res), price)| build_eval(ocr.clone(), res, price, vaulted))
         .collect();
 
     cache.save(); // persist any newly fetched prices
@@ -278,7 +287,12 @@ fn resolve(name: &str, index: &ItemIndex) -> Resolution {
     }
 }
 
-fn build_eval(ocr: String, res: Resolution, price: Option<PriceSummary>) -> RewardEval {
+fn build_eval(
+    ocr: String,
+    res: Resolution,
+    price: Option<PriceSummary>,
+    vaulted: &HashMap<String, bool>,
+) -> RewardEval {
     match res {
         Resolution::Untradable(label) => RewardEval::untradable(ocr, label),
         Resolution::Unresolved => RewardEval::unresolved(ocr),
@@ -288,6 +302,7 @@ fn build_eval(ocr: String, res: Resolution, price: Option<PriceSummary>) -> Rewa
             score,
             ducats,
         } => RewardEval {
+            vaulted: vaulted.get(&name).copied().unwrap_or(false),
             ocr,
             matched_name: Some(name),
             slug: Some(slug),
@@ -364,6 +379,7 @@ mod tests {
             name: name.to_string(),
             ducats: None,
             tags: tags.iter().map(|t| t.to_string()).collect(),
+            vaulted: false,
         }
     }
 
@@ -416,6 +432,7 @@ mod tests {
             score: 1.0,
             ducats,
             plat,
+            vaulted: false,
         }
     }
 
