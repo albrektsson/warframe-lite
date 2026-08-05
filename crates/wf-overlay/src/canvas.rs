@@ -121,6 +121,34 @@ impl Canvas {
         }
     }
 
+    /// Draw a filled five-pointed star inside the `w`×`h` box at top-left
+    /// `(x, y)`, tinted to colour `c`. Drawn as vector geometry (unlike
+    /// [`Self::draw_mastery_mark`]'s bundled icon) so it renders consistently
+    /// regardless of whether the loaded system font happens to include a star
+    /// glyph. Used to flag rewards the player has wishlisted (ADR-0004).
+    pub fn draw_star_mark(&mut self, x: i32, y: i32, w: u32, h: u32, c: Color) {
+        let cx = x as f32 + w as f32 / 2.0;
+        let cy = y as f32 + h as f32 / 2.0;
+        let outer_r = w.min(h) as f32 / 2.0;
+        let inner_r = outer_r * 0.42;
+        let points: Vec<(f32, f32)> = (0..10)
+            .map(|i| {
+                let r = if i % 2 == 0 { outer_r } else { inner_r };
+                let angle = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::PI / 5.0;
+                (cx + r * angle.cos(), cy + r * angle.sin())
+            })
+            .collect();
+        for row in 0..h as i32 {
+            for col in 0..w as i32 {
+                let px = x as f32 + col as f32 + 0.5;
+                let py = y as f32 + row as f32 + 0.5;
+                if point_in_polygon(px, py, &points) {
+                    self.blend(x + col, y + row, c, 1.0);
+                }
+            }
+        }
+    }
+
     /// Draw a run of text with its baseline at `baseline_y`, returning the pen x
     /// position after the last glyph (so callers can chain coloured segments).
     pub fn draw_text(
@@ -226,6 +254,22 @@ fn corner_coverage(px: f32, py: f32, w: f32, h: f32, r: f32) -> f32 {
     (r - d + 0.5).clamp(0.0, 1.0)
 }
 
+/// Ray-casting point-in-polygon test, used by [`Canvas::draw_star_mark`].
+fn point_in_polygon(px: f32, py: f32, points: &[(f32, f32)]) -> bool {
+    let mut inside = false;
+    let n = points.len();
+    let mut j = n - 1;
+    for i in 0..n {
+        let (xi, yi) = points[i];
+        let (xj, yj) = points[j];
+        if (yi > py) != (yj > py) && px < (xj - xi) * (py - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +312,19 @@ mod tests {
         let left = (0..h).flat_map(|y| (0..w / 2).map(move |x| (x, y))).filter(|&(x, y)| opaque(x, y)).count();
         let right = (0..h).flat_map(|y| (w / 2..w).map(move |x| (x, y))).filter(|&(x, y)| opaque(x, y)).count();
         assert!((left as i32 - right as i32).abs() <= 6, "branches should be roughly symmetric ({left} vs {right})");
+    }
+
+    #[test]
+    fn star_mark_draws_symmetric_shape() {
+        let (w, h) = (18u32, 16u32);
+        let mut c = Canvas::new(w, h);
+        c.draw_star_mark(0, 0, w, h, Color::rgb(230, 200, 90));
+        let opaque = |x: u32, y: u32| c.buf[((y * w + x) * 4 + 3) as usize] > 0;
+        let total = c.buf.chunks_exact(4).filter(|p| p[3] > 0).count();
+        assert!(total > 30, "star should cover a meaningful number of pixels, got {total}");
+        let left = (0..h).flat_map(|y| (0..w / 2).map(move |x| (x, y))).filter(|&(x, y)| opaque(x, y)).count();
+        let right = (0..h).flat_map(|y| (w / 2..w).map(move |x| (x, y))).filter(|&(x, y)| opaque(x, y)).count();
+        assert!((left as i32 - right as i32).abs() <= 4, "star should be roughly symmetric ({left} vs {right})");
     }
 
     #[test]

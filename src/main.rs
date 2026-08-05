@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
         Some("capture") => return capture_window(std::env::args().nth(2)),
         Some("overlay-png") => return overlay_png(&config, std::env::args().nth(2)).await,
         Some("overlay") => return run_overlay(config).await,
-        Some(cmd @ ("toggle" | "show" | "hide")) => return overlay_control(cmd),
+        Some(cmd @ ("toggle" | "show" | "hide" | "copy")) => return overlay_control(cmd),
         Some("ocr") => return ocr_test(),
         Some("ocr-file") => return ocr_file(),
         Some("relic-file") => return relic_file(&config).await,
@@ -122,6 +122,7 @@ RUN IT
     settings              Open the graphical settings window
     browse                Open the mastery/relic browser (Mastery/Relics/Sell)
     toggle | show | hide  Show/hide a running overlay
+    copy                  Copy the current best-pick reward (name + plat) to the clipboard
 
 RELICS & MASTERY
     relics <codes…>       Owned-relic guide: unmastered rewards + prices
@@ -1046,16 +1047,19 @@ async fn relic_scan(config: &Config) -> Result<()> {
 }
 
 /// Map evaluated rewards to overlay rows (matched name, plat, best pick,
-/// mastery, owned Prime Part count).
+/// mastery, owned Prime Part count, wishlist status).
 ///
 /// `owned_parts` supplies each unmastered row's `owned_count` — the
 /// Inventory/Sell screen's scanned owned-Prime-Part counts (see issue #37's
 /// downstream-wiring decision). A mastered row never carries a count: the
 /// player already has the item, so "how many parts" stops being interesting.
+/// `wishlist` supplies `wishlisted` via the same matched-name → `PrimePart`
+/// key `wf-browse`'s Mastery tab marks/unmarks (see ADR-0004).
 fn reward_rows(
     evals: &[wf_relic::RewardEval],
     mastery: &wf_relic::MasterySet,
     owned_parts: &wf_relic::OwnedPrimeParts,
+    wishlist: &wf_relic::Wishlist,
 ) -> Vec<wf_overlay::RewardRow> {
     let bp = wf_relic::best_by_plat(evals);
     evals
@@ -1069,6 +1073,9 @@ fn reward_rows(
             let owned_count = e.matched_name.as_deref().filter(|_| !mastered).and_then(|n| {
                 wf_relic::owned_parts::get(owned_parts, &wf_relic::mastery::prime_part(n))
             });
+            let wishlisted = e.matched_name.as_deref().is_some_and(|n| {
+                wishlist.contains(&wf_relic::wishlist::key(&wf_relic::mastery::prime_part(n)))
+            });
             wf_overlay::RewardRow {
                 name: e.matched_name.clone().unwrap_or_else(|| e.ocr.clone()),
                 plat: e.plat,
@@ -1076,6 +1083,7 @@ fn reward_rows(
                 mastered,
                 owned_count,
                 vaulted: e.vaulted,
+                wishlisted,
             }
         })
         .collect()
@@ -1109,8 +1117,12 @@ async fn reward_png(config: &Config) -> Result<()> {
     let owned_parts = wf_cache::load_blob::<wf_relic::OwnedPrimeParts>(wf_relic::OWNED_PRIME_PARTS_FILE)
         .map(|s| s.value)
         .unwrap_or_default();
+    let wishlist = wf_cache::load_blob::<wf_relic::Wishlist>(wf_relic::WISHLIST_FILE)
+        .map(|s| s.value)
+        .unwrap_or_default();
     let font = wf_overlay::load_font()?;
-    let canvas = wf_overlay::render_reward_panel(&reward_rows(&evals, &mastery, &owned_parts), &font);
+    let canvas =
+        wf_overlay::render_reward_panel(&reward_rows(&evals, &mastery, &owned_parts, &wishlist), &font);
     let img = image::RgbaImage::from_raw(canvas.width, canvas.height, canvas.buf)
         .context("canvas -> image")?;
     let out = "reward.png";
@@ -1247,6 +1259,20 @@ async fn load_vaulted(client: &reqwest::Client, items: &wf_relic::ItemIndex) -> 
 }
 
 type RewardState = std::sync::Arc<std::sync::Mutex<Option<(std::time::Instant, Vec<wf_overlay::RewardRow>)>>>;
+
+/// The current reward rows, if a reward screen was detected within the last
+/// [`REWARD_DISPLAY`] window — the same freshness check the overlay's own
+/// reward panel (`make_frame` in [`run_overlay`]) and the `copy` control
+/// command ([`copy_best_reward`]) both need before acting on `reward`.
+fn current_reward_rows(reward: &RewardState) -> Option<Vec<wf_overlay::RewardRow>> {
+    reward
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|(t, _)| t.elapsed() < REWARD_DISPLAY)
+        .map(|(_, r)| r.clone())
+}
+
 /// Live progress for an in-flight relic scan, set the moment the Relics
 /// screen is detected so the overlay reacts immediately instead of showing
 /// nothing (see [`crate::run_overlay`]'s panel priority).
@@ -1310,13 +1336,7 @@ async fn run_overlay(config: Config) -> Result<()> {
             let blank = || wf_overlay::Canvas::new(OVERLAY_W, OVERLAY_H);
             let mut c = if !shown {
                 blank()
-            } else if let Some(rows) = reward
-                .lock()
-                .unwrap()
-                .as_ref()
-                .filter(|(t, _)| t.elapsed() < REWARD_DISPLAY)
-                .map(|(_, r)| r.clone())
-            {
+            } else if let Some(rows) = current_reward_rows(&reward) {
                 wf_overlay::render_reward_panel(&rows, &font).embed(OVERLAY_W, OVERLAY_H)
             } else if let Some(progress) = *relic_scan_status.lock().unwrap() {
                 wf_overlay::render_relic_scanning_panel(progress, &font).embed(OVERLAY_W, OVERLAY_H)
@@ -1345,9 +1365,10 @@ async fn run_overlay(config: Config) -> Result<()> {
 
     let (tx, rx) = mpsc::channel();
 
-    // Control socket: `wf-lite toggle|show|hide` flips `visible` at runtime, so a
-    // KDE global shortcut bound to those commands can hide the overlay on demand.
-    spawn_control_listener(visible.clone());
+    // Control socket: `wf-lite toggle|show|hide` flips `visible` at runtime, and
+    // `copy` copies the current best-pick reward, so a KDE global shortcut bound
+    // to those commands can act on a running overlay on demand.
+    spawn_control_listener(visible.clone(), reward.clone());
 
     // Relic auto-detection: needs tesseract, an EE.log, and the item catalogue.
     // Built before the renderer loop below so the renderer can wire up
@@ -1543,10 +1564,10 @@ fn control_socket_path() -> std::path::PathBuf {
     dir.join("warframe-lite-overlay.sock")
 }
 
-/// Listen on the control socket for `toggle` / `show` / `hide` lines and update
-/// the shared `visible` flag. A stale socket file from a previous run is removed
-/// first. Runs for the life of the overlay.
-fn spawn_control_listener(visible: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+/// Listen on the control socket for `toggle` / `show` / `hide` / `copy` lines
+/// and act on the shared `visible` flag / `reward` state. A stale socket file
+/// from a previous run is removed first. Runs for the life of the overlay.
+fn spawn_control_listener(visible: std::sync::Arc<std::sync::atomic::AtomicBool>, reward: RewardState) {
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncReadExt;
 
@@ -1559,7 +1580,7 @@ fn spawn_control_listener(visible: std::sync::Arc<std::sync::atomic::AtomicBool>
             return;
         }
     };
-    println!("  control:   {} (wf-lite toggle|show|hide)", path.display());
+    println!("  control:   {} (wf-lite toggle|show|hide|copy)", path.display());
     tokio::spawn(async move {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
@@ -1576,10 +1597,70 @@ fn spawn_control_listener(visible: std::sync::Arc<std::sync::atomic::AtomicBool>
                 }
                 "show" => visible.store(true, Ordering::Relaxed),
                 "hide" => visible.store(false, Ordering::Relaxed),
+                "copy" => copy_best_reward(&reward),
                 other => tracing::warn!("unknown overlay control command {other:?}"),
             }
         }
     });
+}
+
+/// Env var to override the `wl-copy` binary path (mirrors `WF_TESSERACT`), for
+/// users with a differently-named/pathed clipboard binary.
+fn wl_copy_bin() -> String {
+    std::env::var("WF_WL_COPY").unwrap_or_else(|_| "wl-copy".into())
+}
+
+/// Format a reward row as clipboard-ready text for Warframe's trade chat, e.g.
+/// `"Mirage Prime Systems 45p"`. Falls back to just the name when the price is
+/// unresolved (shown as "—" in the overlay).
+fn clipboard_text(row: &wf_overlay::RewardRow) -> String {
+    match row.plat {
+        Some(p) => format!("{} {p}p", row.name),
+        None => row.name.clone(),
+    }
+}
+
+/// Handle the `copy` control-socket command: find the current best-pick reward
+/// row (same source and freshness window as the overlay's own reward panel)
+/// and copy it to the clipboard. Logs a clear message — never crashes or
+/// hangs — if there's no active reward or `wl-copy` isn't available.
+fn copy_best_reward(reward: &RewardState) {
+    let Some(rows) = current_reward_rows(reward) else {
+        tracing::warn!("copy requested but no active reward to copy");
+        return;
+    };
+    let Some(best) = rows.iter().find(|r| r.best_plat) else {
+        tracing::warn!("copy requested but no best-pick reward row");
+        return;
+    };
+    let text = clipboard_text(best);
+    match copy_to_clipboard(&text) {
+        Ok(()) => tracing::info!("copied to clipboard: {text}"),
+        Err(e) => tracing::warn!("clipboard copy failed ({e:#}); is wl-copy installed?"),
+    }
+}
+
+/// Shell out to `wl-copy` (or `$WF_WL_COPY`) with `text` on stdin. Not
+/// practically unit-testable (external process, real Wayland compositor) —
+/// same tradeoff as the existing `WF_TESSERACT` shell-out; rely on manual
+/// verification instead.
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(wl_copy_bin())
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("spawning wl-copy")?;
+    child
+        .stdin
+        .take()
+        .context("wl-copy stdin unavailable")?
+        .write_all(text.as_bytes())
+        .context("writing to wl-copy stdin")?;
+    let status = child.wait().context("waiting for wl-copy")?;
+    anyhow::ensure!(status.success(), "wl-copy exited with {status}");
+    Ok(())
 }
 
 /// Client side of the control socket: send a single command to a running overlay.
@@ -1792,7 +1873,12 @@ async fn relic_watch_loop(
             wf_cache::load_blob::<wf_relic::OwnedPrimeParts>(wf_relic::OWNED_PRIME_PARTS_FILE)
                 .map(|s| s.value)
                 .unwrap_or_default();
-        let rows = reward_rows(&evals, &mastery, &owned_parts);
+        // Also re-read fresh: `wf-browse`'s Mastery tab can mark/unmark a
+        // wishlist entry directly (ADR-0004) while this loop keeps running.
+        let wishlist = wf_cache::load_blob::<wf_relic::Wishlist>(wf_relic::WISHLIST_FILE)
+            .map(|s| s.value)
+            .unwrap_or_default();
+        let rows = reward_rows(&evals, &mastery, &owned_parts, &wishlist);
         if let Some(best) = wf_relic::best_by_plat(&evals) {
             tracing::info!("reward screen captured — best plat pick = {}", rows[best].name);
         }
@@ -2154,5 +2240,36 @@ fn log_watch(ee_log: Option<std::path::PathBuf>) -> Result<()> {
             // Nothing recognized this tick; keep polling.
         }
         std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::clipboard_text;
+    use wf_overlay::RewardRow;
+
+    fn row(name: &str, plat: Option<u32>) -> RewardRow {
+        RewardRow {
+            name: name.into(),
+            plat,
+            best_plat: true,
+            mastered: false,
+            owned_count: None,
+            vaulted: false,
+            wishlisted: false,
+        }
+    }
+
+    #[test]
+    fn formats_name_and_plat() {
+        assert_eq!(
+            clipboard_text(&row("Mirage Prime Systems", Some(45))),
+            "Mirage Prime Systems 45p"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_name_when_plat_unresolved() {
+        assert_eq!(clipboard_text(&row("Volnus Prime Blueprint", None)), "Volnus Prime Blueprint");
     }
 }

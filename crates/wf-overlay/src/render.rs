@@ -126,6 +126,11 @@ pub struct RewardRow {
     pub owned_count: Option<u32>,
     /// Whether every relic that can drop this reward is itself vaulted.
     pub vaulted: bool,
+    /// Whether the player has hand-marked this reward's Prime Part as wanted
+    /// (see ADR-0004). Independent of `mastered` — both can be true at once
+    /// (e.g. wishlisted, then mastered without unmarking); `mastered` wins
+    /// the shared marker column when that happens (see `render_reward_panel`).
+    pub wishlisted: bool,
 }
 
 // Reward panel palette.
@@ -133,6 +138,29 @@ const BEST_BG: Color = Color::rgba(40, 70, 45, 235);
 const PLAT: Color = Color::rgb(120, 200, 255);
 const MASTERED: Color = Color::rgb(130, 200, 140);
 const VAULTED: Color = Color::rgb(235, 165, 70);
+const WISHLIST: Color = Color::rgb(230, 200, 90);
+
+/// Which marker (if any) a `RewardRow` draws in the shared mastery/wishlist
+/// column — mastery always wins when a row is somehow both (see
+/// `RewardRow::wishlisted`'s docs). Exists so the mutual-exclusivity rule can
+/// be asserted directly on `RewardRow` input/output rather than only via
+/// rendered pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowMarker {
+    Mastery,
+    Wishlist,
+    None,
+}
+
+fn row_marker(row: &RewardRow) -> RowMarker {
+    if row.mastered {
+        RowMarker::Mastery
+    } else if row.wishlisted {
+        RowMarker::Wishlist
+    } else {
+        RowMarker::None
+    }
+}
 
 // Mastery emblem (laurel wreath): reserved left-column width + gap, and the drawn
 // wreath size.
@@ -179,10 +207,19 @@ pub fn render_reward_panel(rows: &[RewardRow], font: &Font) -> Canvas {
                 BEST_BG,
             );
         }
-        // Mastery emblem in front of the name for items already mastered.
-        if r.mastered {
-            let mark_x = PAD + (MARK_W as i32 - MARK_INNER_W as i32) / 2;
-            canvas.draw_mastery_mark(mark_x, y - MARK_H as i32 + 1, MARK_INNER_W, MARK_H, MASTERED);
+        // Mastery emblem in front of the name for items already mastered; a
+        // wishlist star for wanted-but-unmastered items — the same reserved
+        // column (see `row_marker`'s mutual-exclusivity rule).
+        match row_marker(r) {
+            RowMarker::Mastery => {
+                let mark_x = PAD + (MARK_W as i32 - MARK_INNER_W as i32) / 2;
+                canvas.draw_mastery_mark(mark_x, y - MARK_H as i32 + 1, MARK_INNER_W, MARK_H, MASTERED);
+            }
+            RowMarker::Wishlist => {
+                let mark_x = PAD + (MARK_W as i32 - MARK_INNER_W as i32) / 2;
+                canvas.draw_star_mark(mark_x, y - MARK_H as i32 + 1, MARK_INNER_W, MARK_H, WISHLIST);
+            }
+            RowMarker::None => {}
         }
         let star = if r.best_plat { "* " } else { "  " };
         let label = format!("{star}{}", r.name);
@@ -346,6 +383,7 @@ mod tests {
             mastered,
             owned_count,
             vaulted: false,
+            wishlisted: false,
         };
 
         // Drawing the "✓3" suffix changes the rendered pixels versus the same
@@ -359,6 +397,51 @@ mod tests {
         let mastered_with_count = render_reward_panel(&[row(Some(3), true)], &font);
         let mastered_without_count = render_reward_panel(&[row(None, true)], &font);
         assert_eq!(mastered_with_count.buf, mastered_without_count.buf);
+    }
+
+    #[test]
+    fn row_marker_mastery_wins_over_wishlisted() {
+        let row = |mastered, wishlisted| RewardRow {
+            name: "Ember Prime Systems".to_string(),
+            plat: Some(10),
+            best_plat: false,
+            mastered,
+            owned_count: None,
+            vaulted: false,
+            wishlisted,
+        };
+
+        assert_eq!(row_marker(&row(false, false)), RowMarker::None);
+        assert_eq!(row_marker(&row(false, true)), RowMarker::Wishlist);
+        assert_eq!(row_marker(&row(true, false)), RowMarker::Mastery);
+        // Both true is the mutual-exclusivity case: mastery wins.
+        assert_eq!(row_marker(&row(true, true)), RowMarker::Mastery);
+    }
+
+    #[test]
+    fn wishlist_star_renders_only_on_unmastered_rows_and_mastery_wins_if_both() {
+        let font = load_font().expect("a system monospace font");
+        let row = |mastered, wishlisted| RewardRow {
+            name: "Ember Prime Systems".to_string(),
+            plat: Some(10),
+            best_plat: false,
+            mastered,
+            owned_count: None,
+            vaulted: false,
+            wishlisted,
+        };
+
+        // Wishlisting an unmastered row draws the star, changing the pixels
+        // versus the same row with no wishlist marker at all.
+        let unmastered_wishlisted = render_reward_panel(&[row(false, true)], &font);
+        let unmastered_plain = render_reward_panel(&[row(false, false)], &font);
+        assert_ne!(unmastered_wishlisted.buf, unmastered_plain.buf);
+
+        // A mastered-and-wishlisted row renders identically to a mastered,
+        // not-wishlisted row — the mastery emblem wins the shared column.
+        let mastered_wishlisted = render_reward_panel(&[row(true, true)], &font);
+        let mastered_plain = render_reward_panel(&[row(true, false)], &font);
+        assert_eq!(mastered_wishlisted.buf, mastered_plain.buf);
     }
 
     #[test]

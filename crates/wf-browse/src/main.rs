@@ -92,6 +92,13 @@ fn main() -> eframe::Result<()> {
     // window stays open.
     let rt = tokio::runtime::Runtime::new().expect("failed to start tokio runtime");
     let loaded: Arc<Mutex<Option<Loaded>>> = Arc::new(Mutex::new(None));
+    // Hand-curated, so loaded once synchronously here (a local disk read, no
+    // network) rather than through the background `load_data`/`poll` path —
+    // this window is the only writer, so there's nothing else to catch up
+    // with (see ADR-0004).
+    let wishlist = wf_cache::load_blob::<wf_relic::Wishlist>(wf_relic::WISHLIST_FILE)
+        .map(|s| s.value)
+        .unwrap_or_default();
     // `load_data` (catalogue/mastery/quantity fetches, plus a price lookup per
     // owned relic) runs in the background rather than blocking the window
     // from opening at all — see the module docs and `BrowseApp`'s "Loading…"
@@ -109,7 +116,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             apply_theme(&cc.egui_ctx);
-            Ok(Box::new(BrowseApp::new(loaded)))
+            Ok(Box::new(BrowseApp::new(loaded, wishlist)))
         }),
     )
 }
@@ -176,6 +183,17 @@ fn tier_filter_ui(ui: &mut egui::Ui, selected: &mut HashSet<String>) {
 /// An empty filter set means "no filter" — every tier passes.
 fn tier_matches(selected: &HashSet<String>, tier: &str) -> bool {
     selected.is_empty() || selected.contains(tier)
+}
+
+/// Insert or remove a wishlist `key` (see [`wf_relic::wishlist::key`]) from
+/// `set` per `wishlisted` — the pure mutation [`BrowseApp::set_wishlisted`]'s
+/// checkbox handler applies before persisting.
+fn toggle_membership(set: &mut HashSet<String>, key: &str, wishlisted: bool) {
+    if wishlisted {
+        set.insert(key.to_string());
+    } else {
+        set.remove(key);
+    }
 }
 
 /// Ordinal for sorting by rarity (Rare highest), matching Warframe's own
@@ -248,6 +266,10 @@ struct Live {
 struct Loaded {
     mastery_rows: Vec<MasteryEntry>,
     live: Live,
+    /// Shared with the background poller ([`poll`]) rather than cloned — build
+    /// quantities never change after launch, and the Mastery tab's wishlist
+    /// checkboxes need every part label per prime ([`PartQuantities::parts_for`]).
+    quantities: Arc<PartQuantities>,
 }
 
 /// Lock `m`, recovering the guard even if a previous holder panicked while
@@ -306,6 +328,7 @@ impl Live {
 async fn load_and_poll(loaded: Arc<Mutex<Option<Loaded>>>, config: Config) {
     let LoadedData { index, mastery, quantities, owned, owned_parts, active_tiers, prices } =
         load_data(&config).await;
+    let quantities = Arc::new(quantities);
     let mastery_rows = wf_relic::mastery_browser(&index, &mastery);
     let live = Live::compute(
         owned.as_ref(),
@@ -316,7 +339,7 @@ async fn load_and_poll(loaded: Arc<Mutex<Option<Loaded>>>, config: Config) {
         &prices,
         active_tiers,
     );
-    *lock_loaded(&loaded) = Some(Loaded { mastery_rows, live });
+    *lock_loaded(&loaded) = Some(Loaded { mastery_rows, live, quantities: quantities.clone() });
 
     poll(loaded, index, mastery, quantities, prices, config.platform).await;
 }
@@ -329,7 +352,7 @@ async fn poll(
     loaded: Arc<Mutex<Option<Loaded>>>,
     index: RelicIndex,
     mastery: MasterySet,
-    quantities: PartQuantities,
+    quantities: Arc<PartQuantities>,
     prices: Prices,
     platform: String,
 ) {
@@ -564,10 +587,14 @@ struct BrowseApp {
     /// `live` field is refreshed in place afterward by [`poll`] every
     /// [`POLL_INTERVAL`].
     loaded: Arc<Mutex<Option<Loaded>>>,
+    /// The hand-curated equipment wishlist, loaded once at launch and
+    /// written back to `wishlist.json` on every mark/unmark (ADR-0004). No
+    /// polling: this window is the only writer.
+    wishlist: wf_relic::Wishlist,
 }
 
 impl BrowseApp {
-    fn new(loaded: Arc<Mutex<Option<Loaded>>>) -> Self {
+    fn new(loaded: Arc<Mutex<Option<Loaded>>>, wishlist: wf_relic::Wishlist) -> Self {
         Self {
             tab: Tab::Mastery,
             filter: String::new(),
@@ -583,7 +610,15 @@ impl BrowseApp {
             owned_filter: String::new(),
             reset_confirm: false,
             loaded,
+            wishlist,
         }
+    }
+
+    /// Mark/unmark `key` and persist the wishlist immediately — best-effort,
+    /// matching every other `wf_cache::save_blob` call site in this app.
+    fn set_wishlisted(&mut self, key: &str, wishlisted: bool) {
+        toggle_membership(&mut self.wishlist, key, wishlisted);
+        let _ = wf_cache::save_blob(wf_relic::WISHLIST_FILE, &self.wishlist);
     }
 
     /// Derive `f` from the background-loaded state, or show the "Loading…"
@@ -598,7 +633,9 @@ impl BrowseApp {
     }
 
     fn mastery_tab(&mut self, ui: &mut egui::Ui) {
-        let Some(mastery_rows) = self.loaded_or_placeholder(ui, |l| l.mastery_rows.clone()) else {
+        let Some((mastery_rows, quantities)) =
+            self.loaded_or_placeholder(ui, |l| (l.mastery_rows.clone(), l.quantities.clone()))
+        else {
             return;
         };
 
@@ -637,9 +674,10 @@ impl BrowseApp {
         ui.add_space(4.0);
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("mastery_grid").num_columns(2).striped(true).show(ui, |ui| {
+            egui::Grid::new("mastery_grid").num_columns(3).striped(true).show(ui, |ui| {
                 ui.strong("prime");
                 ui.strong("status");
+                ui.strong("wishlist");
                 ui.end_row();
 
                 for entry in &rows {
@@ -650,6 +688,20 @@ impl BrowseApp {
                         ("— unmastered", UNMASTERED_COLOR)
                     };
                     ui.colored_label(color, text);
+                    // One checkbox per Prime Part (Systems, Chassis, …), reusing
+                    // `tier_filter_ui`'s row-of-checkboxes pattern — wishlisting
+                    // is per-part (CONTEXT.md's "Wishlisted part"), one level
+                    // below this row's whole-Prime granularity (see ADR-0004).
+                    ui.horizontal(|ui| {
+                        for (part, _quantity) in quantities.parts_for(&entry.prime) {
+                            let pp = wf_relic::PrimePart { prime: entry.prime.clone(), part: part.clone() };
+                            let key = wf_relic::wishlist::key(&pp);
+                            let mut checked = self.wishlist.contains(&key);
+                            if ui.checkbox(&mut checked, &part).changed() {
+                                self.set_wishlisted(&key, checked);
+                            }
+                        }
+                    });
                     ui.end_row();
                 }
             });
@@ -1233,5 +1285,49 @@ impl eframe::App for BrowseApp {
                 Tab::Owned => self.owned_tab(ui),
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toggle_membership_marks_and_unmarks() {
+        let mut set: HashSet<String> = HashSet::new();
+        toggle_membership(&mut set, "Ember Prime Systems", true);
+        assert!(set.contains("Ember Prime Systems"));
+        toggle_membership(&mut set, "Ember Prime Systems", false);
+        assert!(!set.contains("Ember Prime Systems"));
+        // Unmarking something never marked is a no-op, not an error.
+        toggle_membership(&mut set, "Volt Prime Chassis", false);
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn set_wishlisted_round_trips_through_wf_cache_disk() {
+        // Point XDG_CACHE_HOME at a throwaway temp dir for this test only, so
+        // `wf_cache::cache_dir()` never touches the real
+        // `~/.cache/warframe-lite/wishlist.json` a running `wf-browse` (or
+        // this very test suite, run again later) might depend on.
+        let dir = std::env::temp_dir().join(format!("wf-browse-wishlist-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+
+        let mut app = BrowseApp::new(Arc::new(Mutex::new(None)), wf_relic::Wishlist::new());
+        app.set_wishlisted("Ember Prime Systems", true);
+        let on_disk = wf_cache::load_blob::<wf_relic::Wishlist>(wf_relic::WISHLIST_FILE)
+            .expect("set_wishlisted should have written wishlist.json")
+            .value;
+        assert!(on_disk.contains("Ember Prime Systems"));
+
+        app.set_wishlisted("Ember Prime Systems", false);
+        let on_disk = wf_cache::load_blob::<wf_relic::Wishlist>(wf_relic::WISHLIST_FILE)
+            .expect("wishlist.json should still be present after unmarking")
+            .value;
+        assert!(!on_disk.contains("Ember Prime Systems"));
+
+        std::env::remove_var("XDG_CACHE_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

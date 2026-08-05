@@ -112,6 +112,7 @@ wf-lite tray               # tray companion: waits for the game, runs the overla
 wf-lite overlay            # show the live overlay (live fissures + relic picker)
 wf-lite settings           # open the graphical settings window (needs wf-settings)
 wf-lite toggle             # show/hide a running overlay (also: show / hide)
+wf-lite copy               # copy the current best-pick reward (name + plat) to the clipboard
 wf-lite capture [out.png]  # capture the Warframe window to a PNG
 wf-lite relic [names…]     # evaluate reward names → matched item + plat
 wf-lite relic-scan         # capture the reward screen, OCR the names, rank them
@@ -148,6 +149,15 @@ opacity = 1.0          # 1.0 = as-drawn, lower = more transparent (e.g. 0.7)
 key itself, so bind a **KDE custom shortcut** (System Settings → Shortcuts →
 Add Custom → Command) to `wf-lite toggle` (or `wf-lite hide` / `wf-lite show`).
 The running overlay listens on a control socket and shows/hides instantly.
+
+**Copy a reward to the clipboard.** Bind another KDE custom shortcut to
+`wf-lite copy` to copy the currently-displayed best-pick reward's name and
+plat price (e.g. `Mirage Prime Systems 45p`) to the clipboard, ready to paste
+into Warframe's trade chat. Needs `wl-clipboard` ≥ 2.3.0 for
+`ext-data-control-v1` support on KWin ≥ 6.5 — older packaged versions (e.g.
+Fedora/Debian/Ubuntu's stock 2.2.1) may hit `wl-copy`'s own documented
+popup-surface hang fallback instead of copying instantly. Override the binary
+with `WF_WL_COPY` if yours is named or pathed differently.
 
 ### Settings window
 

@@ -9,6 +9,7 @@ pub mod owned_parts;
 pub mod part_quantities;
 pub mod regions;
 pub mod relics;
+pub mod wishlist;
 
 pub use bom::{buy_or_farm_plan, unmastered_primes, BomGap, BomPlan};
 pub use index::ItemIndex;
@@ -29,6 +30,7 @@ pub use relics::{
     PartsOwnedSummary, PrimePartGroup, PrimePlan, PrimeRelicSource, RelicIndex, RelicInfo,
     RelicPick, OWNED_RELICS_FILE,
 };
+pub use wishlist::{Wishlist, WISHLIST_FILE};
 
 use std::collections::HashMap;
 use std::time::Duration;
