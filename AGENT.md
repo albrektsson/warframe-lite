@@ -81,10 +81,12 @@ A single Cargo workspace of focused crates:
   against a real captured 2560×1440 4-reward screen (same height as the
   reference, ~25% narrower): the panel kept the reference pitch/name size
   unchanged and centred within ~12px of true screen centre, matching the
-  reference calibration's own small centre bias. A resolution with a
-  **different height** than 3440×1440 (not just a different width) is the case
-  still unverified against a real capture, and is the one most likely to need
-  re-tuning.
+  reference calibration's own small centre bias. Also verified against a real
+  captured **1920×1080** 2-reward screen — a **different height** than the
+  reference, previously the untested case most likely to need re-tuning: it
+  needed none. `wf-lite relic-file` resolved both cards ("2 X Forma
+  Blueprint", "Burston Prime Receiver") straight off the default calibration
+  (issue #7).
 - **Recalibrating against a new capture:** grab a reward-screen PNG (the JPEGs
   Steam's screenshot key saves need converting first, e.g. `magick in.jpg
   out.png` — the `image` crate here isn't built with JPEG support), then:
