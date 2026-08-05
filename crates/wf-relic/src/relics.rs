@@ -18,18 +18,29 @@ use crate::part_quantities::PartQuantities;
 
 const RELICS_URL: &str =
     "https://raw.githubusercontent.com/WFCD/warframe-drop-data/gh-pages/data/relics.json";
-const CACHE_FILE: &str = "relics.json";
+// `-v2`: rewards gained `intact_chance`/`radiant_chance` (see `fetch`'s
+// Intact+Radiant merge) — bump so an old-format cache isn't deserialized into
+// the new shape.
+const CACHE_FILE: &str = "relics-v2.json";
 
-/// One reward inside a relic.
+/// One reward inside a relic. `intact_chance`/`radiant_chance` are drop-chance
+/// percentages (e.g. `20.0` for 20%) at those two refinement states — fixed
+/// game-wide constants per (rarity tier, refinement state), not per relic
+/// (see issue #19's research), used to compute [`expected_value`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelicReward {
     #[serde(rename = "itemName")]
     pub item_name: String,
     #[serde(default)]
     pub rarity: String,
+    #[serde(default)]
+    pub intact_chance: f32,
+    #[serde(default)]
+    pub radiant_chance: f32,
 }
 
-/// A relic and its (Intact) reward set.
+/// A relic and its Intact-state reward set (with each reward's Radiant chance
+/// merged in too — see `fetch`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelicInfo {
     /// Era, e.g. "Axi".
@@ -729,45 +740,131 @@ pub fn mastery_plan(
     plans
 }
 
-/// Fetch and parse the WFCD relic drop tables, keeping only the Intact state
-/// (the reward *set* is state-independent; only drop chances differ).
-async fn fetch(client: &reqwest::Client) -> anyhow::Result<Vec<RelicInfo>> {
-    #[derive(Deserialize)]
-    struct File {
-        relics: Vec<Raw>,
-    }
-    #[derive(Deserialize)]
-    struct Raw {
-        tier: String,
-        // A rare malformed WFCD entry omits relicName; default + filter it out.
-        #[serde(rename = "relicName", default)]
-        relic_name: String,
-        #[serde(default)]
-        state: String,
-        #[serde(default)]
-        rewards: Vec<RelicReward>,
+#[derive(Deserialize)]
+struct RawFile {
+    relics: Vec<RawRelic>,
+}
+
+#[derive(Deserialize, Clone)]
+struct RawRelic {
+    tier: String,
+    // A rare malformed WFCD entry omits relicName; default + filter it out.
+    #[serde(rename = "relicName", default)]
+    relic_name: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    rewards: Vec<RawReward>,
+}
+
+#[derive(Deserialize, Clone)]
+struct RawReward {
+    #[serde(rename = "itemName")]
+    item_name: String,
+    #[serde(default)]
+    rarity: String,
+    #[serde(default)]
+    chance: f32,
+}
+
+/// Merge WFCD's one-row-per-(relic,state) source into one [`RelicInfo`] per
+/// relic, keeping only the Intact and Radiant rows (the reward item set is
+/// state-independent — only `chance` differs, per issue #19's research) and
+/// dropping any relic missing either state row entirely (logged, not
+/// surfaced as a partial entry) rather than emit a reward with no
+/// `radiant_chance`. A reward present in the Intact row but absent from the
+/// Radiant row (shouldn't happen for a standard relic, but WFCD sync lag is
+/// possible) is likewise dropped rather than guessed.
+fn merge_intact_radiant(raw: Vec<RawRelic>) -> Vec<RelicInfo> {
+    // Group Intact/Radiant rows by (tier, code), preserving first-seen order
+    // for a stable result (a `HashMap`'s own iteration order isn't).
+    let mut order: Vec<(String, String)> = Vec::new();
+    let mut by_relic: HashMap<(String, String), (Option<RawRelic>, Option<RawRelic>)> = HashMap::new();
+    for r in raw {
+        if r.relic_name.is_empty() {
+            continue;
+        }
+        let key = (r.tier.clone(), r.relic_name.clone());
+        if !by_relic.contains_key(&key) {
+            order.push(key.clone());
+        }
+        let entry = by_relic.entry(key).or_insert((None, None));
+        if r.state.eq_ignore_ascii_case("Intact") {
+            entry.0 = Some(r);
+        } else if r.state.eq_ignore_ascii_case("Radiant") {
+            entry.1 = Some(r);
+        }
     }
 
+    let mut relics = Vec::new();
+    for key in order {
+        let (tier, code) = key.clone();
+        let (intact, radiant) = by_relic.remove(&key).unwrap_or((None, None));
+        let (Some(intact), Some(radiant)) = (intact, radiant) else {
+            tracing::warn!("relic {tier} {code}: missing Intact or Radiant row, dropped");
+            continue;
+        };
+        let radiant_chances: HashMap<String, f32> =
+            radiant.rewards.into_iter().map(|r| (r.item_name, r.chance)).collect();
+        let rewards: Vec<RelicReward> = intact
+            .rewards
+            .into_iter()
+            .filter_map(|r| {
+                let radiant_chance = *radiant_chances.get(&r.item_name)?;
+                Some(RelicReward {
+                    item_name: r.item_name,
+                    rarity: r.rarity,
+                    intact_chance: r.chance,
+                    radiant_chance,
+                })
+            })
+            .collect();
+        relics.push(RelicInfo { display: format!("{tier} {code}"), tier, code, rewards });
+    }
+    relics
+}
+
+/// Fetch and parse the WFCD relic drop tables (see [`merge_intact_radiant`]).
+async fn fetch(client: &reqwest::Client) -> anyhow::Result<Vec<RelicInfo>> {
     tracing::debug!("GET {RELICS_URL}");
-    let file: File = client
+    let file: RawFile = client
         .get(RELICS_URL)
         .send()
         .await?
         .error_for_status()?
         .json()
         .await?;
-    let relics = file
-        .relics
-        .into_iter()
-        .filter(|r| r.state.eq_ignore_ascii_case("Intact") && !r.relic_name.is_empty())
-        .map(|r| RelicInfo {
-            display: format!("{} {}", r.tier, r.relic_name),
-            tier: r.tier,
-            code: r.relic_name,
-            rewards: r.rewards,
-        })
-        .collect();
-    Ok(relics)
+    Ok(merge_intact_radiant(file.relics))
+}
+
+/// Which refinement state's drop chance [`expected_value`] weights by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvRefinement {
+    Intact,
+    Radiant,
+}
+
+/// Drop-chance-weighted expected plat value of `rewards` at `refinement`:
+/// `Σ price_i × chance_i / 100`. `prices` maps reward item name to its
+/// resolved market price (`None` = checked, no listing — contributes `0`, a
+/// real outcome, not "unknown"). Returns `None` if any reward in `rewards`
+/// has no entry in `prices` at all (still loading), so the caller can show a
+/// loading state instead of an EV computed from partial data.
+pub fn expected_value(
+    rewards: &[RelicReward],
+    prices: &HashMap<String, Option<u32>>,
+    refinement: EvRefinement,
+) -> Option<f32> {
+    let mut total = 0.0;
+    for r in rewards {
+        let price = (*prices.get(&r.item_name)?).unwrap_or(0);
+        let chance = match refinement {
+            EvRefinement::Intact => r.intact_chance,
+            EvRefinement::Radiant => r.radiant_chance,
+        };
+        total += chance / 100.0 * price as f32;
+    }
+    Some(total)
 }
 
 #[cfg(test)]
@@ -783,7 +880,12 @@ mod tests {
             display: display.to_string(),
             rewards: rewards
                 .iter()
-                .map(|n| RelicReward { item_name: n.to_string(), rarity: String::new() })
+                .map(|n| RelicReward {
+                    item_name: n.to_string(),
+                    rarity: String::new(),
+                    intact_chance: 0.0,
+                    radiant_chance: 0.0,
+                })
                 .collect(),
         }
     }
@@ -796,9 +898,130 @@ mod tests {
             display: display.to_string(),
             rewards: rewards
                 .iter()
-                .map(|(n, r)| RelicReward { item_name: n.to_string(), rarity: r.to_string() })
+                .map(|(n, r)| RelicReward {
+                    item_name: n.to_string(),
+                    rarity: r.to_string(),
+                    intact_chance: 0.0,
+                    radiant_chance: 0.0,
+                })
                 .collect(),
         }
+    }
+
+    fn raw_relic(tier: &str, code: &str, state: &str, rewards: &[(&str, &str, f32)]) -> RawRelic {
+        RawRelic {
+            tier: tier.to_string(),
+            relic_name: code.to_string(),
+            state: state.to_string(),
+            rewards: rewards
+                .iter()
+                .map(|(name, rarity, chance)| RawReward {
+                    item_name: name.to_string(),
+                    rarity: rarity.to_string(),
+                    chance: *chance,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn merge_intact_radiant_combines_both_states_per_reward() {
+        let raw = vec![
+            raw_relic("Axi", "H3", "Intact", &[("Nikana Prime Blueprint", "Uncommon", 11.0)]),
+            raw_relic("Axi", "H3", "Radiant", &[("Nikana Prime Blueprint", "Uncommon", 20.0)]),
+        ];
+        let relics = merge_intact_radiant(raw);
+        assert_eq!(relics.len(), 1);
+        let reward = &relics[0].rewards[0];
+        assert_eq!(reward.intact_chance, 11.0);
+        assert_eq!(reward.radiant_chance, 20.0);
+    }
+
+    #[test]
+    fn merge_intact_radiant_drops_a_relic_missing_either_state() {
+        // Intact only, no Radiant row at all for this relic.
+        let raw = vec![raw_relic("Axi", "H3", "Intact", &[("Nikana Prime Blueprint", "Uncommon", 11.0)])];
+        assert!(merge_intact_radiant(raw).is_empty());
+    }
+
+    #[test]
+    fn merge_intact_radiant_drops_a_reward_absent_from_the_radiant_row() {
+        let raw = vec![
+            raw_relic(
+                "Axi",
+                "H3",
+                "Intact",
+                &[("Nikana Prime Blueprint", "Uncommon", 11.0), ("Forma Blueprint", "Common", 25.33)],
+            ),
+            // Radiant row is missing the Forma reward — a WFCD sync-lag quirk.
+            raw_relic("Axi", "H3", "Radiant", &[("Nikana Prime Blueprint", "Uncommon", 20.0)]),
+        ];
+        let relics = merge_intact_radiant(raw);
+        assert_eq!(relics[0].rewards.len(), 1);
+        assert_eq!(relics[0].rewards[0].item_name, "Nikana Prime Blueprint");
+    }
+
+    #[test]
+    fn merge_intact_radiant_ignores_malformed_entries_and_other_states() {
+        let raw = vec![
+            // Missing relicName entirely.
+            raw_relic("Axi", "", "Intact", &[]),
+            raw_relic("Axi", "H3", "Exceptional", &[("Nikana Prime Blueprint", "Uncommon", 13.0)]),
+            raw_relic("Axi", "H3", "Intact", &[("Nikana Prime Blueprint", "Uncommon", 11.0)]),
+            raw_relic("Axi", "H3", "Radiant", &[("Nikana Prime Blueprint", "Uncommon", 20.0)]),
+        ];
+        let relics = merge_intact_radiant(raw);
+        assert_eq!(relics.len(), 1);
+        assert_eq!(relics[0].display, "Axi H3");
+    }
+
+    #[test]
+    fn expected_value_weights_prices_by_drop_chance() {
+        let rewards = vec![
+            RelicReward {
+                item_name: "A".to_string(),
+                rarity: "Uncommon".to_string(),
+                intact_chance: 25.33,
+                radiant_chance: 16.67,
+            },
+            RelicReward {
+                item_name: "B".to_string(),
+                rarity: "Rare".to_string(),
+                intact_chance: 2.0,
+                radiant_chance: 10.0,
+            },
+        ];
+        let prices = HashMap::from([("A".to_string(), Some(10)), ("B".to_string(), Some(100))]);
+        let intact = expected_value(&rewards, &prices, EvRefinement::Intact).unwrap();
+        // 0.2533*10 + 0.02*100 = 2.533 + 2.0
+        assert!((intact - 4.533).abs() < 0.001);
+        let radiant = expected_value(&rewards, &prices, EvRefinement::Radiant).unwrap();
+        // 0.1667*10 + 0.10*100 = 1.667 + 10.0
+        assert!((radiant - 11.667).abs() < 0.001);
+    }
+
+    #[test]
+    fn expected_value_treats_an_unlisted_reward_as_zero_not_unknown() {
+        let rewards = vec![RelicReward {
+            item_name: "A".to_string(),
+            rarity: "Uncommon".to_string(),
+            intact_chance: 25.33,
+            radiant_chance: 16.67,
+        }];
+        let prices = HashMap::from([("A".to_string(), None)]);
+        assert_eq!(expected_value(&rewards, &prices, EvRefinement::Intact), Some(0.0));
+    }
+
+    #[test]
+    fn expected_value_is_none_when_a_reward_has_no_price_entry_at_all() {
+        let rewards = vec![RelicReward {
+            item_name: "A".to_string(),
+            rarity: "Uncommon".to_string(),
+            intact_chance: 25.33,
+            radiant_chance: 16.67,
+        }];
+        let prices = HashMap::new();
+        assert_eq!(expected_value(&rewards, &prices, EvRefinement::Intact), None);
     }
 
     #[test]

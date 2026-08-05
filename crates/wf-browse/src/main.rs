@@ -33,8 +33,8 @@ use eframe::egui;
 use futures::stream::{self, StreamExt};
 use wf_config::Config;
 use wf_relic::{
-    EquipmentCategory, FarmPick, ItemIndex, MasteryEntry, MasterySet, PartMarketInfo, PartQuantities,
-    PrimePart, PrimePlan, RelicIndex, RelicPick, CATEGORY_ORDER,
+    EquipmentCategory, EvRefinement, FarmPick, ItemIndex, MasteryEntry, MasterySet, PartMarketInfo,
+    PartQuantities, PrimePart, PrimePlan, RelicIndex, RelicInfo, RelicPick, CATEGORY_ORDER,
 };
 
 const CATALOGUE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -89,9 +89,11 @@ fn main() -> eframe::Result<()> {
     let config = Config::load(&config_path).unwrap_or_default();
 
     // `rt` is never dropped before `run_native` returns, so the background
-    // loader/poller spawned on it below keeps running for as long as the
+    // loader/poller spawned on it below — and any on-demand price fetch the
+    // Relics EV tab spawns via `rt_handle` — keep running for as long as the
     // window stays open.
     let rt = tokio::runtime::Runtime::new().expect("failed to start tokio runtime");
+    let rt_handle = rt.handle().clone();
     let loaded: Arc<Mutex<Option<Loaded>>> = Arc::new(Mutex::new(None));
     // Hand-curated, so loaded once synchronously here (a local disk read, no
     // network) rather than through the background `load_data`/`poll` path —
@@ -100,6 +102,11 @@ fn main() -> eframe::Result<()> {
     let wishlist = wf_cache::load_blob::<wf_relic::Wishlist>(wf_relic::WISHLIST_FILE)
         .map(|s| s.value)
         .unwrap_or_default();
+    // For the Relics EV tab's on-demand, per-relic price fetch — a separate
+    // client/platform from `load_data`'s own (which stays scoped to its
+    // background task) rather than threading one shared instance across both.
+    let client = wf_data::http_client();
+    let market_platform = config.market_platform.clone();
     // `load_data` (catalogue/mastery/quantity fetches, plus a price lookup per
     // owned relic) runs in the background rather than blocking the window
     // from opening at all — see the module docs and `BrowseApp`'s "Loading…"
@@ -117,7 +124,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             apply_theme(&cc.egui_ctx);
-            Ok(Box::new(BrowseApp::new(loaded, wishlist)))
+            Ok(Box::new(BrowseApp::new(loaded, wishlist, rt_handle, client, market_platform)))
         }),
     )
 }
@@ -238,6 +245,26 @@ struct Prices {
     set: HashMap<String, Option<u32>>,
 }
 
+/// The Relics EV tab's lazy, on-expand pricing state for one relic — `None`
+/// (absent from the map) means never triggered; `Loading` means a fetch is in
+/// flight; `Ready` carries each reward's resolved plat price (reward item
+/// name → `Option<u32>`, `None` = checked, no market listing).
+#[derive(Clone)]
+enum RelicPriceState {
+    Loading,
+    Ready(HashMap<String, Option<u32>>),
+}
+
+/// The Relics EV tab's per-row read-only lookups, bundled (mirroring
+/// [`wf_relic::RelicContext`]) so [`BrowseApp::relic_ev_row`] doesn't carry
+/// them as separate parameters.
+#[derive(Clone, Copy)]
+struct RelicEvContext<'a> {
+    item_index: &'a Arc<ItemIndex>,
+    quantities: &'a PartQuantities,
+    owned_parts: &'a wf_relic::OwnedPrimeParts,
+}
+
 /// The Relics & Plan / Sell / Farm tabs' data — refreshed periodically by
 /// [`poll`] while the window is open, independent of the launch-time
 /// [`LoadedData`].
@@ -279,6 +306,13 @@ struct Loaded {
     /// tree — resolved once at launch (see [`wf_relic::part_market_info`]),
     /// shared with the poller for the same reason as `quantities`.
     part_market: Arc<HashMap<PrimePart, PartMarketInfo>>,
+    /// The whole relic catalogue, for the Relics EV tab's era → code tree
+    /// (unlike every other tab, which only ever shows *owned* relics). Shared
+    /// with the poller, which also holds it for `Live::compute`.
+    index: Arc<RelicIndex>,
+    /// The item catalogue, for the Relics EV tab's on-demand ducat-value and
+    /// market-slug lookups (see `BrowseApp::spawn_relic_price_fetch`).
+    item_index: Arc<ItemIndex>,
 }
 
 /// Lock `m`, recovering the guard even if a previous holder panicked while
@@ -343,10 +377,21 @@ impl Live {
 /// "Loading…" placeholder — then hand off into [`poll`]'s ongoing refresh
 /// loop for as long as the window stays open.
 async fn load_and_poll(loaded: Arc<Mutex<Option<Loaded>>>, config: Config) {
-    let LoadedData { index, mastery, quantities, owned, owned_parts, active_tiers, prices, part_market } =
-        load_data(&config).await;
+    let LoadedData {
+        index,
+        mastery,
+        quantities,
+        owned,
+        owned_parts,
+        active_tiers,
+        prices,
+        part_market,
+        item_index,
+    } = load_data(&config).await;
     let quantities = Arc::new(quantities);
     let part_market = Arc::new(part_market);
+    let index = Arc::new(index);
+    let item_index = Arc::new(item_index);
     let mastery_rows = wf_relic::mastery_browser(&index, &mastery);
     let live = Live::compute(
         owned.as_ref(),
@@ -357,8 +402,14 @@ async fn load_and_poll(loaded: Arc<Mutex<Option<Loaded>>>, config: Config) {
         &prices,
         active_tiers,
     );
-    *lock_loaded(&loaded) =
-        Some(Loaded { mastery_rows, live, quantities: quantities.clone(), part_market: part_market.clone() });
+    *lock_loaded(&loaded) = Some(Loaded {
+        mastery_rows,
+        live,
+        quantities: quantities.clone(),
+        part_market: part_market.clone(),
+        index: index.clone(),
+        item_index: item_index.clone(),
+    });
 
     poll(loaded, index, mastery, quantities, prices, config.platform).await;
 }
@@ -369,7 +420,7 @@ async fn load_and_poll(loaded: Arc<Mutex<Option<Loaded>>>, config: Config) {
 /// exactly as loaded at launch; only re-running the app refreshes those.
 async fn poll(
     loaded: Arc<Mutex<Option<Loaded>>>,
-    index: RelicIndex,
+    index: Arc<RelicIndex>,
     mastery: MasterySet,
     quantities: Arc<PartQuantities>,
     prices: Prices,
@@ -420,6 +471,10 @@ struct LoadedData {
     /// item catalogue for the Mastery tab's tree — see
     /// [`wf_relic::part_market_info`].
     part_market: HashMap<PrimePart, PartMarketInfo>,
+    /// The item catalogue, kept (rather than dropped after `load_data`'s own
+    /// pricing lookups) for the Relics EV tab's on-demand ducat/market-slug
+    /// lookups.
+    item_index: ItemIndex,
 }
 
 /// Look up a bounded-concurrency batch of market prices, keyed by whatever
@@ -533,14 +588,17 @@ async fn load_data(config: &Config) -> LoadedData {
         active_tiers,
         prices: Prices { sell: sell_prices, farm: farm_prices, set: set_prices },
         part_market,
+        item_index,
     }
 }
 
-/// The browser's tabs: Mastery, Relics & Plan, Buy or Farm, Sell, Farm, and Owned.
+/// The browser's tabs: Mastery, Relics & Plan, Relics EV, Buy or Farm, Sell,
+/// Farm, and Owned.
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
     Mastery,
     Relics,
+    RelicsEv,
     BuyOrFarm,
     Sell,
     Farm,
@@ -609,6 +667,8 @@ struct BrowseApp {
     /// Must be checked before "reset all" is clickable — a guard against an
     /// accidental click on a destructive, ADR-0010 action.
     reset_confirm: bool,
+    /// Editable text buffer for the Relics EV tab's search box.
+    relic_ev_filter: String,
     /// `None` until the background [`load_and_poll`] task finishes; its
     /// `live` field is refreshed in place afterward by [`poll`] every
     /// [`POLL_INTERVAL`].
@@ -617,10 +677,28 @@ struct BrowseApp {
     /// written back to `wishlist.json` on every mark/unmark (ADR-0004). No
     /// polling: this window is the only writer.
     wishlist: wf_relic::Wishlist,
+    /// Per-relic reward pricing for the Relics EV tab's lazy, on-expand fetch
+    /// (see [`RelicPriceState`]) — written to by tasks spawned on
+    /// [`Self::rt_handle`], read every frame to render EV/plat once ready.
+    relic_prices: Arc<Mutex<HashMap<String, RelicPriceState>>>,
+    /// Handle onto `main`'s tokio runtime, so the Relics EV tab can spawn an
+    /// on-demand price fetch from inside `eframe::App::ui` (which runs
+    /// synchronously on the UI thread, unlike [`load_and_poll`]/[`poll`]).
+    rt_handle: tokio::runtime::Handle,
+    /// Shared HTTP client for on-demand price fetches — separate from
+    /// `load_data`'s own (which stays scoped to its background task).
+    client: reqwest::Client,
+    market_platform: String,
 }
 
 impl BrowseApp {
-    fn new(loaded: Arc<Mutex<Option<Loaded>>>, wishlist: wf_relic::Wishlist) -> Self {
+    fn new(
+        loaded: Arc<Mutex<Option<Loaded>>>,
+        wishlist: wf_relic::Wishlist,
+        rt_handle: tokio::runtime::Handle,
+        client: reqwest::Client,
+        market_platform: String,
+    ) -> Self {
         Self {
             tab: Tab::Mastery,
             filter: String::new(),
@@ -635,8 +713,13 @@ impl BrowseApp {
             farm_sort: FarmSort::Price,
             owned_filter: String::new(),
             reset_confirm: false,
+            relic_ev_filter: String::new(),
             loaded,
             wishlist,
+            relic_prices: Arc::new(Mutex::new(HashMap::new())),
+            rt_handle,
+            client,
+            market_platform,
         }
     }
 
@@ -656,6 +739,45 @@ impl BrowseApp {
             ui.label("Loading…");
         }
         result
+    }
+
+    /// Fire the Relics EV tab's lazy, on-expand price fetch for `relic`:
+    /// marks it `Loading` immediately (so a re-render this same frame or the
+    /// next doesn't spawn a second fetch), then resolves every reward's
+    /// market slug via `item_index` and prices it, same bounded-concurrency
+    /// `fetch_prices` path the Sell/Farm tabs use at launch — just triggered
+    /// on demand here instead. A reward with no catalogue match keeps its
+    /// entry (price `None`), so [`wf_relic::expected_value`] sees every
+    /// reward accounted for once the fetch completes.
+    fn spawn_relic_price_fetch(&self, relic: RelicInfo, item_index: Arc<ItemIndex>) {
+        let relic_prices = self.relic_prices.clone();
+        relic_prices
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(relic.display.clone(), RelicPriceState::Loading);
+
+        let client = self.client.clone();
+        let market_platform = self.market_platform.clone();
+        self.rt_handle.spawn(async move {
+            let market = wf_data::market::MarketClient::new(client, market_platform);
+            let cache = wf_relic::price_cache();
+            let resolved: Vec<(String, String)> = relic
+                .rewards
+                .iter()
+                .filter_map(|r| {
+                    item_index.best_match(&r.item_name).map(|m| (r.item_name.clone(), m.item.slug.clone()))
+                })
+                .collect();
+            let mut prices = fetch_prices(resolved, &cache, &market, |(name, slug)| (name, slug)).await;
+            for r in &relic.rewards {
+                prices.entry(r.item_name.clone()).or_insert(None);
+            }
+            cache.save();
+            relic_prices
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(relic.display, RelicPriceState::Ready(prices));
+        });
     }
 
     /// The Mastery tab: a 3-level tree — category (fixed WFinfo order) →
@@ -932,6 +1054,158 @@ impl BrowseApp {
             .small()
             .weak(),
         );
+    }
+
+    /// The Relics EV tab: a 2-level tree — era (fixed order) → relic code,
+    /// both collapsed by default — over the *whole* relic catalogue (unlike
+    /// Relics & Plan, which only shows owned relics). Pricing is lazy: no
+    /// fetch happens until a relic code's row is actually expanded, at which
+    /// point [`Self::relic_ev_row`] fires [`Self::spawn_relic_price_fetch`]
+    /// for just that relic's rewards.
+    fn relics_ev_tab(&mut self, ui: &mut egui::Ui) {
+        let Some((index, item_index, quantities, owned_parts)) = self.loaded_or_placeholder(ui, |l| {
+            (l.index.clone(), l.item_index.clone(), l.quantities.clone(), l.live.owned_parts.clone())
+        }) else {
+            return;
+        };
+        let ctx = RelicEvContext { item_index: &item_index, quantities: &quantities, owned_parts: &owned_parts };
+
+        ui.horizontal(|ui| {
+            ui.label("Search:");
+            ui.text_edit_singleline(&mut self.relic_ev_filter);
+        });
+        ui.add_space(6.0);
+
+        // Read fresh each frame, like the Owned tab — cheap (a local file)
+        // and this tab has no poll-driven `Live` counterpart of its own.
+        let owned_counts = wf_cache::load_blob::<wf_relic::OwnedRelics>(wf_relic::OWNED_RELICS_FILE)
+            .map(|s| wf_relic::owned_counts(&s.value))
+            .unwrap_or_default();
+
+        // Search reaches reward names too, not just the relic code.
+        let filter = self.relic_ev_filter.to_ascii_lowercase();
+        let matches = |r: &RelicInfo| -> bool {
+            filter.is_empty()
+                || r.display.to_ascii_lowercase().contains(&filter)
+                || r.rewards.iter().any(|rw| rw.item_name.to_ascii_lowercase().contains(&filter))
+        };
+        let mut by_tier: HashMap<&str, Vec<&RelicInfo>> = HashMap::new();
+        for relic in index.all().iter().filter(|r| matches(r)) {
+            by_tier.entry(relic.tier.as_str()).or_default().push(relic);
+        }
+        let force_open = (!filter.is_empty()).then_some(true);
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for tier in TIERS {
+                let Some(mut relics) = by_tier.remove(tier) else { continue };
+                relics.sort_by(|a, b| a.code.cmp(&b.code));
+                egui::CollapsingHeader::new(format!("{tier}  ({})", relics.len()))
+                    .id_salt(("relic_ev_tier", tier))
+                    .default_open(false)
+                    .open(force_open)
+                    .show(ui, |ui| {
+                        for relic in relics {
+                            let owned = owned_counts.get(&relic.display).copied().unwrap_or(0);
+                            self.relic_ev_row(ui, relic, &ctx, owned, force_open);
+                        }
+                    });
+            }
+        });
+    }
+
+    /// One relic's row in the Relics EV tab's tree: a collapsed-by-default
+    /// header carrying the owned-count badge (if any) and, once priced, the
+    /// Intact/Radiant EV; expanding it fires the lazy price fetch (once —
+    /// guarded by `pricing.is_none()`, since a spawned fetch immediately
+    /// marks itself `Loading`) and shows a per-reward table meanwhile.
+    fn relic_ev_row(
+        &self,
+        ui: &mut egui::Ui,
+        relic: &RelicInfo,
+        ctx: &RelicEvContext<'_>,
+        owned: u32,
+        force_open: Option<bool>,
+    ) {
+        let RelicEvContext { item_index, quantities, owned_parts } = *ctx;
+        let pricing =
+            self.relic_prices.lock().unwrap_or_else(|p| p.into_inner()).get(&relic.display).cloned();
+
+        let mut header = relic.display.clone();
+        if owned > 0 {
+            header.push_str(&format!("  (owned {owned})"));
+        }
+        match &pricing {
+            Some(RelicPriceState::Ready(prices)) => {
+                let intact = wf_relic::expected_value(&relic.rewards, prices, EvRefinement::Intact);
+                let radiant = wf_relic::expected_value(&relic.rewards, prices, EvRefinement::Radiant);
+                if let (Some(intact), Some(radiant)) = (intact, radiant) {
+                    header.push_str(&format!(
+                        "  INT: {intact:.0}p  RAD: {radiant:.0}p (+{:.0})",
+                        radiant - intact
+                    ));
+                }
+            }
+            Some(RelicPriceState::Loading) => header.push_str("  pricing…"),
+            None => {}
+        }
+
+        let response = egui::CollapsingHeader::new(header)
+            .id_salt(("relic_ev_code", &relic.display))
+            .default_open(false)
+            .open(force_open)
+            .show(ui, |ui| {
+                egui::Grid::new(format!("relic_ev_grid_{}", relic.display))
+                    .num_columns(4)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("reward");
+                        ui.strong("ducats");
+                        ui.strong("plat");
+                        ui.strong("owned / need");
+                        ui.end_row();
+
+                        for reward in &relic.rewards {
+                            ui.horizontal(|ui| {
+                                rarity_pip(ui, &reward.rarity);
+                                ui.label(&reward.item_name);
+                            });
+
+                            let ducats = item_index
+                                .best_match(&reward.item_name)
+                                .and_then(|m| m.item.ducats)
+                                .map(|d| format!("{d}d"))
+                                .unwrap_or_else(|| "—".to_string());
+                            ui.label(ducats);
+
+                            let plat = match &pricing {
+                                Some(RelicPriceState::Ready(prices)) => {
+                                    prices.get(&reward.item_name).copied().flatten()
+                                }
+                                _ => None,
+                            };
+                            ui.label(plat_str(plat));
+
+                            // Highlight a reward whose specific Prime Part
+                            // still falls short of its build quantity — the
+                            // same owned/need vocabulary the Equipment tree
+                            // and Relics & Plan tab already speak.
+                            let pp = wf_relic::mastery::prime_part(&reward.item_name);
+                            let part_owned = wf_relic::owned_parts::get(owned_parts, &pp);
+                            let need = quantities.get(&pp);
+                            let cell = owned_need_cell(part_owned, need);
+                            if need.is_some_and(|n| part_owned.unwrap_or(0) < n) {
+                                ui.colored_label(STALE_COLOR, cell);
+                            } else {
+                                ui.weak(cell);
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+
+        if response.body_returned.is_some() && pricing.is_none() {
+            self.spawn_relic_price_fetch(relic.clone(), item_index.clone());
+        }
     }
 
     /// The full-BOM "Buy or Farm" tab: every part of every unmastered Prime,
@@ -1383,6 +1657,7 @@ impl eframe::App for BrowseApp {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Mastery, "Mastery");
                 ui.selectable_value(&mut self.tab, Tab::Relics, "Relics & Plan");
+                ui.selectable_value(&mut self.tab, Tab::RelicsEv, "Relics EV");
                 ui.selectable_value(&mut self.tab, Tab::BuyOrFarm, "Buy or Farm");
                 ui.selectable_value(&mut self.tab, Tab::Sell, "Sell");
                 ui.selectable_value(&mut self.tab, Tab::Farm, "Farm");
@@ -1393,6 +1668,7 @@ impl eframe::App for BrowseApp {
             match self.tab {
                 Tab::Mastery => self.mastery_tab(ui),
                 Tab::Relics => self.relics_tab(ui),
+                Tab::RelicsEv => self.relics_ev_tab(ui),
                 Tab::BuyOrFarm => self.buy_or_farm_tab(ui),
                 Tab::Sell => self.sell_tab(ui),
                 Tab::Farm => self.farm_tab(ui),
@@ -1428,7 +1704,16 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("XDG_CACHE_HOME", &dir);
 
-        let mut app = BrowseApp::new(Arc::new(Mutex::new(None)), wf_relic::Wishlist::new());
+        // A throwaway runtime just to obtain a `Handle` — this test never
+        // actually spawns anything onto it.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = BrowseApp::new(
+            Arc::new(Mutex::new(None)),
+            wf_relic::Wishlist::new(),
+            rt.handle().clone(),
+            wf_data::http_client(),
+            "pc".to_string(),
+        );
         app.set_wishlisted("Ember Prime Systems", true);
         let on_disk = wf_cache::load_blob::<wf_relic::Wishlist>(wf_relic::WISHLIST_FILE)
             .expect("set_wishlisted should have written wishlist.json")

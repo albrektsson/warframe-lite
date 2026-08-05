@@ -27,10 +27,10 @@ pub use regions::{
     InventoryGridRegions, InventorySlot, Rect, RelicGridRegions, RelicSlot, RewardRegions,
 };
 pub use relics::{
-    active_tier_reward_names, farm_picks, farm_reward_names, mastery_browser, mastery_plan,
-    rank as rank_relics, sell_picks, tier_of, vaulted_rewards, FarmPick, MasteryEntry,
-    PartsOwnedSummary, PrimePartGroup, PrimePlan, PrimeRelicSource, RelicContext, RelicIndex,
-    RelicInfo, RelicPick, OWNED_RELICS_FILE,
+    active_tier_reward_names, expected_value, farm_picks, farm_reward_names, mastery_browser,
+    mastery_plan, rank as rank_relics, sell_picks, tier_of, vaulted_rewards, EvRefinement,
+    FarmPick, MasteryEntry, PartsOwnedSummary, PrimePartGroup, PrimePlan, PrimeRelicSource,
+    RelicContext, RelicIndex, RelicInfo, RelicPick, RelicReward, OWNED_RELICS_FILE,
 };
 pub use wishlist::{Wishlist, WISHLIST_FILE};
 

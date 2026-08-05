@@ -4019,6 +4019,7 @@ version = "0.0.1"
 dependencies = [
  "eframe",
  "futures",
+ "reqwest",
  "tokio",
  "tracing",
  "tracing-subscriber",

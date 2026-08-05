@@ -133,7 +133,12 @@ mod tests {
             display: display.to_string(),
             rewards: rewards
                 .iter()
-                .map(|name| RelicReward { item_name: name.to_string(), rarity: "Uncommon".to_string() })
+                .map(|name| RelicReward {
+                    item_name: name.to_string(),
+                    rarity: "Uncommon".to_string(),
+                    intact_chance: 0.0,
+                    radiant_chance: 0.0,
+                })
                 .collect(),
         }
     }
