@@ -50,7 +50,17 @@ name row.
 
 ## Scope
 
-The phase-anchoring idea and the ink-analysis gates (`looks_like_text`,
-`looks_like_name_line`, `is_blank`) live in `wf-ocr` so the forthcoming
-equipment scan reuses them; only the card geometry and the eye-icon ownership
-signal are relic-specific.
+**Updated by issue #37** (Prime Part owned-count scanning via the
+Inventory/Sell screen), which built the "forthcoming" reuse this ADR
+anticipated: the phase-anchoring idea itself (`best_phase`, `scan_grid`,
+`dedupe_frame` — originally `best_grid_phase`/`scan_relic_grid`/
+`dedupe_frame` in `src/main.rs`) turned out to be screen-agnostic *machinery*,
+not just an OCR primitive, so it was extracted into its own crate,
+**`wf-gridscan`**, rather than folded into `wf-ocr`. `wf-ocr` stays scoped to
+OCR primitives proper (`looks_like_text`, `looks_like_name_line`, `is_blank`,
+`parse_badge`); `wf-gridscan` is where the grid/slot/frame/observation
+concepts live, configured per screen via a `GridConfig` of closures (name
+resolution, badge geometry, an optional ownership-signal fn). Only the card
+geometry (`RelicGridRegions`/`InventoryGridRegions`) and the eye-icon
+ownership signal (relic-specific; the Inventory/Sell screen has none) stay
+outside `wf-gridscan`, in `wf-relic` and `src/main.rs` respectively.

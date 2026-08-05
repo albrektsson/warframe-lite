@@ -3750,6 +3750,7 @@ dependencies = [
  "wf-capture",
  "wf-config",
  "wf-data",
+ "wf-gridscan",
  "wf-log",
  "wf-ocr",
  "wf-overlay",
@@ -4072,6 +4073,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "wf-gridscan"
+version = "0.0.1"
+dependencies = [
+ "image",
+ "wf-ocr",
+]
+
+[[package]]
 name = "wf-log"
 version = "0.0.1"
 dependencies = [
@@ -4113,6 +4122,7 @@ dependencies = [
  "tracing",
  "wf-cache",
  "wf-data",
+ "wf-gridscan",
 ]
 
 [[package]]

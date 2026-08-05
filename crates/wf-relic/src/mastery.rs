@@ -14,6 +14,8 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+use crate::part_quantities::PartQuantities;
+
 /// PC profile endpoint (public, no auth).
 const PC_ENDPOINT: &str = "https://api.warframe.com/cdn/getProfileViewingData.php";
 
@@ -343,6 +345,25 @@ pub fn prime_part(reward: &str) -> PrimePart {
     PrimePart { prime: built_name(reward), part: part_name(reward) }
 }
 
+/// Resolve an Inventory/Sell screen card's raw OCR'd label to its
+/// [`PrimePart`] identity, e.g. `"Ember Prime Systems"` →
+/// `PrimePart { prime: "Ember Prime", part: "Systems" }`.
+///
+/// Uses the same [`prime_part`] split relic reward strings already go
+/// through, but validates the result's `prime` against `quantities`'s
+/// WFCD-derived keyspace ([`PartQuantities::has_prime`]) as the authoritative
+/// check — this *replaces* a raw `"Prime"` substring heuristic rather than
+/// layering on top of it, since Prime Part names are far more distinctive
+/// than relic codes and need no fuzzy matching (unlike
+/// [`crate::RelicIndex::best_match`]). A label whose prime isn't in the
+/// catalogue is dropped (`None`), not counted (see issue #37's
+/// catalog-matching decision, mirroring [`PartQuantities::get`]'s existing
+/// "unknown key → unknown, never guessed" behavior).
+pub fn inventory_prime_part(label: &str, quantities: &PartQuantities) -> Option<PrimePart> {
+    let pp = prime_part(label);
+    quantities.has_prime(&pp.prime).then_some(pp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +407,37 @@ mod tests {
         assert_eq!(
             prime_part("Ember Prime Blueprint"),
             PrimePart { prime: "Ember Prime".to_string(), part: "Blueprint".to_string() }
+        );
+    }
+
+    #[test]
+    fn inventory_prime_part_accepts_a_known_prime_and_drops_an_unknown_one() {
+        let quantities = PartQuantities::from_entries_for_test(vec![(
+            "Ember Prime".to_string(),
+            "Systems".to_string(),
+            1,
+        )]);
+        assert_eq!(
+            inventory_prime_part("Ember Prime Systems", &quantities),
+            Some(PrimePart { prime: "Ember Prime".to_string(), part: "Systems".to_string() })
+        );
+        // Not a known Prime in the catalogue — dropped, not guessed.
+        assert_eq!(inventory_prime_part("Volnus Prime Blueprint", &quantities), None);
+    }
+
+    #[test]
+    fn inventory_prime_part_checks_the_prime_not_the_exact_part_pair() {
+        // Afuris Prime is known, but only its Barrel quantity is in the
+        // catalogue below — Link should still resolve, since only `prime`
+        // (not the exact (prime, part) pair) is the authoritative check.
+        let quantities = PartQuantities::from_entries_for_test(vec![(
+            "Afuris Prime".to_string(),
+            "Barrel".to_string(),
+            2,
+        )]);
+        assert_eq!(
+            inventory_prime_part("Afuris Prime Link", &quantities),
+            Some(PrimePart { prime: "Afuris Prime".to_string(), part: "Link".to_string() })
         );
     }
 

@@ -7,6 +7,7 @@ members = [
     "crates/wf-capture",
     "crates/wf-overlay",
     "crates/wf-ocr",
+    "crates/wf-gridscan",
     "crates/wf-relic",
     "crates/wf-cache",
     "crates/wf-settings",
@@ -24,6 +25,7 @@ default-members = [
     "crates/wf-capture",
     "crates/wf-overlay",
     "crates/wf-ocr",
+    "crates/wf-gridscan",
     "crates/wf-relic",
     "crates/wf-cache",
     "crates/wf-settings",
@@ -45,6 +47,7 @@ wf-log = { path = "crates/wf-log" }
 wf-capture = { path = "crates/wf-capture" }
 wf-overlay = { path = "crates/wf-overlay" }
 wf-ocr = { path = "crates/wf-ocr" }
+wf-gridscan = { path = "crates/wf-gridscan" }
 wf-relic = { path = "crates/wf-relic" }
 wf-cache = { path = "crates/wf-cache" }
 
@@ -79,6 +82,7 @@ wf-log.workspace = true
 wf-capture.workspace = true
 wf-overlay.workspace = true
 wf-ocr.workspace = true
+wf-gridscan.workspace = true
 wf-relic.workspace = true
 wf-cache.workspace = true
 reqwest.workspace = true

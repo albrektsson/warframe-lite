@@ -163,6 +163,67 @@ pub struct RelicPick {
     pub unmastered: Vec<String>,
     /// Lowest market sell price in platinum, if resolved.
     pub plat: Option<u32>,
+    /// This relic's worst-off distinct unmastered Prime Part, per the
+    /// Inventory/Sell screen scan — `None` when the relic has no unmastered
+    /// rewards at all (see [`PartsOwnedSummary`]). Display-only: never
+    /// changes `unmastered`/`plat`-driven ranking or classification.
+    pub parts_owned: Option<PartsOwnedSummary>,
+}
+
+/// One relic's Sell tab owned-Prime-Part summary: the worst-off distinct
+/// unmastered Prime Part it can still drop (smallest owned/need ratio — an
+/// unscanned part, `owned: None`, always sorts worst of all — see issue #37's
+/// downstream-wiring decision), plus how many other distinct unmastered parts
+/// it can also drop, mirroring the overlay's existing "top reward, +N"
+/// truncation pattern.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartsOwnedSummary {
+    pub part: PrimePart,
+    /// How many the player already owns — `None` means never scanned, never
+    /// `0` (see ADR-0011's "never guess an unknown quantity" precedent).
+    pub owned: Option<u32>,
+    /// How many a full build needs, if known (see ADR-0011).
+    pub need: Option<u32>,
+    /// How many *other* distinct unmastered Prime Parts this relic can also
+    /// still drop.
+    pub more: usize,
+}
+
+/// The worst-off distinct unmastered Prime Part `relic` can still drop (see
+/// [`PartsOwnedSummary`]), or `None` if it has no unmastered rewards.
+fn worst_off_part(
+    relic: &RelicInfo,
+    mastery: &MasterySet,
+    quantities: &PartQuantities,
+    owned_parts: &crate::OwnedPrimeParts,
+) -> Option<PartsOwnedSummary> {
+    let mut parts: Vec<PrimePart> = Vec::new();
+    for r in unmastered_rewards(relic, mastery) {
+        let pp = prime_part(&r.item_name);
+        if !parts.contains(&pp) {
+            parts.push(pp);
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    // Sort key: an unscanned part (owned: None) sorts first (worst of all);
+    // among scanned parts, ascending owned/need ratio (need defaults to 1
+    // when unknown) puts the least-progressed part first.
+    let key = |p: &PrimePart| -> (bool, f32) {
+        match crate::owned_parts::get(owned_parts, p) {
+            None => (false, 0.0),
+            Some(o) => {
+                let need = quantities.get(p).unwrap_or(1).max(1);
+                (true, o as f32 / need as f32)
+            }
+        }
+    };
+    parts.sort_by(|a, b| key(a).partial_cmp(&key(b)).unwrap_or(std::cmp::Ordering::Equal));
+    let worst = parts.remove(0);
+    let owned = crate::owned_parts::get(owned_parts, &worst);
+    let need = quantities.get(&worst);
+    Some(PartsOwnedSummary { part: worst, owned, need, more: parts.len() })
 }
 
 /// Rank picks by value: highest plat first, then most unmastered rewards.
@@ -196,11 +257,17 @@ pub fn tier_of(relic_display: &str) -> &str {
 /// already-resolved plat, `None` where unresolved) rather than being fetched
 /// inline, keeping this pure; a slug missing from the map is treated the same
 /// as an explicit `None` — the relic still appears, unpriced.
+///
+/// `quantities` and `owned_parts` populate each pick's [`RelicPick::parts_owned`]
+/// display-only summary — they play no role in `rank`'s plat/unmastered-driven
+/// ordering.
 pub fn sell_picks(
     owned: &HashMap<String, u32>,
     prices: &HashMap<String, Option<u32>>,
     index: &RelicIndex,
     mastery: &MasterySet,
+    quantities: &PartQuantities,
+    owned_parts: &crate::OwnedPrimeParts,
 ) -> Vec<RelicPick> {
     let mut picks: Vec<RelicPick> = index
         .all()
@@ -216,6 +283,7 @@ pub fn sell_picks(
                 count,
                 unmastered: relic.unmastered(mastery),
                 plat,
+                parts_owned: worst_off_part(relic, mastery, quantities, owned_parts),
             })
         })
         .collect();
@@ -403,6 +471,12 @@ pub struct PrimePartGroup {
     /// How many `part.part` a full build needs, if known — never guessed when
     /// unknown (see ADR-0011).
     pub build_quantity: Option<u32>,
+    /// How many the player already owns, per the Inventory/Sell screen scan —
+    /// `None` when this part's card has never been scanned, never `0` (a
+    /// part shows a concrete number only once a scan has actually observed
+    /// its card at least once — see issue #37's downstream-wiring decision,
+    /// following ADR-0011's "never guess an unknown quantity" precedent).
+    pub owned: Option<u32>,
     /// Owned relics that can drop this part, cheapest first (unresolved prices
     /// last) so a plentiful cheap relic is never overlooked in favor of a
     /// pricier — often vaulted — one that happens to be owned too; ties broken
@@ -434,12 +508,19 @@ pub struct PrimePlan {
 /// already-resolved plat, `None` where unresolved) rather than being fetched
 /// inline, keeping this pure and mirroring [`sell_picks`]; a slug missing from
 /// the map is treated the same as an explicit `None`.
+///
+/// `owned_parts` is the Inventory/Sell screen's scanned owned-Prime-Part
+/// counts (see [`crate::OwnedPrimeParts`]), used only to populate each
+/// [`PrimePartGroup::owned`] — it plays no role in which primes/parts appear
+/// or how they're ranked (that's still driven entirely by `owned`, the
+/// owned-*relic* counts).
 pub fn mastery_plan(
     owned: &std::collections::HashMap<String, u32>,
     prices: &HashMap<String, Option<u32>>,
     index: &RelicIndex,
     mastery: &MasterySet,
     quantities: &PartQuantities,
+    owned_parts: &crate::OwnedPrimeParts,
 ) -> Vec<PrimePlan> {
     let mut by_prime: std::collections::HashMap<String, std::collections::HashMap<PrimePart, Vec<PrimeRelicSource>>> =
         std::collections::HashMap::new();
@@ -490,7 +571,8 @@ pub fn mastery_plan(
                             .then_with(|| a.relic_display.cmp(&b.relic_display))
                     });
                     let build_quantity = quantities.get(&pp);
-                    PrimePartGroup { part: pp, build_quantity, relics }
+                    let owned = crate::owned_parts::get(owned_parts, &pp);
+                    PrimePartGroup { part: pp, build_quantity, owned, relics }
                 })
                 .collect();
             parts.sort_by(|a, b| a.part.part.cmp(&b.part.part));
@@ -629,9 +711,9 @@ mod tests {
     #[test]
     fn rank_orders_by_plat_then_unmastered() {
         let mut picks = vec![
-            RelicPick { display: "A".into(), count: 1, unmastered: vec!["x".into()], plat: Some(10) },
-            RelicPick { display: "B".into(), count: 1, unmastered: vec!["x".into(), "y".into()], plat: Some(25) },
-            RelicPick { display: "C".into(), count: 1, unmastered: vec!["x".into(), "y".into()], plat: Some(25) },
+            RelicPick { display: "A".into(), count: 1, unmastered: vec!["x".into()], plat: Some(10), parts_owned: None },
+            RelicPick { display: "B".into(), count: 1, unmastered: vec!["x".into(), "y".into()], plat: Some(25), parts_owned: None },
+            RelicPick { display: "C".into(), count: 1, unmastered: vec!["x".into(), "y".into()], plat: Some(25), parts_owned: None },
         ];
         rank(&mut picks);
         assert_eq!(picks[0].display, "B"); // 25p, 2 unmastered (stable vs C)
@@ -650,7 +732,14 @@ mod tests {
         let owned = HashMap::from([("Meso E1".to_string(), 3)]);
         let prices = HashMap::from([("meso_e1_relic".to_string(), Some(12))]);
 
-        let picks = sell_picks(&owned, &prices, &idx, &mastery);
+        let picks = sell_picks(
+            &owned,
+            &prices,
+            &idx,
+            &mastery,
+            &PartQuantities::empty(),
+            &crate::OwnedPrimeParts::new(),
+        );
 
         assert_eq!(picks.len(), 1);
         assert_eq!(picks[0].display, "Meso E1");
@@ -665,7 +754,14 @@ mod tests {
         let owned = HashMap::from([("Axi H3".to_string(), 1)]);
         let prices = HashMap::new(); // never resolved (timeout/error)
 
-        let picks = sell_picks(&owned, &prices, &idx, &MasterySet::default());
+        let picks = sell_picks(
+            &owned,
+            &prices,
+            &idx,
+            &MasterySet::default(),
+            &PartQuantities::empty(),
+            &crate::OwnedPrimeParts::new(),
+        );
 
         assert_eq!(picks.len(), 1);
         assert_eq!(picks[0].plat, None);
@@ -688,9 +784,99 @@ mod tests {
             ("meso_b2_relic".to_string(), Some(40)),
         ]);
 
-        let picks = sell_picks(&owned, &prices, &idx, &MasterySet::default());
+        let picks = sell_picks(
+            &owned,
+            &prices,
+            &idx,
+            &MasterySet::default(),
+            &PartQuantities::empty(),
+            &crate::OwnedPrimeParts::new(),
+        );
 
         assert_eq!(picks.iter().map(|p| p.display.as_str()).collect::<Vec<_>>(), vec!["Meso B2", "Axi A1"]);
+    }
+
+    #[test]
+    fn sell_picks_parts_owned_is_none_for_a_fully_mastered_relic() {
+        let idx = RelicIndex::new(vec![relic("Meso E1", &["Ember Prime Blueprint"])]);
+        let mastery =
+            MasterySet::from_xp([("/Lotus/Powersuits/Ember/EmberPrime".to_string(), 9_000_000)]);
+        let owned = HashMap::from([("Meso E1".to_string(), 3)]);
+
+        let picks = sell_picks(
+            &owned,
+            &HashMap::new(),
+            &idx,
+            &mastery,
+            &PartQuantities::empty(),
+            &crate::OwnedPrimeParts::new(),
+        );
+
+        assert_eq!(picks[0].parts_owned, None);
+    }
+
+    #[test]
+    fn sell_picks_parts_owned_picks_the_worst_off_part_and_counts_the_rest() {
+        // Two distinct unmastered parts: Barrel is scanned (2/2 = fully
+        // covered), Link has never been scanned (unknown → always worst).
+        let idx = RelicIndex::new(vec![relic(
+            "Axi C3",
+            &["Afuris Prime Barrel", "Afuris Prime Link"],
+        )]);
+        let owned = HashMap::from([("Axi C3".to_string(), 1)]);
+        let quantities = PartQuantities::from_entries_for_test(vec![(
+            "Afuris Prime".to_string(),
+            "Barrel".to_string(),
+            2,
+        )]);
+        let mut owned_parts = crate::OwnedPrimeParts::new();
+        crate::owned_parts::apply_count(
+            &mut owned_parts,
+            &PrimePart { prime: "Afuris Prime".to_string(), part: "Barrel".to_string() },
+            2,
+        );
+
+        let picks =
+            sell_picks(&owned, &HashMap::new(), &idx, &MasterySet::default(), &quantities, &owned_parts);
+
+        let summary = picks[0].parts_owned.as_ref().unwrap();
+        assert_eq!(summary.part.part, "Link"); // unscanned always sorts worst
+        assert_eq!(summary.owned, None);
+        assert_eq!(summary.more, 1); // Barrel is the one other unmastered part
+    }
+
+    #[test]
+    fn sell_picks_parts_owned_ranks_by_owned_need_ratio_when_both_are_scanned() {
+        let idx = RelicIndex::new(vec![relic(
+            "Axi C3",
+            &["Afuris Prime Barrel", "Afuris Prime Link"],
+        )]);
+        let owned = HashMap::from([("Axi C3".to_string(), 1)]);
+        let quantities = PartQuantities::from_entries_for_test(vec![
+            ("Afuris Prime".to_string(), "Barrel".to_string(), 2),
+            ("Afuris Prime".to_string(), "Link".to_string(), 2),
+        ]);
+        let mut owned_parts = crate::OwnedPrimeParts::new();
+        // Barrel: 1/2 = 0.5 ratio. Link: 2/2 = 1.0 ratio — Barrel is worse off.
+        crate::owned_parts::apply_count(
+            &mut owned_parts,
+            &PrimePart { prime: "Afuris Prime".to_string(), part: "Barrel".to_string() },
+            1,
+        );
+        crate::owned_parts::apply_count(
+            &mut owned_parts,
+            &PrimePart { prime: "Afuris Prime".to_string(), part: "Link".to_string() },
+            2,
+        );
+
+        let picks =
+            sell_picks(&owned, &HashMap::new(), &idx, &MasterySet::default(), &quantities, &owned_parts);
+
+        let summary = picks[0].parts_owned.as_ref().unwrap();
+        assert_eq!(summary.part.part, "Barrel");
+        assert_eq!(summary.owned, Some(1));
+        assert_eq!(summary.need, Some(2));
+        assert_eq!(summary.more, 1);
     }
 
     #[test]
@@ -754,7 +940,14 @@ mod tests {
             ("Lith G4".to_string(), 9),  // owned but nothing unmastered → contributes nothing
             ("Neo V9".to_string(), 3),   // owned but not in the index → ignored
         ]);
-        let plans = mastery_plan(&owned, &HashMap::new(), &idx, &mastery, &PartQuantities::empty());
+        let plans = mastery_plan(
+            &owned,
+            &HashMap::new(),
+            &idx,
+            &mastery,
+            &PartQuantities::empty(),
+            &crate::OwnedPrimeParts::new(),
+        );
 
         // Akstiletto Prime's Barrel and Receiver are two different parts, each
         // sourced from a different owned relic: 5 + 2 = 7 total_owned, and it
@@ -799,7 +992,14 @@ mod tests {
             ("lith_v1_relic".to_string(), Some(2)),
             // Meso B4 deliberately absent — unresolved price.
         ]);
-        let plans = mastery_plan(&owned, &prices, &idx, &MasterySet::default(), &PartQuantities::empty());
+        let plans = mastery_plan(
+            &owned,
+            &prices,
+            &idx,
+            &MasterySet::default(),
+            &PartQuantities::empty(),
+            &crate::OwnedPrimeParts::new(),
+        );
 
         let rubico = plans.iter().find(|p| p.prime == "Rubico Prime").unwrap();
         let barrel = rubico.parts.iter().find(|g| g.part.part == "Barrel").unwrap();
@@ -822,7 +1022,14 @@ mod tests {
         )]);
         let owned = std::collections::HashMap::from([("Axi B2".to_string(), 4)]);
 
-        let plans = mastery_plan(&owned, &HashMap::new(), &idx, &MasterySet::default(), &PartQuantities::empty());
+        let plans = mastery_plan(
+            &owned,
+            &HashMap::new(),
+            &idx,
+            &MasterySet::default(),
+            &PartQuantities::empty(),
+            &crate::OwnedPrimeParts::new(),
+        );
 
         let loki = plans.iter().find(|p| p.prime == "Loki Prime").unwrap();
         assert_eq!(loki.total_owned, 4);
@@ -840,13 +1047,48 @@ mod tests {
             2,
         )]);
 
-        let plans = mastery_plan(&owned, &HashMap::new(), &idx, &MasterySet::default(), &quantities);
+        let plans = mastery_plan(
+            &owned,
+            &HashMap::new(),
+            &idx,
+            &MasterySet::default(),
+            &quantities,
+            &crate::OwnedPrimeParts::new(),
+        );
 
         let afuris = plans.iter().find(|p| p.prime == "Afuris Prime").unwrap();
         let barrel = afuris.parts.iter().find(|g| g.part.part == "Barrel").unwrap();
         assert_eq!(barrel.build_quantity, Some(2));
         let link = afuris.parts.iter().find(|g| g.part.part == "Link").unwrap();
         assert_eq!(link.build_quantity, None); // not in the lookup — never guessed at 1
+    }
+
+    #[test]
+    fn mastery_plan_carries_owned_part_count_when_scanned_and_none_when_unscanned() {
+        let idx = RelicIndex::new(vec![relic("Axi C3", &["Afuris Prime Barrel", "Afuris Prime Link"])]);
+        let owned = std::collections::HashMap::from([("Axi C3".to_string(), 1)]);
+        let mut owned_parts = crate::OwnedPrimeParts::new();
+        crate::owned_parts::apply_count(
+            &mut owned_parts,
+            &PrimePart { prime: "Afuris Prime".to_string(), part: "Barrel".to_string() },
+            3,
+        );
+
+        let plans = mastery_plan(
+            &owned,
+            &HashMap::new(),
+            &idx,
+            &MasterySet::default(),
+            &PartQuantities::empty(),
+            &owned_parts,
+        );
+
+        let afuris = plans.iter().find(|p| p.prime == "Afuris Prime").unwrap();
+        let barrel = afuris.parts.iter().find(|g| g.part.part == "Barrel").unwrap();
+        assert_eq!(barrel.owned, Some(3));
+        // Never scanned — unknown, not zero.
+        let link = afuris.parts.iter().find(|g| g.part.part == "Link").unwrap();
+        assert_eq!(link.owned, None);
     }
 
     #[test]

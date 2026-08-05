@@ -119,6 +119,11 @@ pub struct RewardRow {
     pub best_plat: bool,
     /// Whether the built item this reward belongs to is already mastered.
     pub mastered: bool,
+    /// How many of this Prime Part the player already owns, per the
+    /// Inventory/Sell screen scan — `None` when unscanned (unknown, never a
+    /// guessed `0`) or when the row is mastered (see [`render_reward_panel`]:
+    /// only rendered on unmastered rows).
+    pub owned_count: Option<u32>,
 }
 
 // Reward panel palette.
@@ -173,7 +178,19 @@ pub fn render_reward_panel(rows: &[RewardRow], font: &Font) -> Canvas {
         let label = format!("{star}{}", r.name);
         // Mastered items are dimmed (you already have them for mastery).
         let name_color = if r.mastered { DIM } else { TEXT };
-        canvas.draw_text(font, &truncate(&label, name_cols), name_x, y as f32, FONT_PX, name_color);
+        let truncated_label = truncate(&label, name_cols);
+        canvas.draw_text(font, &truncated_label, name_x, y as f32, FONT_PX, name_color);
+
+        // Owned Prime Part count, dim, right after the name — unmastered rows
+        // only (mastered rows have nothing left to count towards; see the
+        // reserved mastery-emblem column above, which this doesn't touch).
+        if !r.mastered {
+            if let Some(n) = r.owned_count {
+                let suffix = format!(" ✓{n}");
+                let name_w = Canvas::text_width(font, &truncated_label, FONT_PX);
+                canvas.draw_text(font, &suffix, name_x + name_w, y as f32, FONT_PX, DIM);
+            }
+        }
 
         let plat = r.plat.map(|p| format!("{p}p")).unwrap_or_else(|| "—".into());
         canvas.draw_text(font, &plat, plat_x, y as f32, FONT_PX, PLAT);
@@ -296,6 +313,36 @@ mod tests {
         assert_eq!(canvas.width, WIDTH);
         let opaque = canvas.buf.chunks_exact(4).filter(|p| p[3] > 0).count();
         assert!(opaque > 100, "expected a visible panel background");
+    }
+
+    #[test]
+    fn owned_count_suffix_renders_only_on_unmastered_rows_with_a_known_count() {
+        // The panel's background fills the whole canvas opaque, so an
+        // alpha-based "ink" count (as other tests here use for "is anything
+        // drawn at all") can't distinguish text from bare background — text
+        // only changes pixel *color*, not opacity. Compare raw buffers
+        // instead: drawing (or skipping) the suffix must change (or not
+        // change) the rendered bytes.
+        let font = load_font().expect("a system monospace font");
+        let row = |owned_count, mastered| RewardRow {
+            name: "Ember Prime Systems".to_string(),
+            plat: Some(10),
+            best_plat: false,
+            mastered,
+            owned_count,
+        };
+
+        // Drawing the "✓3" suffix changes the rendered pixels versus the same
+        // unmastered row with no owned count at all.
+        let unmastered_with_count = render_reward_panel(&[row(Some(3), false)], &font);
+        let unmastered_without_count = render_reward_panel(&[row(None, false)], &font);
+        assert_ne!(unmastered_with_count.buf, unmastered_without_count.buf);
+
+        // A mastered row never renders the suffix, even with a known count —
+        // it must render identically to the same mastered row with no count.
+        let mastered_with_count = render_reward_panel(&[row(Some(3), true)], &font);
+        let mastered_without_count = render_reward_panel(&[row(None, true)], &font);
+        assert_eq!(mastered_with_count.buf, mastered_without_count.buf);
     }
 
     #[test]

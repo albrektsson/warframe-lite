@@ -69,6 +69,7 @@ async fn main() -> Result<()> {
         Some("mastery-plan") => return mastery_plan_cmd(&config).await,
         Some("relic-guide-png") => return relic_guide_png(&config).await,
         Some("relic-grid-file") => return relic_grid_file().await,
+        Some("inventory-grid-file") => return inventory_grid_file().await,
         Some("relic-scan") => return relic_scan(&config).await,
         Some("reward-png") => return reward_png(&config).await,
         _ => {}
@@ -305,6 +306,7 @@ async fn relics_cmd(config: &Config) -> Result<()> {
             count: 1,
             unmastered,
             plat,
+            parts_owned: None,
         });
     }
     cache.save();
@@ -368,6 +370,7 @@ async fn relic_guide_png(config: &Config) -> Result<()> {
                 count: 1,
                 unmastered,
                 plat,
+                parts_owned: None,
             });
         }
     }
@@ -445,6 +448,9 @@ async fn mastery_plan_cmd(config: &Config) -> Result<()> {
             wf_relic::PartQuantities::empty()
         });
     let intact = wf_relic::intact_counts(&owned.value);
+    let owned_parts = wf_cache::load_blob::<wf_relic::OwnedPrimeParts>(wf_relic::OWNED_PRIME_PARTS_FILE)
+        .map(|s| s.value)
+        .unwrap_or_default();
 
     // Price every owned relic (not the whole catalogue) so the breakdown can
     // list cheapest first — the mastery_plan_cmd equivalent of relics_cmd's
@@ -462,7 +468,8 @@ async fn mastery_plan_cmd(config: &Config) -> Result<()> {
     }
     cache.save();
 
-    let plans = wf_relic::mastery_plan(&intact, &relic_prices, &index, &mastery, &quantities);
+    let plans =
+        wf_relic::mastery_plan(&intact, &relic_prices, &index, &mastery, &quantities, &owned_parts);
 
     if plans.is_empty() {
         println!("  no unmastered primes found among your scanned relics");
@@ -756,6 +763,11 @@ const RELIC_AGREEMENT: u32 = 2;
 /// tie-broken bad match (see ADR-0009).
 const SEEN_AGREEMENT: u32 = 2;
 
+/// What a single frame concluded about one card — the relic and Inventory/
+/// Sell scanners share this exact shape, so both use [`wf_gridscan::ObsKind`]
+/// directly rather than each keeping their own copy.
+use wf_gridscan::ObsKind;
+
 /// One relic card's resolved reading on a single frame.
 struct RelicObservation {
     /// Relic display code, e.g. "Meso B9".
@@ -764,176 +776,133 @@ struct RelicObservation {
     kind: ObsKind,
 }
 
-/// What a single frame concluded about one relic card.
-enum ObsKind {
-    /// The count badge read as this value (a genuinely blank badge → 1, since a
-    /// single copy shows no badge on the Void Relics screen).
-    Count(u32),
-    /// The card resolved to a relic but its badge was present-yet-unreadable, so
-    /// this frame casts no count vote rather than guessing.
-    Abstain,
-    /// The "unowned" eye icon is present — positive proof the player owns zero.
-    Unowned,
-}
-
 /// Preprocessing for the relic grid: 4× upscale, light-on-dark threshold.
 fn grid_pre() -> wf_ocr::Preprocess {
-    wf_ocr::Preprocess { scale: 4, threshold: 140, light_text: true }
-}
-
-/// Crop a slot rectangle out of a frame.
-fn crop_rect(image: &image::RgbaImage, r: &wf_relic::Rect) -> image::RgbaImage {
-    image::imageops::crop_imm(image, r.x, r.y, r.w, r.h).to_image()
-}
-
-/// The vertical phase (fraction of a `row_pitch`) whose name band best lands on
-/// real text. The Relics list scrolls continuously, so the true rows sit at an
-/// arbitrary sub-pitch offset; we score a handful of phases by how many name
-/// crops have text-like ink coverage — cheaply, with **no** OCR and no upscale —
-/// and keep the best. This is what makes one aligned OCR pass enough, instead of
-/// OCR-ing every phase (which was ~7× the cost, minutes per frame).
-fn best_grid_phase(image: &image::RgbaImage, regions: &wf_relic::RelicGridRegions) -> f32 {
-    const PHASE_SAMPLES: u32 = 12;
-    let coarse = wf_ocr::Preprocess { scale: 1, threshold: 140, light_text: true };
-    (0..PHASE_SAMPLES)
-        .map(|p| {
-            let phase = p as f32 / PHASE_SAMPLES as f32;
-            let score = regions
-                .slots(image.width(), image.height(), phase)
-                .iter()
-                .filter(|s| {
-                    // A name line spreads across the crop; the badge row above is
-                    // also text but narrow, so require horizontal spread too.
-                    wf_ocr::looks_like_name_line(
-                        &crop_rect(image, &s.name),
-                        coarse,
-                        MAX_NAME_COVERAGE,
-                        MIN_NAME_HSPAN,
-                    )
-                })
-                .count();
-            (p, score)
-        })
-        .max_by_key(|&(_, score)| score)
-        .map(|(p, _)| p as f32 / PHASE_SAMPLES as f32)
-        .unwrap_or(0.0)
+    wf_gridscan::default_grid_preprocess()
 }
 
 /// OCR the Void Relics grid in `image` and resolve each visible card to a
-/// `(relic, refinement)` observation. Reads *every* card — including ones flagged
-/// with the "unowned" eye icon, whose name we now need so a later scan can zero
-/// the right relic — at the single best-aligned vertical phase (see
-/// [`best_grid_phase`]), collapsing the frame to **one** vote per
-/// `(code, refinement)` so the caller's agreement gate counts *frames*, not slots.
+/// `(relic, refinement)` observation, via [`wf_gridscan::scan_grid`] — the
+/// screen-agnostic phase-anchored scan/OCR-confirm loop shared with the
+/// Inventory/Sell scanner (see ADR-0006). Reads *every* card — including ones
+/// flagged with the "unowned" eye icon, whose name we still need so a later
+/// scan can zero the right relic — at the single best-aligned vertical phase,
+/// collapsing the frame to **one** vote per `(code, refinement)` so the
+/// caller's agreement gate counts *frames*, not slots.
 fn scan_relic_grid(
     image: &image::RgbaImage,
     ocr: &wf_ocr::Ocr,
     regions: &wf_relic::RelicGridRegions,
     index: &wf_relic::RelicIndex,
 ) -> Vec<RelicObservation> {
-    let pre = grid_pre();
-    let slots = regions.slots(image.width(), image.height(), best_grid_phase(image, regions));
+    let resolve = |raw: &str| -> Option<(String, wf_relic::Refinement)> {
+        let (base, refinement) = wf_relic::parse_refinement(raw);
+        let info = index.best_match(&base)?;
+        Some((info.display.clone(), refinement))
+    };
+    let ownership_signal = |image: &image::RgbaImage, eye: &wf_gridscan::Rect| card_has_eye(image, eye);
+    let cfg = wf_gridscan::GridConfig {
+        pre: grid_pre(),
+        max_name_coverage: MAX_NAME_COVERAGE,
+        min_name_hspan: MIN_NAME_HSPAN,
+        badge_cap: RELIC_COUNT_CAP,
+        resolve: &resolve,
+        ownership_signal: Some(&ownership_signal),
+    };
+    let slots_for_phase = |w: u32, h: u32, phase: f32| -> Vec<wf_gridscan::Slot> {
+        regions.slots(w, h, phase).into_iter().map(Into::into).collect()
+    };
 
-    // OCR every card concurrently — each slot shells out to tesseract, so ~32
-    // calls run in parallel across cores instead of ~2s×32 serially.
-    let resolved: Vec<Option<(String, wf_relic::Refinement, ObsKind)>> =
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = slots
-                .iter()
-                .map(|slot| {
-                    scope.spawn(move || {
-                        let name_crop = image::imageops::crop_imm(
-                            image, slot.name.x, slot.name.y, slot.name.w, slot.name.h,
-                        )
-                        .to_image();
-                        // Even at the aligned phase, some columns land on artwork
-                        // or empty cells; skip those before paying for OCR — a
-                        // name line's ink coverage is far below solid artwork's.
-                        if !wf_ocr::looks_like_text(&name_crop, pre, MAX_NAME_COVERAGE) {
-                            return None;
-                        }
-                        // Read as a block: refined names wrap onto two lines.
-                        let raw = ocr
-                            .recognize(&name_crop, pre, wf_ocr::PageMode::Block)
-                            .unwrap_or_default()
-                            .replace('\n', " ");
-                        let (base, refinement) = wf_relic::parse_refinement(&raw);
-                        let info = index.best_match(&base)?;
-                        // Read the name even on eye cards (done above) so we can
-                        // attribute the "unowned" proof to the right relic.
-                        let kind = if card_has_eye(image, &slot.eye) {
-                            ObsKind::Unowned
-                        } else {
-                            read_count_badge(image, &slot.count, ocr, pre)
-                        };
-                        Some((info.display.clone(), refinement, kind))
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-
-    dedupe_frame(resolved.into_iter().flatten())
-}
-
-/// Read one card's count badge: a blank crop means the player owns exactly one
-/// (singles show no badge); otherwise a strict `x?NN` parse, abstaining on
-/// anything unreadable (see [`wf_ocr::parse_badge`]).
-fn read_count_badge(
-    image: &image::RgbaImage,
-    count: &wf_relic::Rect,
-    ocr: &wf_ocr::Ocr,
-    pre: wf_ocr::Preprocess,
-) -> ObsKind {
-    let crop =
-        image::imageops::crop_imm(image, count.x, count.y, count.w, count.h).to_image();
-    if wf_ocr::is_blank(&crop, pre) {
-        return ObsKind::Count(1);
-    }
-    let text = ocr.recognize(&crop, pre, wf_ocr::PageMode::Line).unwrap_or_default();
-    match wf_ocr::parse_badge(&text, RELIC_COUNT_CAP) {
-        Some(n) => ObsKind::Count(n),
-        None => ObsKind::Abstain,
-    }
-}
-
-/// Collapse a frame's per-slot reads to one [`RelicObservation`] per
-/// `(code, refinement)`. Owned reads win over an eye flag for the same card
-/// (never zero on an ambiguous frame); the owned count is trusted only if the
-/// slots that read a value agree, otherwise the frame abstains for that card.
-fn dedupe_frame(
-    reads: impl Iterator<Item = (String, wf_relic::Refinement, ObsKind)>,
-) -> Vec<RelicObservation> {
-    use std::collections::HashMap;
-    let mut groups: HashMap<(String, wf_relic::Refinement), Vec<ObsKind>> = HashMap::new();
-    for (display, refinement, kind) in reads {
-        groups.entry((display, refinement)).or_default().push(kind);
-    }
-    groups
+    wf_gridscan::scan_grid(image, ocr, slots_for_phase, &cfg)
         .into_iter()
-        .map(|((display, refinement), kinds)| {
-            let counts: Vec<u32> = kinds
-                .iter()
-                .filter_map(|k| if let ObsKind::Count(n) = k { Some(*n) } else { None })
-                .collect();
-            let owned_reads =
-                counts.len() + kinds.iter().filter(|k| matches!(k, ObsKind::Abstain)).count();
-            let has_unowned = kinds.iter().any(|k| matches!(k, ObsKind::Unowned));
-            let kind = if owned_reads == 0 && has_unowned {
-                ObsKind::Unowned
-            } else if let Some(&first) = counts.first() {
-                // Trust the count only if every slot that read one agrees.
-                if counts.iter().all(|&c| c == first) {
-                    ObsKind::Count(first)
-                } else {
-                    ObsKind::Abstain
-                }
-            } else {
-                ObsKind::Abstain // owned card, but no slot produced a usable count
-            };
-            RelicObservation { display, refinement, kind }
+        .map(|obs| RelicObservation {
+            display: obs.key.0,
+            refinement: obs.key.1,
+            kind: obs.kind,
         })
         .collect()
+}
+
+/// Upper bound on a plausible owned-count reading on the Inventory/Sell
+/// screen. Meaningfully higher than the relic grid's cap: a real capture
+/// showed `✓303` on a non-Prime item in the (out-of-scope) All tab, and even
+/// scoped to the Prime Parts tab a common Blueprint/Systems/Chassis part can
+/// pile up well past a relic's realistic hoard (see issue #37's
+/// region-calibration research, resolving #32).
+const INVENTORY_COUNT_CAP: u32 = 999;
+
+/// How many frames must agree on an Inventory/Sell part's count before it's
+/// believed (see ADR-0005) — same floor the relic scanner uses. Unlike the
+/// relic scanner there is no separate Seen tier here (see issue #37's
+/// catalog-matching decision: this screen's badge is always a single-frame
+/// passive read, so a Seen/Confirmed split has nothing to distinguish);
+/// identity and count are trusted together, once frames agree.
+const INVENTORY_AGREEMENT: u32 = 2;
+
+/// One Inventory/Sell card's resolved reading on a single frame.
+struct InventoryObservation {
+    part: wf_relic::PrimePart,
+    kind: ObsKind,
+}
+
+/// OCR the Inventory/Sell screen's Prime Parts grid in `image` and resolve
+/// each visible card to a [`wf_relic::PrimePart`] observation, via
+/// [`wf_gridscan::scan_grid`] — the same screen-agnostic phase-anchored
+/// scan/OCR-confirm loop [`scan_relic_grid`] uses. No ownership-signal icon:
+/// this screen never lists a 0-owned card (see issue #37's
+/// region-calibration research, resolving #32), so `ObsKind::Unowned` is
+/// structurally possible but never produced here.
+fn scan_inventory_grid(
+    image: &image::RgbaImage,
+    ocr: &wf_ocr::Ocr,
+    regions: &wf_relic::InventoryGridRegions,
+    quantities: &wf_relic::PartQuantities,
+) -> Vec<InventoryObservation> {
+    let resolve = |raw: &str| wf_relic::inventory_prime_part(raw, quantities);
+    let cfg = wf_gridscan::GridConfig {
+        pre: grid_pre(),
+        max_name_coverage: MAX_NAME_COVERAGE,
+        min_name_hspan: MIN_NAME_HSPAN,
+        badge_cap: INVENTORY_COUNT_CAP,
+        resolve: &resolve,
+        ownership_signal: None,
+    };
+    let slots_for_phase = |w: u32, h: u32, phase: f32| -> Vec<wf_gridscan::Slot> {
+        regions.slots(w, h, phase).into_iter().map(Into::into).collect()
+    };
+
+    wf_gridscan::scan_grid(image, ocr, slots_for_phase, &cfg)
+        .into_iter()
+        .map(|obs| InventoryObservation { part: obs.key, kind: obs.kind })
+        .collect()
+}
+
+/// Calibration: OCR the Inventory/Sell Prime Parts grid from a PNG and print
+/// what resolved. `wf-lite inventory-grid-file <path-to-inventory.png>` — use
+/// this against a real capture to correct [`wf_relic::InventoryGridRegions`]'s
+/// currently-estimated absolute-position constants (see its doc comment).
+async fn inventory_grid_file() -> Result<()> {
+    let path = std::env::args()
+        .nth(2)
+        .context("usage: inventory-grid-file <path-to-inventory.png>")?;
+    println!("\n== Inventory grid file: {path} ==");
+    let image = image::open(&path).with_context(|| format!("opening {path}"))?.to_rgba8();
+    let client = http_client();
+    let quantities = wf_relic::PartQuantities::load_cached(&client, CATALOGUE_TTL).await?;
+    let ocr = wf_ocr::Ocr::new()?;
+    let regions = wf_relic::InventoryGridRegions::default_calibration();
+
+    let found = scan_inventory_grid(&image, &ocr, &regions, &quantities);
+    println!("  resolved {} card observations:", found.len());
+    for o in &found {
+        let what = match o.kind {
+            ObsKind::Count(n) => format!("x{n}"),
+            ObsKind::Abstain => "badge unreadable (abstain)".to_string(),
+            ObsKind::Unowned => "UNOWNED (unexpected on this screen)".to_string(),
+        };
+        println!("    {} {} {what}", o.part.prime, o.part.part);
+    }
+    Ok(())
 }
 
 /// Calibration: OCR the Void Relics grid from a PNG and print what resolved.
@@ -954,7 +923,24 @@ async fn relic_grid_file() -> Result<()> {
     // Per-slot debug (eye NCC + OCR) to calibrate ownership + regions, at the
     // same best-aligned phase the live scanner picks.
     let pre = grid_pre();
-    let phase = best_grid_phase(&image, &regions);
+    let resolve = |raw: &str| -> Option<(String, wf_relic::Refinement)> {
+        let (base, refinement) = wf_relic::parse_refinement(raw);
+        let info = index.best_match(&base)?;
+        Some((info.display.clone(), refinement))
+    };
+    let ownership_signal = |image: &image::RgbaImage, eye: &wf_gridscan::Rect| card_has_eye(image, eye);
+    let cfg = wf_gridscan::GridConfig {
+        pre,
+        max_name_coverage: MAX_NAME_COVERAGE,
+        min_name_hspan: MIN_NAME_HSPAN,
+        badge_cap: RELIC_COUNT_CAP,
+        resolve: &resolve,
+        ownership_signal: Some(&ownership_signal),
+    };
+    let slots_for_phase = |w: u32, h: u32, phase: f32| -> Vec<wf_gridscan::Slot> {
+        regions.slots(w, h, phase).into_iter().map(Into::into).collect()
+    };
+    let phase = wf_gridscan::best_phase(&image, slots_for_phase, &cfg);
     for (i, slot) in regions.slots(image.width(), image.height(), phase).iter().enumerate() {
         let ncc = eye_ncc(&image, &slot.eye);
         let raw = ocr
@@ -968,7 +954,7 @@ async fn relic_grid_file() -> Result<()> {
             .replace('\n', " ");
         let (base, refinement) = wf_relic::parse_refinement(&raw);
         let matched = index.best_match(&base).map(|r| r.display.as_str());
-        let badge = read_count_badge(&image, &slot.count, &ocr, pre);
+        let badge = wf_gridscan::read_badge(&image, &slot.count, &ocr, pre, RELIC_COUNT_CAP);
         println!(
             "  slot {i:2}: eye={ncc:+.2} {} ocr={raw:?} -> {} [{refinement:?}] {}",
             if ncc >= EYE_THRESHOLD { "UNOWNED" } else { "owned  " },
@@ -1026,23 +1012,37 @@ async fn relic_scan(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Map evaluated rewards to overlay rows (matched name, plat, best pick, mastery).
+/// Map evaluated rewards to overlay rows (matched name, plat, best pick,
+/// mastery, owned Prime Part count).
+///
+/// `owned_parts` supplies each unmastered row's `owned_count` — the
+/// Inventory/Sell screen's scanned owned-Prime-Part counts (see issue #37's
+/// downstream-wiring decision). A mastered row never carries a count: the
+/// player already has the item, so "how many parts" stops being interesting.
 fn reward_rows(
     evals: &[wf_relic::RewardEval],
     mastery: &wf_relic::MasterySet,
+    owned_parts: &wf_relic::OwnedPrimeParts,
 ) -> Vec<wf_overlay::RewardRow> {
     let bp = wf_relic::best_by_plat(evals);
     evals
         .iter()
         .enumerate()
-        .map(|(i, e)| wf_overlay::RewardRow {
-            name: e.matched_name.clone().unwrap_or_else(|| e.ocr.clone()),
-            plat: e.plat,
-            best_plat: Some(i) == bp,
-            mastered: e
+        .map(|(i, e)| {
+            let mastered = e
                 .matched_name
                 .as_deref()
-                .is_some_and(|n| mastery.is_mastered(n)),
+                .is_some_and(|n| mastery.is_mastered(n));
+            let owned_count = e.matched_name.as_deref().filter(|_| !mastered).and_then(|n| {
+                wf_relic::owned_parts::get(owned_parts, &wf_relic::mastery::prime_part(n))
+            });
+            wf_overlay::RewardRow {
+                name: e.matched_name.clone().unwrap_or_else(|| e.ocr.clone()),
+                plat: e.plat,
+                best_plat: Some(i) == bp,
+                mastered,
+                owned_count,
+            }
         })
         .collect()
 }
@@ -1065,8 +1065,11 @@ async fn reward_png(config: &Config) -> Result<()> {
             .await;
 
     let mastery = load_mastery(config, &client).await;
+    let owned_parts = wf_cache::load_blob::<wf_relic::OwnedPrimeParts>(wf_relic::OWNED_PRIME_PARTS_FILE)
+        .map(|s| s.value)
+        .unwrap_or_default();
     let font = wf_overlay::load_font()?;
-    let canvas = wf_overlay::render_reward_panel(&reward_rows(&evals, &mastery), &font);
+    let canvas = wf_overlay::render_reward_panel(&reward_rows(&evals, &mastery, &owned_parts), &font);
     let img = image::RgbaImage::from_raw(canvas.width, canvas.height, canvas.buf)
         .context("canvas -> image")?;
     let out = "reward.png";
@@ -1196,6 +1199,11 @@ type RelicScanStatus = std::sync::Arc<std::sync::Mutex<Option<wf_overlay::ScanPr
 /// `relic_watch_loop` (which extends it from `EE.log`) and `relic_scan_loop`
 /// (which reads it every iteration to decide whether to scan or idle).
 type RelicDeadline = std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>;
+/// Deadline the owned-Prime-Part scan should keep running until — the
+/// Inventory/Sell screen's counterpart to [`RelicDeadline`], extended by
+/// whatever detects the Inventory/Sell screen opening and read every
+/// iteration by [`inventory_scan_loop`].
+type InventoryDeadline = std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>;
 
 /// Show the live overlay as a `wlr-layer-shell` surface: live Fissures normally,
 /// automatically swapping to the relic reward result for a few seconds when a
@@ -1308,6 +1316,14 @@ async fn run_overlay(config: Config) -> Result<()> {
                     .await
                     .ok()
                     .map(Arc::new);
+                // Prime Part build quantities, doubling as the Inventory/Sell
+                // scanner's catalog-matching authority (see
+                // `wf_relic::inventory_prime_part`) — best-effort, same as
+                // the relic catalogue above.
+                let part_quantities = wf_relic::PartQuantities::load_cached(&client, CATALOGUE_TTL)
+                    .await
+                    .ok()
+                    .map(Arc::new);
                 println!(
                     "  relic auto-detect: ON ({} items; {} relics; {} cached prices; {} mastered; watching {})",
                     index.len(),
@@ -1339,6 +1355,24 @@ async fn run_overlay(config: Config) -> Result<()> {
                     None
                 };
 
+                // The owned-Prime-Part scan mirrors the owned-relic scan
+                // above: its own tightly-looped task, armed by an EE.log
+                // event via `relic_watch_loop`, independent of both the
+                // relic scan and reward-screen detection.
+                let inventory_deadline: Option<InventoryDeadline> =
+                    if let Some(quantities) = part_quantities.clone() {
+                        let deadline: InventoryDeadline = Arc::new(Mutex::new(None));
+                        tokio::spawn(inventory_scan_loop(
+                            deadline.clone(),
+                            ocr.clone(),
+                            quantities,
+                            wf_relic::InventoryGridRegions::default_calibration(),
+                        ));
+                        Some(deadline)
+                    } else {
+                        None
+                    };
+
                 tokio::spawn(async move {
                     if let Err(e) = relic_watch_loop(
                         ee_log,
@@ -1350,6 +1384,7 @@ async fn run_overlay(config: Config) -> Result<()> {
                         reward,
                         wf_relic::RewardRegions::default_calibration(),
                         relic_deadline,
+                        inventory_deadline,
                     )
                     .await
                     {
@@ -1473,14 +1508,20 @@ async fn wait_for_window(timeout: Duration) -> Option<(i32, i32, u32, u32)> {
 /// How long a relic-inventory-open event keeps [`relic_scan_loop`] scanning
 /// (shared: `relic_watch_loop` extends the deadline, `relic_scan_loop` reads it).
 const RELIC_SCAN_WINDOW: Duration = Duration::from_secs(180);
+/// [`RELIC_SCAN_WINDOW`]'s counterpart for [`inventory_scan_loop`], armed by
+/// `Event::InventorySellOpen`.
+const INVENTORY_SCAN_WINDOW: Duration = Duration::from_secs(180);
 
 /// Watch the EE.log for a relic **crack** / reward-screen line, which opens a
 /// poll window scanned until the 4-choice screen resolves (publishing the
 /// ranked reward to `reward`). A **Relics inventory** open
-/// (`RelicInventoryOpen`) instead extends `relic_deadline` — the actual owned-
-/// relic scanning happens in the separate, tightly-looped [`relic_scan_loop`],
-/// so a slow or expensive scan never throttles reward-screen detection (and
-/// vice versa: reward-screen debounce logic never throttles the relic scan).
+/// (`RelicInventoryOpen`) instead extends `relic_deadline`, and an
+/// **Inventory/Sell** open (`InventorySellOpen`) extends `inventory_deadline`
+/// the same way — the actual owned-relic/owned-Prime-Part scanning happens in
+/// their own separate, tightly-looped tasks ([`relic_scan_loop`],
+/// [`inventory_scan_loop`]), so a slow or expensive scan never throttles
+/// reward-screen detection (and vice versa: reward-screen debounce logic
+/// never throttles either scan).
 #[allow(clippy::too_many_arguments)]
 async fn relic_watch_loop(
     ee_log: std::path::PathBuf,
@@ -1492,6 +1533,7 @@ async fn relic_watch_loop(
     reward: RewardState,
     regions: wf_relic::RewardRegions,
     relic_deadline: Option<RelicDeadline>,
+    inventory_deadline: Option<InventoryDeadline>,
 ) -> Result<()> {
     use std::time::Instant;
     use wf_log::Event;
@@ -1529,6 +1571,11 @@ async fn relic_watch_loop(
                 Some(Event::RelicInventoryOpen) => {
                     if let Some(d) = &relic_deadline {
                         *d.lock().unwrap() = Some(Instant::now() + RELIC_SCAN_WINDOW);
+                    }
+                }
+                Some(Event::InventorySellOpen) => {
+                    if let Some(d) = &inventory_deadline {
+                        *d.lock().unwrap() = Some(Instant::now() + INVENTORY_SCAN_WINDOW);
                     }
                 }
                 _ => {}
@@ -1586,7 +1633,13 @@ async fn relic_watch_loop(
         let evals =
             wf_relic::evaluate_cached(&names, &index, &market, &cache, wf_relic::PriceOpts::default())
                 .await;
-        let rows = reward_rows(&evals, &mastery);
+        // Re-read fresh each time: the Inventory/Sell scanner (a separate
+        // task) can update this file independently of this loop's cadence.
+        let owned_parts =
+            wf_cache::load_blob::<wf_relic::OwnedPrimeParts>(wf_relic::OWNED_PRIME_PARTS_FILE)
+                .map(|s| s.value)
+                .unwrap_or_default();
+        let rows = reward_rows(&evals, &mastery, &owned_parts);
         if let Some(best) = wf_relic::best_by_plat(&evals) {
             tracing::info!("reward screen captured — best plat pick = {}", rows[best].name);
         }
@@ -1772,6 +1825,118 @@ fn mark_seen_if_agreed(
     let reads = identity_reads.entry(key.clone()).or_insert(0);
     *reads += 1;
     *reads >= SEEN_AGREEMENT && wf_relic::mark_seen(relic_owned, &key.0, key.1)
+}
+
+/// Scan the Inventory/Sell screen's Prime Parts grid on its own tight
+/// cadence, mirroring [`relic_scan_loop`] — same continuous-scroll,
+/// phase-anchored sampling rationale (see [`wf_relic::InventoryGridRegions`]),
+/// same disk-persisted cumulative owned set. Simpler than the relic loop in
+/// one respect: no Seen tier (see issue #37's catalog-matching decision —
+/// this screen's badge is always a single-frame passive read, so a
+/// Seen/Confirmed split has nothing to distinguish), so a card only ever
+/// needs [`INVENTORY_AGREEMENT`] agreeing frames before its count is applied.
+async fn inventory_scan_loop(
+    inventory_deadline: InventoryDeadline,
+    ocr: std::sync::Arc<wf_ocr::Ocr>,
+    quantities: std::sync::Arc<wf_relic::PartQuantities>,
+    inventory_regions: wf_relic::InventoryGridRegions,
+) {
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    // Same cadence knobs as `relic_scan_loop` — see its doc comment for why.
+    const SCAN_IDLE: Duration = Duration::from_secs(12);
+    const SCAN_COOLDOWN: Duration = Duration::from_millis(100);
+    const IDLE_POLL: Duration = Duration::from_millis(400);
+
+    let owned_path = wf_cache::cache_dir().ok().map(|d| d.join(wf_relic::OWNED_PRIME_PARTS_FILE));
+    let mut owned: wf_relic::OwnedPrimeParts =
+        match wf_cache::load_blob::<wf_relic::OwnedPrimeParts>(wf_relic::OWNED_PRIME_PARTS_FILE) {
+            Some(s) => s.value,
+            None => {
+                if let Some(p) = &owned_path {
+                    if p.exists() {
+                        let bak = p.with_extension("json.bak");
+                        if std::fs::rename(p, &bak).is_ok() {
+                            tracing::info!("backed up unrecognised {} to {}", p.display(), bak.display());
+                        }
+                    }
+                }
+                wf_relic::OwnedPrimeParts::default()
+            }
+        };
+    let mut tally: wf_ocr::Tally<wf_relic::PrimePart> = wf_ocr::Tally::new();
+    let mut session_applied: HashMap<wf_relic::PrimePart, u32> = HashMap::new();
+    let mut was_active = false;
+    let mut last_seen_deadline: Option<Instant> = Some(Instant::now() - SCAN_IDLE * 2);
+    let mut last_new = Instant::now() - SCAN_IDLE * 2;
+
+    loop {
+        let deadline = *inventory_deadline.lock().unwrap();
+        if deadline != last_seen_deadline {
+            last_seen_deadline = deadline;
+            if deadline.is_some() {
+                last_new = Instant::now();
+            }
+        }
+        let active = deadline.is_some_and(|t| Instant::now() < t) && last_new.elapsed() <= SCAN_IDLE;
+
+        if !active {
+            was_active = false;
+            tokio::time::sleep(IDLE_POLL).await;
+            continue;
+        }
+        if !was_active {
+            was_active = true;
+            tally = wf_ocr::Tally::new();
+            session_applied.clear();
+            tracing::info!(
+                "inventory/sell screen opened — scanning as you scroll ({} parts known from before)",
+                owned.values().map(|m| m.len()).sum::<usize>()
+            );
+        }
+
+        let (ocr2, regions2, quantities2) = (ocr.clone(), inventory_regions.clone(), quantities.clone());
+        let scanned = tokio::task::spawn_blocking(move || {
+            let t0 = Instant::now();
+            let cap = wf_capture::capture_warframe(None)?;
+            let captured = t0.elapsed();
+            let found = scan_inventory_grid(&cap.image, &ocr2, &regions2, &quantities2);
+            tracing::debug!(
+                "inventory scan cycle: capture {captured:?}, scan {:?}",
+                t0.elapsed() - captured
+            );
+            Ok::<_, anyhow::Error>(found)
+        })
+        .await;
+        if let Ok(Ok(found)) = scanned {
+            let mut changed = false;
+            for obs in found {
+                let ObsKind::Count(n) = obs.kind else {
+                    continue; // abstain — no vote (Unowned never occurs on this screen)
+                };
+                tally.record(obs.part.clone(), n);
+                let Some(confirmed) = tally.confirmed(&obs.part, INVENTORY_AGREEMENT) else {
+                    continue;
+                };
+                if session_applied.get(&obs.part) == Some(&confirmed) {
+                    continue;
+                }
+                session_applied.insert(obs.part.clone(), confirmed);
+                wf_relic::owned_parts::apply_count(&mut owned, &obs.part, confirmed);
+                changed = true;
+            }
+            if changed {
+                last_new = Instant::now();
+                let _ = wf_cache::save_blob(wf_relic::OWNED_PRIME_PARTS_FILE, &owned);
+                tracing::info!(
+                    "inventory scan: {} parts owned",
+                    owned.values().map(|m| m.len()).sum::<usize>()
+                );
+            }
+        }
+        tokio::time::sleep(SCAN_COOLDOWN).await;
+    }
 }
 
 /// OCR each candidate reward-name slot of an already-captured frame. Slots are

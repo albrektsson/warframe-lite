@@ -68,6 +68,15 @@ impl PartQuantities {
         self.map.get(&(part.prime.clone(), part.part.clone())).copied()
     }
 
+    /// Whether `prime` is a known Prime item name in this catalogue — the
+    /// authoritative check [`crate::mastery::inventory_prime_part`] uses to
+    /// accept or reject an OCR'd Inventory/Sell card label, replacing a raw
+    /// `"Prime"` substring heuristic (see issue #37's catalog-matching
+    /// decision).
+    pub fn has_prime(&self, prime: &str) -> bool {
+        self.map.keys().any(|(p, _)| p == prime)
+    }
+
     /// Fetch + cache (weekly TTL, stale-served on failure), mirroring
     /// [`crate::RelicIndex::load_cached`].
     pub async fn load_cached(client: &reqwest::Client, ttl: Duration) -> anyhow::Result<Self> {
@@ -212,6 +221,17 @@ mod tests {
             quantities.get(&PrimePart { prime: "Afuris Prime".to_string(), part: "Link".to_string() }),
             Some(1)
         );
+    }
+
+    #[test]
+    fn has_prime_true_only_for_a_known_prime() {
+        let quantities = PartQuantities::from_entries_for_test(vec![(
+            "Afuris Prime".to_string(),
+            "Barrel".to_string(),
+            2,
+        )]);
+        assert!(quantities.has_prime("Afuris Prime"));
+        assert!(!quantities.has_prime("Nonexistent Prime"));
     }
 
     #[test]

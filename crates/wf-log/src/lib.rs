@@ -77,6 +77,12 @@ pub enum Event {
     /// grid). Confirmed marker: `ThemedProjectionManager.lua` populates its
     /// inventory grid when the screen appears — used to start an owned-relic scan.
     RelicInventoryOpen,
+
+    /// The **Inventory/Sell** screen was opened (or its grid repopulated by a
+    /// category-tab switch). Confirmed marker (issue #37's region-calibration
+    /// research, resolving #31): `InventoryTest.lua` populates its item grid
+    /// on open and on each tab switch — used to start an owned-Prime-Part scan.
+    InventorySellOpen,
 }
 
 /// Substrings that mark the reward **selection screen appearing**. Confirmed
@@ -97,6 +103,16 @@ pub const RELIC_CRACK_MARKERS: &[&str] = &["DVRCAftermath"];
 /// debounces, so a double-fire is harmless.)
 pub const RELIC_INVENTORY_MARKER: &str = "ThemedProjectionManager.lua: PopulateInventoryGrid";
 
+/// Substring that marks the **Inventory/Sell** screen's grid (re)populating —
+/// on open, and again on every category-tab switch (e.g. to Prime Parts).
+/// Empirically confirmed against a real `EE.log` capture (issue #37's
+/// region-calibration research, resolving #31): the predicted line
+/// `InventoryTest.lua: PopulateGrid()` fired exactly as expected. Deliberately
+/// excludes the trailing `()` so this also matches the `PopulateGrid
+/// complete` line `InventoryTest.lua` emits ~0.8s later — the same
+/// consumer-debounces-a-double-fire shape [`RELIC_INVENTORY_MARKER`] has.
+pub const INVENTORY_SELL_MARKER: &str = "InventoryTest.lua: PopulateGrid";
+
 /// Classify a parsed line into an [`Event`], if it matches a known pattern.
 pub fn classify(line: &LogLine<'_>) -> Option<Event> {
     // Relic markers appear on several subsystems (HudRedux/Transmission on
@@ -110,6 +126,9 @@ pub fn classify(line: &LogLine<'_>) -> Option<Event> {
     }
     if line.message.contains(RELIC_INVENTORY_MARKER) {
         return Some(Event::RelicInventoryOpen);
+    }
+    if line.message.contains(INVENTORY_SELL_MARKER) {
+        return Some(Event::InventorySellOpen);
     }
     match line.subsystem {
         "Sys" if line.message.starts_with("Logged in ") => {
@@ -190,6 +209,33 @@ mod tests {
             event_from_line("49.306 Script [Info]: ThemedProjectionManager.lua: PopulateInventoryGridEnd"),
             Some(Event::RelicInventoryOpen)
         );
+    }
+
+    #[test]
+    fn detects_inventory_sell_open() {
+        // Real captured lines (issue #37): opening the Inventory/Sell screen.
+        assert_eq!(
+            event_from_line("289.679 Script [Info]: InventoryTest.lua: PopulateGrid()"),
+            Some(Event::InventorySellOpen)
+        );
+        // The ~0.8s-later "complete" line also matches (consumer debounces),
+        // same shape as the relic inventory marker's GridEnd double-fire.
+        assert_eq!(
+            event_from_line("290.477 Script [Info]: InventoryTest.lua: PopulateGrid complete"),
+            Some(Event::InventorySellOpen)
+        );
+    }
+
+    #[test]
+    fn inventory_sell_debug_lines_are_not_events() {
+        // Real captured lines that share the InventoryTest.lua source file but
+        // aren't grid-population — must not spuriously arm a scan window.
+        for line in [
+            "281.706 Script [Info]: InventoryTest.lua: DBG: HudVis 0",
+            "289.676 Script [Info]: InventoryTest.lua: InventoryTest - CurrMode: Inventory",
+        ] {
+            assert_eq!(event_from_line(line), None);
+        }
     }
 
     #[test]

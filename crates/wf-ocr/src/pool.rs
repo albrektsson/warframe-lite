@@ -38,8 +38,11 @@ impl Pool {
 
     /// An engine-less stub for unit tests that must never actually touch
     /// libtesseract (so they don't depend on tessdata being installed in the
-    /// test environment). See [`Pool::acquire`].
-    #[cfg(test)]
+    /// test environment). See [`Pool::acquire`]. Also built under the
+    /// `test-util` feature so other crates' tests (e.g. `wf-gridscan`'s) can
+    /// get a stub `Ocr` via [`crate::Ocr::empty_for_test`] without linking
+    /// libtesseract either.
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn empty() -> Self {
         Self { idle: Mutex::new(Vec::new()), cvar: Condvar::new(), capacity: 0 }
     }

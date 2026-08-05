@@ -81,6 +81,15 @@ impl Ocr {
         Ok(Self { pool })
     }
 
+    /// A test double with zero engines: any `recognize()` call that doesn't
+    /// short-circuit on a blank crop panics. Lets other crates' tests build
+    /// an `Ocr` without linking libtesseract or depending on tessdata being
+    /// installed. Gated behind the `test-util` feature.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn empty_for_test() -> Self {
+        Self { pool: pool::Pool::empty() }
+    }
+
     /// Recognise text in `img`, applying `pre` preprocessing and `mode` layout.
     ///
     /// Skips the pool entirely (returning an empty string) when the

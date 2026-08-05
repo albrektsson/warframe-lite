@@ -15,14 +15,10 @@
 //! centred on the capture's actual screen centre rather than a width-scaled
 //! position.
 
-/// A rectangle in screen/window pixels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Rect {
-    pub x: u32,
-    pub y: u32,
-    pub w: u32,
-    pub h: u32,
-}
+/// A rectangle in screen/window pixels. Re-exported from `wf-gridscan`, which
+/// now owns the grid/slot/frame concepts shared with the Inventory/Sell
+/// screen scanner (see `wf-gridscan`'s crate docs).
+pub use wf_gridscan::Rect;
 
 /// Centred-layout parameters at a reference resolution.
 #[derive(Debug, Clone)]
@@ -95,6 +91,12 @@ pub struct RelicSlot {
     /// Search window for the "unowned" eye icon (present only on relics the
     /// player does *not* own). A match here means the card should be skipped.
     pub eye: Rect,
+}
+
+impl From<RelicSlot> for wf_gridscan::Slot {
+    fn from(s: RelicSlot) -> Self {
+        wf_gridscan::Slot { name: s.name, badge: s.count, ownership: Some(s.eye) }
+    }
 }
 
 /// The Void **Relics/Refinement** inventory grid: a regular grid of cards, each
@@ -211,9 +213,154 @@ impl RelicGridRegions {
     }
 }
 
+/// The name + count-badge rectangles for one card in the Inventory/Sell
+/// screen's Prime Parts grid. No eye-icon equivalent: this screen never lists
+/// a 0-owned item (issue #37's region-calibration research, resolving #32).
+#[derive(Debug, Clone, Copy)]
+pub struct InventorySlot {
+    /// The item name text, e.g. "Ember Prime Systems".
+    pub name: Rect,
+    /// The owned-count badge: a checkmark icon + bare digit run (e.g. "✓4"),
+    /// distinct from the Void Relics grid's `xNN` text badge.
+    pub count: Rect,
+}
+
+impl From<InventorySlot> for wf_gridscan::Slot {
+    fn from(s: InventorySlot) -> Self {
+        wf_gridscan::Slot { name: s.name, badge: s.count, ownership: None }
+    }
+}
+
+/// The Inventory/Sell screen's **Prime Parts** tab grid: a regular grid of
+/// cards, each with a `✓N` owned-count badge and the item name below.
+///
+/// Confirmed against three real 3440×1440 captures (issue #37's
+/// region-calibration research, resolving #32): `col_pitch`/`row_pitch` match
+/// [`RelicGridRegions`]'s exactly (283px — visibly the same underlying
+/// card-grid UI component the game reuses across screens), this screen shows
+/// 9 columns rather than 8, and the badge sits roughly 148px left of and
+/// 195px above the name centre (vs. the relic grid's (-79, -180) — this
+/// badge sits flush in the card's top-left corner rather than more inset).
+/// The scroll behavior is the same continuous, phase-drifting kind Void
+/// Relics has, so [`InventoryGridRegions::slots`] takes the same per-frame
+/// `phase` parameter [`RelicGridRegions::slots`] does.
+///
+/// **`col0_cx`, `name_cy0`, `name_w`/`name_h`, `count_h`, and `count_w` are
+/// not yet independently measured** — the three real captures pinned pitch,
+/// column count, and badge offset, but not these absolute placements/sizes.
+/// `col0_cx`/`name_cy0`/`name_w`/`name_h`/`count_h` default to the closest
+/// available reference (`RelicGridRegions`'s own values, since both screens
+/// visibly share one grid component). `count_w` is the one exception: it's
+/// deliberately narrower (90 vs. the relic grid's 120) since this screen's
+/// badge is a checkmark icon + bare digit run, not `xNN` text — still an
+/// unmeasured guess, just not carried over verbatim. All of the above should
+/// be corrected against a live capture — see `wf-lite inventory-grid-file`.
+#[derive(Debug, Clone)]
+pub struct InventoryGridRegions {
+    pub ref_width: u32,
+    pub ref_height: u32,
+    pub cols: u32,
+    pub rows: u32,
+    pub col0_cx: u32,
+    pub col_pitch: u32,
+    pub name_cy0: u32,
+    pub row_pitch: u32,
+    pub name_w: u32,
+    pub name_h: u32,
+    pub count_dx: i32,
+    pub count_dy: i32,
+    pub count_w: u32,
+    pub count_h: u32,
+}
+
+impl InventoryGridRegions {
+    /// Default calibration, measured on 3440×1440 Inventory/Sell (Prime
+    /// Parts tab) screens (9 columns) — see the struct docs for which
+    /// constants are confirmed vs. carried over from [`RelicGridRegions`] as
+    /// a starting estimate.
+    pub fn default_calibration() -> Self {
+        Self {
+            ref_width: 3440,
+            ref_height: 1440,
+            cols: 9,
+            col0_cx: 238,
+            col_pitch: 283,
+            name_cy0: 350,
+            row_pitch: 283,
+            name_w: 250,
+            name_h: 84,
+            // Measured: the "✓N" badge sits at the card's top-left, ~148px
+            // left of and ~195px above the name centre.
+            count_dx: -148,
+            count_dy: -195,
+            count_w: 90,
+            count_h: 48,
+            rows: 6,
+        }
+    }
+
+    /// Name + count rectangles for every visible card at one vertical
+    /// **phase** — see [`RelicGridRegions::slots`], whose scroll-phase
+    /// contract this mirrors exactly (same UI component, same continuous
+    /// scroll behavior).
+    pub fn slots(&self, width: u32, height: u32, phase: f32) -> Vec<InventorySlot> {
+        let sx = width as f32 / self.ref_width as f32;
+        let sy = height as f32 / self.ref_height as f32;
+        let rect_centered = |cx: f32, cy: f32, w: f32, h: f32| Rect {
+            x: (cx - w / 2.0).max(0.0).round() as u32,
+            y: (cy - h / 2.0).max(0.0).round() as u32,
+            w: w.round() as u32,
+            h: h.round() as u32,
+        };
+        let phase_off = self.row_pitch as f32 * phase;
+        let mut out = Vec::with_capacity((self.cols * self.rows) as usize);
+        for row in 0..self.rows {
+            for col in 0..self.cols {
+                let cx = (self.col0_cx + col * self.col_pitch) as f32 * sx;
+                let ncy = (self.name_cy0 as f32 + phase_off + (row * self.row_pitch) as f32) * sy;
+                let name = rect_centered(cx, ncy, self.name_w as f32 * sx, self.name_h as f32 * sy);
+                let count = rect_centered(
+                    cx + self.count_dx as f32 * sx,
+                    ncy + self.count_dy as f32 * sy,
+                    self.count_w as f32 * sx,
+                    self.count_h as f32 * sy,
+                );
+                out.push(InventorySlot { name, count });
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inventory_grid_slots_cover_the_grid() {
+        let g = InventoryGridRegions::default_calibration();
+        let slots = g.slots(3440, 1440, 0.0);
+        assert_eq!(slots.len(), (g.cols * g.rows) as usize);
+        let n0 = slots[0].name;
+        assert_eq!(n0.x + n0.w / 2, g.col0_cx);
+        assert_eq!(n0.y + n0.h / 2, g.name_cy0);
+        // Badge sits up-and-left of the name, like the relic grid's.
+        let c0 = slots[0].count;
+        assert!((c0.x + c0.w / 2) < g.col0_cx && (c0.y + c0.h / 2) < g.name_cy0);
+        // Nine columns (vs. the relic grid's 8).
+        assert_eq!(g.cols, 9);
+    }
+
+    #[test]
+    fn inventory_grid_phase_shifts_rows_the_same_way_as_the_relic_grid() {
+        let g = InventoryGridRegions::default_calibration();
+        let base = g.slots(3440, 1440, 0.0);
+        let shifted = g.slots(3440, 1440, 1.0 / 3.0);
+        let expected = g.row_pitch / 3;
+        assert!(
+            (shifted[0].name.y as i32 - base[0].name.y as i32 - expected as i32).abs() <= 1
+        );
+    }
 
     #[test]
     fn relic_grid_slots_cover_the_grid() {

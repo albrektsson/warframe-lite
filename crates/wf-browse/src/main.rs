@@ -82,12 +82,13 @@ fn main() -> eframe::Result<()> {
     // `rt` is never dropped before `run_native` returns, so the poller spawned
     // on it below keeps running for as long as the window stays open.
     let rt = tokio::runtime::Runtime::new().expect("failed to start tokio runtime");
-    let LoadedData { index, mastery, quantities, owned, active_tiers, prices } =
+    let LoadedData { index, mastery, quantities, owned, owned_parts, active_tiers, prices } =
         rt.block_on(load_data(&config));
 
     let mastery_rows = wf_relic::mastery_browser(&index, &mastery);
     let live = Arc::new(Mutex::new(Live::compute(
         owned.as_ref(),
+        &owned_parts,
         &index,
         &mastery,
         &quantities,
@@ -237,6 +238,7 @@ impl Live {
     /// never change after launch).
     fn compute(
         owned: Option<&wf_cache::Stamped<wf_relic::OwnedRelics>>,
+        owned_parts: &wf_relic::OwnedPrimeParts,
         index: &RelicIndex,
         mastery: &MasterySet,
         quantities: &PartQuantities,
@@ -247,9 +249,12 @@ impl Live {
         // Intact-only); refined copies are tracked but excluded here.
         let intact = owned.map(|o| wf_relic::intact_counts(&o.value));
         // mastery_plan/sell_picks/farm_picks already rank their output.
-        let plans =
-            intact.as_ref().map(|c| wf_relic::mastery_plan(c, &prices.sell, index, mastery, quantities));
-        let sell_picks = intact.as_ref().map(|c| wf_relic::sell_picks(c, &prices.sell, index, mastery));
+        let plans = intact
+            .as_ref()
+            .map(|c| wf_relic::mastery_plan(c, &prices.sell, index, mastery, quantities, owned_parts));
+        let sell_picks = intact.as_ref().map(|c| {
+            wf_relic::sell_picks(c, &prices.sell, index, mastery, quantities, owned_parts)
+        });
         let farm_picks = intact.as_ref().map(|c| wf_relic::farm_picks(c, &prices.farm, index, mastery));
         let owned_age_range = owned.and_then(|o| wf_relic::intact_age_range(&o.value));
         let ages = owned.map(|o| wf_relic::intact_ages(&o.value)).unwrap_or_default();
@@ -273,25 +278,39 @@ async fn poll(
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
         let owned = wf_cache::load_blob::<wf_relic::OwnedRelics>(wf_relic::OWNED_RELICS_FILE);
+        let owned_parts =
+            wf_cache::load_blob::<wf_relic::OwnedPrimeParts>(wf_relic::OWNED_PRIME_PARTS_FILE)
+                .map(|s| s.value)
+                .unwrap_or_default();
         let active_tiers = wf_data::worldstate::fetch(&client, &platform)
             .await
             .map(|ws| ws.active_fissure_tiers())
             .unwrap_or_default();
-        let fresh = Live::compute(owned.as_ref(), &index, &mastery, &quantities, &prices, active_tiers);
+        let fresh = Live::compute(
+            owned.as_ref(),
+            &owned_parts,
+            &index,
+            &mastery,
+            &quantities,
+            &prices,
+            active_tiers,
+        );
         *lock_live(&live) = fresh;
     }
 }
 
 /// Data loaded once at launch: the relic catalogue, the player's mastered set,
 /// Prime Part build quantities, their scanned Owned relic counts (if any),
-/// which relic tiers currently have an active Fissure, and — for owned relics
-/// only — each relic's resolved sell price and each already-mastered reward's
-/// resolved part price.
+/// their scanned owned-Prime-Part counts (if any), which relic tiers
+/// currently have an active Fissure, and — for owned relics only — each
+/// relic's resolved sell price and each already-mastered reward's resolved
+/// part price.
 struct LoadedData {
     index: RelicIndex,
     mastery: MasterySet,
     quantities: PartQuantities,
     owned: Option<wf_cache::Stamped<wf_relic::OwnedRelics>>,
+    owned_parts: wf_relic::OwnedPrimeParts,
     active_tiers: HashSet<String>,
     prices: Prices,
 }
@@ -343,6 +362,10 @@ async fn load_data(config: &Config) -> LoadedData {
         PartQuantities::empty()
     });
     let owned = wf_cache::load_blob::<wf_relic::OwnedRelics>(wf_relic::OWNED_RELICS_FILE);
+    let owned_parts =
+        wf_cache::load_blob::<wf_relic::OwnedPrimeParts>(wf_relic::OWNED_PRIME_PARTS_FILE)
+            .map(|s| s.value)
+            .unwrap_or_default();
     let active_tiers = wf_data::worldstate::fetch(&client, &config.platform)
         .await
         .map(|ws| ws.active_fissure_tiers())
@@ -384,6 +407,7 @@ async fn load_data(config: &Config) -> LoadedData {
         mastery,
         quantities,
         owned,
+        owned_parts,
         active_tiers,
         prices: Prices { sell: sell_prices, farm: farm_prices },
     }
@@ -590,12 +614,12 @@ impl BrowseApp {
                     .striped(true)
                     .show(ui, |ui| {
                         ui.strong("part");
-                        ui.strong("need");
+                        ui.strong("owned / need");
                         ui.strong("relics you own that can still drop it");
                         ui.end_row();
 
                         for g in &p.parts {
-                            let need = g.build_quantity.map(|q| format!("x{q}")).unwrap_or_default();
+                            let need = owned_need_cell(g.owned, g.build_quantity);
                             let breakdown = g
                                 .relics
                                 .iter()
@@ -680,11 +704,12 @@ impl BrowseApp {
         }
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("sell_grid").num_columns(5).striped(true).show(ui, |ui| {
+            egui::Grid::new("sell_grid").num_columns(6).striped(true).show(ui, |ui| {
                 ui.strong("relic");
                 ui.strong("owned");
                 ui.strong("plat");
                 ui.strong("unmastered");
+                ui.strong("parts owned");
                 ui.strong("scanned");
                 ui.end_row();
 
@@ -694,6 +719,7 @@ impl BrowseApp {
                     ui.label(p.count.to_string());
                     ui.label(plat);
                     ui.label(p.unmastered.len().to_string());
+                    ui.label(parts_owned_cell(&p.parts_owned));
                     ui.label(age_cell(&ages, &p.display));
                     ui.end_row();
                 }
@@ -954,6 +980,29 @@ fn stale_marker(ages: &HashMap<String, Duration>, display: &str) -> String {
         Some(age) if *age >= wf_relic::STALE_AFTER => format!(" ⚠{}", wf_cache::format_age(*age)),
         _ => String::new(),
     }
+}
+
+/// The Relics & Plan tab's combined `owned / need` cell, e.g. `"— / x1"`
+/// (never scanned) or `"1 / x1"` (confirmed). Never renders `0` for an
+/// unscanned part — unknown stays `—` (see ADR-0011's precedent, applied to
+/// Prime Part owned counts).
+fn owned_need_cell(owned: Option<u32>, need: Option<u32>) -> String {
+    let owned = owned.map(|o| o.to_string()).unwrap_or_else(|| "—".to_string());
+    let need = need.map(|q| format!("x{q}")).unwrap_or_else(|| "—".to_string());
+    format!("{owned} / {need}")
+}
+
+/// The Sell tab's `parts owned` column: the relic's worst-off unmastered
+/// Prime Part (see [`wf_relic::PrimePartGroup`]'s sibling,
+/// `wf_relic::RelicPick::parts_owned`) as `"<part> <owned>/<need> +N more"`,
+/// mirroring the overlay's existing "top reward, +N" truncation pattern.
+/// Empty for a relic with no unmastered rewards at all.
+fn parts_owned_cell(summary: &Option<wf_relic::PartsOwnedSummary>) -> String {
+    let Some(s) = summary else { return String::new() };
+    let owned = s.owned.map(|o| o.to_string()).unwrap_or_else(|| "—".to_string());
+    let need = s.need.map(|q| format!("x{q}")).unwrap_or_else(|| "—".to_string());
+    let more = if s.more > 0 { format!(" +{} more", s.more) } else { String::new() };
+    format!("{} {owned}/{need}{more}", s.part.part)
 }
 
 /// Shown by the Sell/Farm tabs when the tier/status filters leave nothing to

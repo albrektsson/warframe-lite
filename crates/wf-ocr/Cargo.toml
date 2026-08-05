@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Exposes Ocr::empty_for_test() outside this crate, for other crates' tests
+# (e.g. wf-gridscan's) that need a stub Ocr without linking libtesseract.
+test-util = []
+
 [dependencies]
 anyhow.workspace = true
 tracing.workspace = true
