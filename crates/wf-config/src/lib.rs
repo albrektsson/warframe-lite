@@ -55,6 +55,17 @@ pub struct OverlayConfig {
     /// Panel opacity, `0.0` (invisible) to `1.0` (as-drawn). Scales the whole
     /// panel's alpha so it obscures less of the game behind it.
     pub opacity: f32,
+    /// Override for the reward screen's candidate-centre spacing (distance
+    /// between adjacent card centres, in reference-resolution pixels; see
+    /// `wf_relic::RewardRegions::pitch`). `None` uses the built-in
+    /// calibration. Candidate centres are spaced at half of this value.
+    pub reward_pitch: Option<u32>,
+    /// Override for the reward screen's horizontal centre (in
+    /// reference-resolution pixels; see `wf_relic::RewardRegions::center_x`).
+    /// `None` uses the built-in calibration. Retune either of these two
+    /// fields when OCR on a given display consistently misses the reward
+    /// names — no rebuild required.
+    pub reward_center_x: Option<u32>,
 }
 
 impl Default for OverlayConfig {
@@ -65,6 +76,8 @@ impl Default for OverlayConfig {
             margin_y: 24,
             fissures: true,
             opacity: 1.0,
+            reward_pitch: None,
+            reward_center_x: None,
         }
     }
 }

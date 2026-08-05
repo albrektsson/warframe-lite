@@ -629,6 +629,20 @@ async fn mastery_cmd(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Build the reward-screen candidate-centre geometry, applying any
+/// `[overlay]` config overrides (see issue #6) on top of the built-in
+/// calibration.
+fn reward_regions(config: &Config) -> wf_relic::RewardRegions {
+    let mut regions = wf_relic::RewardRegions::default_calibration();
+    if let Some(pitch) = config.overlay.reward_pitch {
+        regions.pitch = pitch;
+    }
+    if let Some(center_x) = config.overlay.reward_center_x {
+        regions.center_x = center_x;
+    }
+    regions
+}
+
 /// Run the full reward pipeline on a saved PNG (calibration/validation):
 /// OCR the candidate slots, show each slot's text, pick the real rewards, and
 /// rank them. Usage: `wf-lite relic-file <path>`.
@@ -643,7 +657,7 @@ async fn relic_file(config: &Config) -> Result<()> {
 
     let client = http_client();
     let index = wf_relic::ItemIndex::load_cached(&client, CATALOGUE_TTL).await?;
-    let regions = wf_relic::RewardRegions::default_calibration();
+    let regions = reward_regions(config);
     let ocr = wf_ocr::Ocr::new()?;
 
     let slots = ocr_regions(&image, &ocr, &regions);
@@ -1009,7 +1023,7 @@ async fn relic_scan(config: &Config) -> Result<()> {
 
     let client = http_client();
     let index = wf_relic::ItemIndex::load_cached(&client, CATALOGUE_TTL).await?;
-    let regions = wf_relic::RewardRegions::default_calibration();
+    let regions = reward_regions(config);
     let ocr = wf_ocr::Ocr::new()?;
 
     let slots = ocr_regions(&cap.image, &ocr, &regions);
@@ -1054,7 +1068,7 @@ fn reward_rows(
     owned_parts: &wf_relic::OwnedPrimeParts,
     wishlist: &wf_relic::Wishlist,
 ) -> Vec<wf_overlay::RewardRow> {
-    let bp = wf_relic::best_by_plat(evals);
+    let bp = wf_relic::best_pick(evals, mastery);
     evals
         .iter()
         .enumerate()
@@ -1072,7 +1086,7 @@ fn reward_rows(
             wf_overlay::RewardRow {
                 name: e.matched_name.clone().unwrap_or_else(|| e.ocr.clone()),
                 plat: e.plat,
-                best_plat: Some(i) == bp,
+                best_pick: Some(i) == bp,
                 mastered,
                 owned_count,
                 vaulted: e.vaulted,
@@ -1124,12 +1138,12 @@ async fn reward_png(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Print a ranked reward table: plat, best-plat marker, and mastery status.
+/// Print a ranked reward table: plat, best-pick marker, and mastery status.
 fn print_reward_table(evals: &[wf_relic::RewardEval], mastery: &wf_relic::MasterySet) {
-    let best_plat = wf_relic::best_by_plat(evals);
+    let best_pick = wf_relic::best_pick(evals, mastery);
     println!("  {:<26} {:>6}  {:<9} match", "reward", "plat", "mastery");
     for (i, e) in evals.iter().enumerate() {
-        let mark = if Some(i) == best_plat { " ⭐plat" } else { "" };
+        let mark = if Some(i) == best_pick { " ⭐pick" } else { "" };
         let name = e.matched_name.as_deref().unwrap_or("(no match)");
         let mastered = e
             .matched_name
@@ -1487,6 +1501,7 @@ async fn run_overlay(config: Config) -> Result<()> {
                         None
                     };
 
+                let reward_regions = reward_regions(&config);
                 tokio::spawn(async move {
                     if let Err(e) = relic_watch_loop(
                         ee_log,
@@ -1497,7 +1512,7 @@ async fn run_overlay(config: Config) -> Result<()> {
                         mastery,
                         vaulted,
                         reward,
-                        wf_relic::RewardRegions::default_calibration(),
+                        reward_regions,
                         relic_deadline,
                         inventory_deadline,
                     )
@@ -1663,7 +1678,7 @@ fn copy_best_reward(reward: &RewardState) {
         tracing::warn!("copy requested but no active reward to copy");
         return;
     };
-    let Some(best) = rows.iter().find(|r| r.best_plat) else {
+    let Some(best) = rows.iter().find(|r| r.best_pick) else {
         tracing::warn!("copy requested but no best-pick reward row");
         return;
     };
@@ -1913,8 +1928,8 @@ async fn relic_watch_loop(
             .map(|s| s.value)
             .unwrap_or_default();
         let rows = reward_rows(&evals, &mastery, &owned_parts, &wishlist);
-        if let Some(best) = wf_relic::best_by_plat(&evals) {
-            tracing::info!("reward screen captured — best plat pick = {}", rows[best].name);
+        if let Some(best) = wf_relic::best_pick(&evals, &mastery) {
+            tracing::info!("reward screen captured — best pick = {}", rows[best].name);
         }
         *reward.lock().unwrap() = Some((Instant::now(), rows));
         last_shown = Instant::now();
@@ -2244,7 +2259,7 @@ mod clipboard_tests {
         RewardRow {
             name: name.into(),
             plat,
-            best_plat: true,
+            best_pick: true,
             mastered: false,
             owned_count: None,
             vaulted: false,

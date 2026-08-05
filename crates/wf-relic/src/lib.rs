@@ -398,6 +398,33 @@ pub fn best_by_plat(evals: &[RewardEval]) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+/// An unmastered reward may give up this fraction of the top-plat reward's
+/// value and still outrank it — "slightly cheaper" per issue #8: the plat
+/// price alone doesn't capture the mastery progress an unmastered pick still
+/// carries.
+const MASTERY_PREFERENCE_RATIO: f32 = 0.8;
+
+/// Index of the reward to highlight as the overall best pick: the
+/// highest-plat reward, unless the highest-plat *unmastered* reward is priced
+/// within [`MASTERY_PREFERENCE_RATIO`] of it, in which case the unmastered
+/// one wins.
+pub fn best_pick(evals: &[RewardEval], mastery: &MasterySet) -> Option<usize> {
+    let top = best_by_plat(evals)?;
+    let top_plat = evals[top].plat? as f32;
+
+    let unmastered_best = evals
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.plat.is_some())
+        .filter(|(_, e)| e.matched_name.as_deref().is_some_and(|n| !mastery.is_mastered(n)))
+        .max_by_key(|(_, e)| e.plat);
+
+    match unmastered_best {
+        Some((i, e)) if e.plat.unwrap() as f32 >= top_plat * MASTERY_PREFERENCE_RATIO => Some(i),
+        _ => Some(top),
+    }
+}
+
 /// Index of the highest-ducat reward, if any are prime parts.
 pub fn best_by_ducats(evals: &[RewardEval]) -> Option<usize> {
     evals
@@ -492,5 +519,44 @@ mod tests {
         let evals = vec![eval(None, None), eval(None, None)];
         assert_eq!(best_by_plat(&evals), None);
         assert_eq!(best_by_ducats(&evals), None);
+    }
+
+    fn matched_eval(name: &str, plat: Option<u32>) -> RewardEval {
+        RewardEval {
+            ocr: name.to_string(),
+            matched_name: Some(name.to_string()),
+            slug: None,
+            score: 1.0,
+            ducats: None,
+            plat,
+            vaulted: false,
+        }
+    }
+
+    #[test]
+    fn best_pick_prefers_a_close_unmastered_reward_over_a_pricier_mastered_one() {
+        let mastery = MasterySet::from_xp([("/Lotus/Powersuits/Ember/EmberPrime".to_string(), 900_000)]);
+        let evals = vec![
+            matched_eval("Ember Prime Blueprint", Some(100)), // mastered, top plat
+            matched_eval("Nova Prime Blueprint", Some(85)),   // unmastered, within 20%
+        ];
+        assert_eq!(best_pick(&evals, &mastery), Some(1));
+    }
+
+    #[test]
+    fn best_pick_falls_back_to_plat_when_the_unmastered_gap_is_too_wide() {
+        let mastery = MasterySet::from_xp([("/Lotus/Powersuits/Ember/EmberPrime".to_string(), 900_000)]);
+        let evals = vec![
+            matched_eval("Ember Prime Blueprint", Some(100)),
+            matched_eval("Nova Prime Blueprint", Some(50)), // too far below the top pick
+        ];
+        assert_eq!(best_pick(&evals, &mastery), Some(0));
+    }
+
+    #[test]
+    fn best_pick_matches_plat_when_the_top_pick_is_already_unmastered() {
+        let mastery = MasterySet::default();
+        let evals = vec![matched_eval("Ember Prime Blueprint", Some(100)), matched_eval("Nova Prime Blueprint", Some(50))];
+        assert_eq!(best_pick(&evals, &mastery), Some(0));
     }
 }

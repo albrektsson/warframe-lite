@@ -116,7 +116,9 @@ pub fn render_panel(ws: &WorldState, font: &Font) -> Canvas {
 pub struct RewardRow {
     pub name: String,
     pub plat: Option<u32>,
-    pub best_plat: bool,
+    /// Whether this is the overall best pick, per `wf_relic::best_pick`
+    /// (highest plat, unless a close unmastered reward outranks it).
+    pub best_pick: bool,
     /// Whether the built item this reward belongs to is already mastered.
     pub mastered: bool,
     /// How many of this Prime Part the player already owns, per the
@@ -174,7 +176,7 @@ const MARK_H: u32 = 16;
 const VAULT_COLS: f32 = 4.0;
 
 /// Render the relic reward-choice result panel: each choice with its plat/ducat
-/// value, the best-plat row highlighted.
+/// value, the best-pick row highlighted.
 pub fn render_reward_panel(rows: &[RewardRow], font: &Font) -> Canvas {
     let n = rows.len().max(1) as i32;
     let height = (PAD * 2 + (n + 1) * LINE_H) as u32;
@@ -196,8 +198,8 @@ pub fn render_reward_panel(rows: &[RewardRow], font: &Font) -> Canvas {
     let name_cols = ((vault_x - name_x) / charw).floor() as usize;
 
     for r in rows {
-        // Highlight the best-plat row.
-        if r.best_plat {
+        // Highlight the best-pick row.
+        if r.best_pick {
             canvas.fill_round_rect(
                 (PAD / 2) as u32 as i32,
                 y - 15,
@@ -221,7 +223,7 @@ pub fn render_reward_panel(rows: &[RewardRow], font: &Font) -> Canvas {
             }
             RowMarker::None => {}
         }
-        let star = if r.best_plat { "* " } else { "  " };
+        let star = if r.best_pick { "* " } else { "  " };
         let label = format!("{star}{}", r.name);
         // Mastered items are dimmed (you already have them for mastery).
         let name_color = if r.mastered { DIM } else { TEXT };
@@ -379,7 +381,7 @@ mod tests {
         let row = |owned_count, mastered| RewardRow {
             name: "Ember Prime Systems".to_string(),
             plat: Some(10),
-            best_plat: false,
+            best_pick: false,
             mastered,
             owned_count,
             vaulted: false,
@@ -404,7 +406,7 @@ mod tests {
         let row = |mastered, wishlisted| RewardRow {
             name: "Ember Prime Systems".to_string(),
             plat: Some(10),
-            best_plat: false,
+            best_pick: false,
             mastered,
             owned_count: None,
             vaulted: false,
@@ -424,7 +426,7 @@ mod tests {
         let row = |mastered, wishlisted| RewardRow {
             name: "Ember Prime Systems".to_string(),
             plat: Some(10),
-            best_plat: false,
+            best_pick: false,
             mastered,
             owned_count: None,
             vaulted: false,
