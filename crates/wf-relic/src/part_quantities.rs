@@ -11,9 +11,11 @@ use serde::{Deserialize, Serialize};
 use crate::mastery::PrimePart;
 
 const BASE: &str = "https://raw.githubusercontent.com/WFCD/warframe-items/master/data/json";
-// `-v2`: entries gained a `category` field (see `EquipmentCategory`) — bump so
-// an old-format cache isn't deserialized into the new shape.
-const CACHE_FILE: &str = "part-quantities-v2.json";
+// `-v3`: non-tradable resource components (Orokin Cell and the like) are no
+// longer fetched into entries at all — bump so a stale v2 cache, which still
+// has those bogus rows baked in, isn't served for up to a week before this
+// fix takes effect.
+const CACHE_FILE: &str = "part-quantities-v3.json";
 
 /// Per-category files that carry Prime items today. Fetched individually
 /// rather than the much larger combined `All.json` (~54.5MB vs a few MB per
@@ -244,22 +246,37 @@ struct RawComponent {
     name: String,
     #[serde(default, rename = "itemCount")]
     item_count: u32,
+    /// True for an actual relic-sourced Prime Part (Barrel, Blueprint, …),
+    /// false for a plain crafting resource entry (Orokin Cell, Circuits, …)
+    /// that a build recipe also lists in `components`. WFCD tags every
+    /// resource entry `"type": "Resource"` with empty `drops`, and every real
+    /// Prime Part `tradable: true` with populated `drops` — perfectly
+    /// correlated across the whole Prime catalogue, so this flag alone
+    /// distinguishes them without needing to parse `drops` or `type`.
+    #[serde(default)]
+    tradable: bool,
 }
 
 /// Every Prime item's component quantities in one category file's JSON,
 /// tagged with that file's [`EquipmentCategory`] (see [`category_for_file`]).
+/// Non-tradable components (plain crafting resources like Orokin Cell) are
+/// dropped — they're real Foundry ingredients but never a relic-sourced Prime
+/// Part, so they don't belong in a relic-farming BOM.
 fn parse_category(body: &str, category: EquipmentCategory) -> anyhow::Result<Vec<Entry>> {
     let items: Vec<RawItem> = serde_json::from_str(body)?;
     Ok(items
         .into_iter()
         .filter(|i| i.is_prime)
         .flat_map(|i| {
-            i.components.into_iter().map(move |c| Entry {
-                prime: i.name.clone(),
-                part: c.name,
-                quantity: c.item_count,
-                category,
-            })
+            i.components
+                .into_iter()
+                .filter(|c| c.tradable)
+                .map(move |c| Entry {
+                    prime: i.name.clone(),
+                    part: c.name,
+                    quantity: c.item_count,
+                    category,
+                })
         })
         .collect())
 }
@@ -309,14 +326,14 @@ mod tests {
                 "name": "Ash Prime",
                 "isPrime": true,
                 "components": [
-                    {"name": "Blueprint", "itemCount": 1},
-                    {"name": "Chassis", "itemCount": 1}
+                    {"name": "Blueprint", "itemCount": 1, "tradable": true},
+                    {"name": "Chassis", "itemCount": 1, "tradable": true}
                 ]
             },
             {
                 "name": "Ash",
                 "isPrime": false,
-                "components": [{"name": "Blueprint", "itemCount": 1}]
+                "components": [{"name": "Blueprint", "itemCount": 1, "tradable": true}]
             }
         ]"#;
         let entries = parse_category(body, EquipmentCategory::Warframe).unwrap();
@@ -337,10 +354,10 @@ mod tests {
                 "name": "Afuris Prime",
                 "isPrime": true,
                 "components": [
-                    {"name": "Blueprint", "itemCount": 1},
-                    {"name": "Barrel", "itemCount": 2},
-                    {"name": "Receiver", "itemCount": 2},
-                    {"name": "Link", "itemCount": 1}
+                    {"name": "Blueprint", "itemCount": 1, "tradable": true},
+                    {"name": "Barrel", "itemCount": 2, "tradable": true},
+                    {"name": "Receiver", "itemCount": 2, "tradable": true},
+                    {"name": "Link", "itemCount": 1, "tradable": true}
                 ]
             }
         ]"#;
@@ -354,6 +371,27 @@ mod tests {
             quantities.get(&PrimePart { prime: "Afuris Prime".to_string(), part: "Link".to_string() }),
             Some(1)
         );
+    }
+
+    #[test]
+    fn parse_category_drops_non_tradable_resource_components() {
+        // Real WFCD shape for Afentis Prime: Orokin Cell is a plain Foundry
+        // ingredient (type: "Resource", tradable: false, empty drops), not a
+        // relic-sourced Prime Part — it must not show up as a BOM gap.
+        let body = r#"[
+            {
+                "name": "Afentis Prime",
+                "isPrime": true,
+                "components": [
+                    {"name": "Blueprint", "itemCount": 1, "tradable": true},
+                    {"name": "Barrel", "itemCount": 1, "tradable": true},
+                    {"name": "Orokin Cell", "itemCount": 10, "tradable": false, "type": "Resource"}
+                ]
+            }
+        ]"#;
+        let entries = parse_category(body, EquipmentCategory::Primary).unwrap();
+        assert!(!entries.iter().any(|e| e.part == "Orokin Cell"));
+        assert_eq!(entries.len(), 2);
     }
 
     #[test]

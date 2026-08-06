@@ -349,7 +349,6 @@ impl Live {
         let sell_picks = counts.as_ref().map(|c| wf_relic::sell_picks(c, &prices.sell, &ctx));
         let farm_picks = counts.as_ref().map(|c| wf_relic::farm_picks(c, &prices.farm, index, mastery));
         let bom_plans = wf_relic::buy_or_farm_plan(
-            &evidence.unwrap_or_default(),
             &prices.sell,
             &prices.set,
             index,

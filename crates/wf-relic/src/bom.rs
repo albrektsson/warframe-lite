@@ -7,12 +7,11 @@
 use std::collections::HashMap;
 
 use crate::mastery::{MasterySet, PrimePart};
-use crate::owned::RelicEvidence;
 use crate::part_quantities::PartQuantities;
-use crate::relics::{all_relic_sources, relic_sourced_parts, RelicIndex, RelicOption};
+use crate::relics::{all_relic_sources, RelicIndex, RelicOption};
 
-/// One still-missing Prime Part: you don't yet own enough of it (or any, if
-/// never scanned) and no relic evidence covers it.
+/// One still-missing Prime Part: the player doesn't yet own enough of it (or
+/// any, if never scanned).
 #[derive(Debug, Clone)]
 pub struct BomGap {
     pub part: PrimePart,
@@ -31,7 +30,7 @@ pub struct BomGap {
 }
 
 /// One unmastered Prime's full parts list, split into what's still missing
-/// and what's already covered (by owned parts or relic evidence).
+/// and what's already owned in sufficient quantity.
 #[derive(Debug, Clone)]
 pub struct BomPlan {
     /// Built prime name, e.g. "Ember Prime".
@@ -60,16 +59,18 @@ pub fn unmastered_primes(quantities: &PartQuantities, mastery: &MasterySet) -> V
 /// Build the full-BOM "Buy or Farm" view: for every unmastered Prime, every
 /// known component, split into gaps (need buying/farming) and covered parts.
 ///
-/// A part is a gap unless the player already owns at least as many as a
-/// build needs (per the Inventory/Sell screen scan) OR has relic evidence
-/// (confirmed or merely seen) for it — an unscanned owned count doesn't by
-/// itself clear a part, since nothing proves ownership yet.
+/// A part is covered only when the player already owns at least as many as a
+/// build needs, per the Inventory/Sell screen scan — an unscanned owned count
+/// doesn't clear a part, since nothing proves ownership yet. Relic evidence
+/// (owned or merely seen) is *not* enough on its own to call a part covered:
+/// having seen a relic that can drop a part just means a farming path is
+/// known, not that the part is in hand yet, so it still needs buying or
+/// farming until the owned count actually meets the build quantity.
 ///
 /// `prices`/`set_prices`/`quantities`/`owned_parts` are caller-supplied,
 /// already-resolved lookups (see [`crate::mastery_plan`]'s docs for the same
 /// pattern) — a missing key is treated the same as an explicit `None`.
 pub fn buy_or_farm_plan(
-    owned: &HashMap<String, RelicEvidence>,
     prices: &HashMap<String, Option<u32>>,
     set_prices: &HashMap<String, Option<u32>>,
     index: &RelicIndex,
@@ -77,18 +78,13 @@ pub fn buy_or_farm_plan(
     quantities: &PartQuantities,
     owned_parts: &crate::OwnedPrimeParts,
 ) -> Vec<BomPlan> {
-    // Two different relic lookups: `owned_by_part` (relics the player has
-    // evidence for) decides coverage; `all_sources_by_part` (every relic in
-    // the catalogue) supplies what to go buy/farm for an actual gap — a gap
-    // has no owned evidence by construction, so the former is always empty
-    // for it.
-    let (owned_by_part, _) = relic_sourced_parts(owned, prices, index, mastery);
+    // Every relic in the catalogue, regardless of ownership — what to go
+    // buy/farm for an actual gap.
     let all_sources_by_part = all_relic_sources(prices, index, mastery);
 
     unmastered_primes(quantities, mastery)
         .into_iter()
         .map(|prime| {
-            let owned_parts_for_prime = owned_by_part.get(&prime);
             let mut gaps: Vec<BomGap> = Vec::new();
             let mut covered = 0usize;
 
@@ -99,9 +95,7 @@ pub fn buy_or_farm_plan(
 
                 let owned_meets_need =
                     matches!((owned_count, build_quantity), (Some(o), Some(n)) if o >= n);
-                let has_relic_evidence =
-                    owned_parts_for_prime.is_some_and(|m| m.get(&pp).is_some_and(|v| !v.is_empty()));
-                if owned_meets_need || has_relic_evidence {
+                if owned_meets_need {
                     covered += 1;
                 } else {
                     let relics = all_sources_by_part.get(&pp).cloned().unwrap_or_default();
@@ -155,17 +149,20 @@ mod tests {
     }
 
     #[test]
-    fn buy_or_farm_plan_marks_a_part_covered_by_seen_only_relic_as_not_a_gap() {
+    fn buy_or_farm_plan_treats_a_seen_only_relic_as_still_a_gap() {
+        // Seeing a relic that can drop this part (never owning or building
+        // it) is a known farming path, not possession — it must still show
+        // up as a gap rather than being marked covered (this was the Afuris
+        // Prime bug: the tab claimed "all parts covered" while the in-game
+        // Foundry screen still showed missing Barrel/Receiver copies).
         let quantities = PartQuantities::from_entries_for_test(vec![(
             "Afentis Prime".to_string(),
             "Blueprint".to_string(),
             1,
         )]);
         let idx = RelicIndex::new(vec![relic("Axi A22", &["Afentis Prime Blueprint"])]);
-        let owned = HashMap::from([("Axi A22".to_string(), RelicEvidence::SeenOnly)]);
 
         let plans = buy_or_farm_plan(
-            &owned,
             &HashMap::new(),
             &HashMap::new(),
             &idx,
@@ -175,22 +172,20 @@ mod tests {
         );
 
         let afentis = plans.iter().find(|p| p.prime == "Afentis Prime").unwrap();
-        assert_eq!(afentis.covered, 1);
-        assert!(afentis.gaps.is_empty());
+        assert_eq!(afentis.covered, 0);
+        assert_eq!(afentis.gaps.len(), 1);
     }
 
     #[test]
-    fn buy_or_farm_plan_treats_unscanned_owned_as_a_gap_absent_relic_evidence() {
+    fn buy_or_farm_plan_treats_unscanned_owned_as_a_gap() {
         let quantities = PartQuantities::from_entries_for_test(vec![(
             "Kompressa Prime".to_string(),
             "Barrel".to_string(),
             1,
         )]);
         let idx = RelicIndex::new(Vec::new()); // no relic evidence at all
-        let owned = HashMap::new();
 
         let plans = buy_or_farm_plan(
-            &owned,
             &HashMap::new(),
             &HashMap::new(),
             &idx,
@@ -205,13 +200,13 @@ mod tests {
     }
 
     #[test]
-    fn buy_or_farm_plan_marks_a_part_covered_when_owned_meets_build_quantity_absent_relic_evidence() {
-        // No relic evidence at all, but the Inventory/Sell scan shows enough
-        // already built — not a gap. (build_quantity is always known here,
-        // since every part in this enumeration comes from PartQuantities
-        // itself — the "unknown quantity" fallback described in the plan is
-        // exercised instead by mastery_plan's own quantities.get() lookup,
-        // see mastery_plan_carries_build_quantity_when_known_and_none_when_unknown.)
+    fn buy_or_farm_plan_marks_a_part_covered_when_owned_meets_build_quantity() {
+        // The Inventory/Sell scan shows enough already built — not a gap.
+        // (build_quantity is always known here, since every part in this
+        // enumeration comes from PartQuantities itself — the "unknown
+        // quantity" fallback described in the plan is exercised instead by
+        // mastery_plan's own quantities.get() lookup, see
+        // mastery_plan_carries_build_quantity_when_known_and_none_when_unknown.)
         let quantities = PartQuantities::from_entries_for_test(vec![(
             "Afuris Prime".to_string(),
             "Barrel".to_string(),
@@ -228,7 +223,6 @@ mod tests {
         let plans = buy_or_farm_plan(
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             &idx,
             &MasterySet::default(),
             &quantities,
@@ -238,6 +232,39 @@ mod tests {
         let afuris = plans.iter().find(|p| p.prime == "Afuris Prime").unwrap();
         assert_eq!(afuris.covered, 1);
         assert!(afuris.gaps.is_empty());
+    }
+
+    #[test]
+    fn buy_or_farm_plan_marks_a_part_a_gap_when_owned_is_below_build_quantity() {
+        // Afuris Prime needs 2 Barrel; owning only 1 must still be a gap —
+        // this is the reported bug: partial ownership was wrongly counted as
+        // covered.
+        let quantities = PartQuantities::from_entries_for_test(vec![(
+            "Afuris Prime".to_string(),
+            "Barrel".to_string(),
+            2,
+        )]);
+        let idx = RelicIndex::new(Vec::new());
+        let mut owned_parts = crate::OwnedPrimeParts::new();
+        crate::owned_parts::apply_count(
+            &mut owned_parts,
+            &PrimePart { prime: "Afuris Prime".to_string(), part: "Barrel".to_string() },
+            1,
+        );
+
+        let plans = buy_or_farm_plan(
+            &HashMap::new(),
+            &HashMap::new(),
+            &idx,
+            &MasterySet::default(),
+            &quantities,
+            &owned_parts,
+        );
+
+        let afuris = plans.iter().find(|p| p.prime == "Afuris Prime").unwrap();
+        assert_eq!(afuris.covered, 0);
+        assert_eq!(afuris.gaps.len(), 1);
+        assert_eq!(afuris.gaps[0].owned, Some(1));
     }
 
     #[test]
@@ -256,7 +283,6 @@ mod tests {
         // Lith V1 (Stock's relic) deliberately unpriced.
 
         let plans = buy_or_farm_plan(
-            &HashMap::new(),
             &prices,
             &HashMap::new(),
             &idx,
