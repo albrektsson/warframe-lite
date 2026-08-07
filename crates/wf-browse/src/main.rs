@@ -33,8 +33,9 @@ use eframe::egui;
 use futures::stream::{self, StreamExt};
 use wf_config::Config;
 use wf_relic::{
-    EquipmentCategory, EvRefinement, FarmPick, ItemIndex, MasteryEntry, MasterySet, PartMarketInfo,
-    PartQuantities, PrimePart, PrimePlan, RelicIndex, RelicInfo, RelicPick, CATEGORY_ORDER,
+    DucatPick, EquipmentCategory, EvRefinement, FarmPick, ItemIndex, MasteryEntry, MasterySet,
+    PartMarketInfo, PartQuantities, PrimePart, PrimePlan, RelicIndex, RelicInfo, RelicPick,
+    CATEGORY_ORDER,
 };
 
 const CATALOGUE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -59,6 +60,9 @@ const LOADING_REPAINT: Duration = Duration::from_millis(200);
 /// happened yet.
 const NO_OWNED_DATA_MSG: &str = "no owned-relic data yet. Run `wf-lite overlay` (or the tray) and \
      open the in-game Void Relics screen once — it scans automatically as you scroll.";
+/// Shown on the Ducats tab when no Prime Part has been scanned yet.
+const NO_OWNED_PARTS_MSG: &str = "no owned Prime Part data yet. Run `wf-lite overlay` (or the tray) \
+     and open the in-game Inventory/Sell screen once — it scans automatically as you scroll.";
 /// Relic tiers offered by the tier-filter checkboxes, in drop order.
 const TIERS: [&str; 5] = ["Lith", "Meso", "Neo", "Axi", "Requiem"];
 
@@ -235,14 +239,16 @@ fn rarity_pip(ui: &mut egui::Ui, rarity: &str) {
 }
 
 /// Launch-time-resolved market prices for the Sell tab (relic slug → plat),
-/// the Farm tab (mastered reward name → plat), and each unmastered built
-/// Prime's Set (built prime name → plat). Bundled because all three are
-/// fetched once in [`load_data`] and travel together everywhere after —
+/// the Farm tab (mastered reward name → plat), each unmastered built Prime's
+/// Set (built prime name → plat), and the Ducats tab (owned Prime Part's
+/// [`wf_relic::reward_label`] → plat). Bundled because all four are fetched
+/// once in [`load_data`] and travel together everywhere after —
 /// [`LoadedData`], [`Live::compute`], and [`poll`] all need them at once.
 struct Prices {
     sell: HashMap<String, Option<u32>>,
     farm: HashMap<String, Option<u32>>,
     set: HashMap<String, Option<u32>>,
+    ducats: HashMap<String, Option<u32>>,
 }
 
 /// The Relics EV tab's lazy, on-expand pricing state for one relic — `None`
@@ -289,6 +295,12 @@ struct Live {
     /// owned/need cell — refreshed on the same poll cadence as every other
     /// scan-derived field here, unlike the launch-time-only [`Loaded::quantities`].
     owned_parts: wf_relic::OwnedPrimeParts,
+    /// The Ducats tab's ducat-efficiency ranking of every owned Prime Part —
+    /// recomputed each poll tick against the same launch-time `Prices::ducats`
+    /// (a newly-scanned part's ducat value shows immediately since
+    /// `part_market` is catalogue-wide, but its plat price waits for the next
+    /// launch, same as every other owned-driven price in this app).
+    ducat_picks: Vec<wf_relic::DucatPick>,
 }
 
 /// Launch-time [`load_data`] plus the first [`Live::compute`] derived from
@@ -323,6 +335,18 @@ fn lock_loaded(m: &Mutex<Option<Loaded>>) -> std::sync::MutexGuard<'_, Option<Lo
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The catalogue-side inputs [`Live::compute`] derives every tab from that
+/// stay fixed after launch (see [`Loaded`]'s docs) — bundled so `compute`
+/// takes one reference instead of growing an argument per catalogue lookup
+/// (clippy's `too_many_arguments`).
+#[derive(Clone, Copy)]
+struct StaticData<'a> {
+    index: &'a RelicIndex,
+    mastery: &'a MasterySet,
+    quantities: &'a PartQuantities,
+    part_market: &'a HashMap<PrimePart, PartMarketInfo>,
+}
+
 impl Live {
     /// Derive the live view from a fresh Owned relic read + active-Fissure
     /// set, against the launch-time relic catalogue/mastery/prices (which
@@ -330,12 +354,11 @@ impl Live {
     fn compute(
         owned: Option<&wf_cache::Stamped<wf_relic::OwnedRelics>>,
         owned_parts: &wf_relic::OwnedPrimeParts,
-        index: &RelicIndex,
-        mastery: &MasterySet,
-        quantities: &PartQuantities,
+        static_data: &StaticData,
         prices: &Prices,
         active_tiers: HashSet<String>,
     ) -> Self {
+        let StaticData { index, mastery, quantities, part_market } = *static_data;
         // sell_picks/farm_picks only rank relics with a confirmed count;
         // mastery_plan additionally surfaces seen-but-unconfirmed relics via
         // the richer evidence map (see wf_relic::owned_evidence).
@@ -358,6 +381,8 @@ impl Live {
         );
         let owned_age_range = owned.and_then(|o| wf_relic::intact_age_range(&o.value));
         let ages = owned.map(|o| wf_relic::intact_ages(&o.value)).unwrap_or_default();
+        let ducat_picks =
+            wf_relic::ducat_picks(owned_parts, part_market, &prices.ducats, quantities, mastery);
         Self {
             plans,
             sell_picks,
@@ -367,6 +392,7 @@ impl Live {
             ages,
             active_tiers,
             owned_parts: owned_parts.clone(),
+            ducat_picks,
         }
     }
 }
@@ -392,15 +418,9 @@ async fn load_and_poll(loaded: Arc<Mutex<Option<Loaded>>>, config: Config) {
     let index = Arc::new(index);
     let item_index = Arc::new(item_index);
     let mastery_rows = wf_relic::mastery_browser(&index, &mastery);
-    let live = Live::compute(
-        owned.as_ref(),
-        &owned_parts,
-        &index,
-        &mastery,
-        &quantities,
-        &prices,
-        active_tiers,
-    );
+    let static_data =
+        StaticData { index: &index, mastery: &mastery, quantities: &quantities, part_market: &part_market };
+    let live = Live::compute(owned.as_ref(), &owned_parts, &static_data, &prices, active_tiers);
     *lock_loaded(&loaded) = Some(Loaded {
         mastery_rows,
         live,
@@ -410,18 +430,19 @@ async fn load_and_poll(loaded: Arc<Mutex<Option<Loaded>>>, config: Config) {
         item_index: item_index.clone(),
     });
 
-    poll(loaded, index, mastery, quantities, prices, config.platform).await;
+    poll(loaded, index, mastery, quantities, part_market, prices, config.platform).await;
 }
 
 /// Re-read `owned-relics.json` and re-fetch world state every [`POLL_INTERVAL`],
 /// refreshing `loaded`'s `live` field — the only two things cheap/fast-changing
-/// enough to poll. The relic catalogue, mastery, and Sell/Farm-tab prices stay
-/// exactly as loaded at launch; only re-running the app refreshes those.
+/// enough to poll. The relic catalogue, mastery, and Sell/Farm/Ducats-tab prices
+/// stay exactly as loaded at launch; only re-running the app refreshes those.
 async fn poll(
     loaded: Arc<Mutex<Option<Loaded>>>,
     index: Arc<RelicIndex>,
     mastery: MasterySet,
     quantities: Arc<PartQuantities>,
+    part_market: Arc<HashMap<PrimePart, PartMarketInfo>>,
     prices: Prices,
     platform: String,
 ) {
@@ -437,15 +458,13 @@ async fn poll(
             .await
             .map(|ws| ws.active_fissure_tiers())
             .unwrap_or_default();
-        let fresh = Live::compute(
-            owned.as_ref(),
-            &owned_parts,
-            &index,
-            &mastery,
-            &quantities,
-            &prices,
-            active_tiers,
-        );
+        let static_data = StaticData {
+            index: &index,
+            mastery: &mastery,
+            quantities: &quantities,
+            part_market: &part_market,
+        };
+        let fresh = Live::compute(owned.as_ref(), &owned_parts, &static_data, &prices, active_tiers);
         if let Some(l) = lock_loaded(&loaded).as_mut() {
             l.live = fresh;
         }
@@ -574,6 +593,26 @@ async fn load_data(config: &Config) -> LoadedData {
         .collect();
     let set_prices = fetch_prices(resolved_sets, &cache, &market, |(prime, slug)| (prime, slug)).await;
 
+    // Ducats-tab pricing: every owned Prime Part's plat price, resolved once
+    // at launch like sell/farm/set pricing above. A newly-scanned part shows
+    // its ducat value immediately (`part_market_info` below is catalogue-wide,
+    // not owned-driven) but waits for its plat price until the next launch,
+    // same as every other owned-driven price in this app.
+    let owned_part_names: Vec<String> = owned_parts
+        .iter()
+        .flat_map(|(prime, parts)| {
+            parts.keys().map(move |part| {
+                wf_relic::reward_label(&PrimePart { prime: prime.clone(), part: part.clone() })
+            })
+        })
+        .collect();
+    let resolved_owned_parts: Vec<(String, String)> = owned_part_names
+        .into_iter()
+        .filter_map(|name| item_index.best_match(&name).map(|m| (name, m.item.slug.clone())))
+        .collect();
+    let ducat_prices =
+        fetch_prices(resolved_owned_parts, &cache, &market, |(name, slug)| (name, slug)).await;
+
     cache.save();
 
     let part_market = wf_relic::part_market_info(&quantities, &item_index);
@@ -585,14 +624,14 @@ async fn load_data(config: &Config) -> LoadedData {
         owned,
         owned_parts,
         active_tiers,
-        prices: Prices { sell: sell_prices, farm: farm_prices, set: set_prices },
+        prices: Prices { sell: sell_prices, farm: farm_prices, set: set_prices, ducats: ducat_prices },
         part_market,
         item_index,
     }
 }
 
 /// The browser's tabs: Mastery, Relics & Plan, Relics EV, Buy or Farm, Sell,
-/// Farm, and Owned.
+/// Farm, Ducats, and Owned.
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
     Mastery,
@@ -601,6 +640,7 @@ enum Tab {
     BuyOrFarm,
     Sell,
     Farm,
+    Ducats,
     Owned,
 }
 
@@ -668,6 +708,10 @@ struct BrowseApp {
     reset_confirm: bool,
     /// Editable text buffer for the Relics EV tab's search box.
     relic_ev_filter: String,
+    /// The Ducats tab's default filter: only show parts whose Built prime is
+    /// already mastered (pure ducat-fodder) — toggled off to reveal every
+    /// owned part.
+    ducats_mastered_only: bool,
     /// `None` until the background [`load_and_poll`] task finishes; its
     /// `live` field is refreshed in place afterward by [`poll`] every
     /// [`POLL_INTERVAL`].
@@ -713,6 +757,7 @@ impl BrowseApp {
             owned_filter: String::new(),
             reset_confirm: false,
             relic_ev_filter: String::new(),
+            ducats_mastered_only: true,
             loaded,
             wishlist,
             relic_prices: Arc::new(Mutex::new(HashMap::new())),
@@ -1421,6 +1466,56 @@ impl BrowseApp {
         );
     }
 
+    /// The Ducats tab: every owned Prime Part ranked by Ducat efficiency
+    /// (ducats ÷ plat, descending — see CONTEXT.md) — warframe.market's own
+    /// "which parts are worth trading in for ducats over listing" question,
+    /// applied to what's actually in inventory. Defaults to mastered-primes-
+    /// only (pure ducat-fodder, nothing lost by dumping them); toggling it
+    /// off reveals every owned part, including ones a build still needs.
+    fn ducats_tab(&mut self, ui: &mut egui::Ui) {
+        let Some(picks) = self.loaded_or_placeholder(ui, |l| l.live.ducat_picks.clone()) else {
+            return;
+        };
+
+        if picks.is_empty() {
+            ui.label(NO_OWNED_PARTS_MSG);
+            return;
+        }
+
+        ui.checkbox(&mut self.ducats_mastered_only, "Mastered primes only");
+        ui.add_space(4.0);
+
+        let rows: Vec<&DucatPick> =
+            picks.iter().filter(|p| !self.ducats_mastered_only || p.mastered).collect();
+
+        if rows.is_empty() {
+            ui.label("no owned parts match the current filter");
+            return;
+        }
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new("ducats_grid").num_columns(5).striped(true).show(ui, |ui| {
+                ui.strong("part");
+                ui.strong("owned / need");
+                ui.strong("ducats");
+                ui.strong("plat");
+                ui.strong("efficiency");
+                ui.end_row();
+
+                for p in &rows {
+                    ui.label(format!("{} {}", p.part.prime, p.part.part));
+                    ui.label(owned_need_cell(Some(p.owned), p.build_quantity));
+                    ui.label(p.ducats.map(|d| format!("{d}d")).unwrap_or_else(|| "—".to_string()));
+                    ui.label(plat_str(p.plat));
+                    ui.label(
+                        p.efficiency.map(|e| format!("{e:.2}")).unwrap_or_else(|| "—".to_string()),
+                    );
+                    ui.end_row();
+                }
+            });
+        });
+    }
+
     /// Raw owned-relic inventory, across every refinement (unlike the
     /// Intact-only Relics/Sell/Farm tabs) — where a specific `(code,
     /// refinement)` entry can be cleared, or the whole set reset. See
@@ -1660,6 +1755,7 @@ impl eframe::App for BrowseApp {
                 ui.selectable_value(&mut self.tab, Tab::BuyOrFarm, "Buy or Farm");
                 ui.selectable_value(&mut self.tab, Tab::Sell, "Sell");
                 ui.selectable_value(&mut self.tab, Tab::Farm, "Farm");
+                ui.selectable_value(&mut self.tab, Tab::Ducats, "Ducats");
                 ui.selectable_value(&mut self.tab, Tab::Owned, "Owned");
             });
             ui.separator();
@@ -1671,6 +1767,7 @@ impl eframe::App for BrowseApp {
                 Tab::BuyOrFarm => self.buy_or_farm_tab(ui),
                 Tab::Sell => self.sell_tab(ui),
                 Tab::Farm => self.farm_tab(ui),
+                Tab::Ducats => self.ducats_tab(ui),
                 Tab::Owned => self.owned_tab(ui),
             }
         });

@@ -5,6 +5,7 @@ pub mod bom;
 pub mod index;
 pub mod mastery;
 pub mod owned;
+pub mod ducats;
 pub mod owned_parts;
 pub mod part_market;
 pub mod part_quantities;
@@ -20,6 +21,7 @@ pub use owned::{
     owned_counts, owned_evidence, parse_refinement, OwnedCount, OwnedEntry, OwnedRelics,
     RelicEvidence, Refinement, STALE_AFTER,
 };
+pub use ducats::{ducat_picks, DucatPick};
 pub use owned_parts::{OwnedPrimeParts, OWNED_PRIME_PARTS_FILE};
 pub use part_market::{reward_label, resolve as part_market_info, PartMarketInfo};
 pub use part_quantities::{EquipmentCategory, PartQuantities, CATEGORY_ORDER};

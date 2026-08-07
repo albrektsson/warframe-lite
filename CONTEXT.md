@@ -136,6 +136,14 @@ ADR-0004). Surfaces as its own marker on the reward screen, separate from the
 mastery emblem.
 _Avoid_: Favorite, tracked item, reward part (superseded by Prime Part).
 
+**Ducat efficiency**:
+An owned Prime Part's ducat value divided by its lowest active platinum sell
+price — ranks how much more the part is worth trading in for ducats at
+Baro Ki'Teer's ducat store versus listing it on warframe.market. Basis for
+the Ducats tab's default sort (highest efficiency first).
+_Avoid_: Ducat/plat ratio (fine informally, but "efficiency" is the canonical
+term for the sorted metric itself).
+
 ### Out of scope: general world state
 
 **World state** (out of scope):
