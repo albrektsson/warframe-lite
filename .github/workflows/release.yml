@@ -41,7 +41,7 @@ jobs:
         # The lean overlay binary plus the optional companions (settings GUI and
         # tray), each a separate crate so the overlay stays dependency-light.
         run: cargo build --locked --release -p warframe-lite -p wf-settings -p wf-tray
-      - uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # ratchet:taiki-e/install-action@v2
+      - uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # ratchet:taiki-e/install-action@v2
         with:
           tool: git-cliff
       - name: Generate release notes
