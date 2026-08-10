@@ -259,6 +259,10 @@ async fn mem_scan_cmd() -> Result<()> {
     let rivens = wf_mem::parse_rivens(&raw)?;
     print_rivens(&rivens);
 
+    println!("\n== mem-scan: Relics (LevelKeys) ==");
+    let level_keys = wf_mem::parse_level_keys(&raw)?;
+    print_level_keys(&level_keys);
+
     Ok(())
 }
 
@@ -334,6 +338,24 @@ fn print_rivens(state: &wf_mem::RivenState) {
             };
             println!("      buffs: {}   curses: {}", tags(&r.buffs), tags(&r.curses));
         }
+    }
+}
+
+/// Print raw `LevelKeys[]` state in the app's existing output style (cf.
+/// `print_foundry`) — aligned columns, not a raw JSON dump. This is a raw
+/// exposure only (see `wf_mem::level_keys`'s module doc): no refinement
+/// decoding, no dedup against the existing OCR-based Seen/Confirmed relic
+/// scan (ADR-0009) — that pipeline is untouched and out of scope here.
+#[cfg(feature = "mem-scan")]
+fn print_level_keys(state: &wf_mem::LevelKeyState) {
+    if state.level_keys.is_empty() {
+        println!("  no LevelKeys entries found");
+        return;
+    }
+
+    println!("  entries ({}):", state.level_keys.len());
+    for k in &state.level_keys {
+        println!("    {:<32} x{}", readable_item_name(&k.item_type), k.item_count);
     }
 }
 

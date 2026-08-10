@@ -1,0 +1,23 @@
+{
+  "_comment": "Synthetic/sanitized — shaped per docs/research/mobile-inventory-api-coverage.md's reconstruction of DE's inventory.php schema (RawInventoryEntry: ItemType/ItemCount). Not a real captured response; the real one from issue #52 has live account data and can't be committed.",
+  "LevelKeys": [
+    {
+      "_id": { "$oid": "5f1b2c3d4e5f6a7b8c9d0e30" },
+      "ItemType": "/Lotus/Types/Game/Projections/MesoA1RelicItem",
+      "ItemCount": 4
+    },
+    {
+      "_id": { "$oid": "5f1b2c3d4e5f6a7b8c9d0e31" },
+      "ItemType": "/Lotus/Types/Game/Projections/AxiN13RelicItem",
+      "ItemCount": 1
+    },
+    {
+      "_id": { "$oid": "5f1b2c3d4e5f6a7b8c9d0e32" },
+      "ItemType": "/Lotus/Types/Game/Projections/LithV1RelicItem"
+    }
+  ],
+  "Suits": [
+    { "ItemType": "/Lotus/Powersuits/Excalibur/ExcaliburSuit", "XP": 1234567 }
+  ],
+  "RegularCredits": 458213
+}
