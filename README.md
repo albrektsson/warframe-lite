@@ -121,7 +121,39 @@ wf-lite set-account <id>   # save your account id for mastery lookup
 wf-lite mastery [id]       # report your mastered-item count
 wf-lite logstats           # parse whole EE.log history, report coverage/events
 wf-lite logwatch           # follow EE.log live, print recognized events
+wf-lite mem-scan           # (feature-gated) read live Foundry state — see "mem-scan" below
 ```
+
+### mem-scan (Phase 4, feature-gated)
+
+`mem-scan` reads Foundry state (in-progress and owned Prime blueprints)
+straight out of the running game's own memory, then echoes the session token
+it finds there once to DE's own `inventory.php` endpoint — see
+[ADR-0001](docs/adr/0001-observe-only-never-touch-game-process.md) and
+[ADR-0013](docs/adr/0013-token-relay-session-nonce-is-not-a-credential.md)
+for why this is a read, not a held credential. Nothing it reads is ever
+cached or written to disk.
+
+It's opt-in at build time and isn't part of the default build:
+
+```
+cargo build --release --features mem-scan
+```
+
+Running `wf-lite mem-scan` at all **is** the explicit in-the-moment consent
+this feature assumes — it doesn't prompt separately. It needs Warframe
+already running and logged in, and the binary needs permission to read
+another process's memory. This map decided against wiring that into
+packaging, so it's a manual, one-time step after each build/install:
+
+```
+sudo setcap cap_sys_ptrace=+ep /path/to/wf-lite
+```
+
+(Alternatively, lower `/proc/sys/kernel/yama/ptrace_scope` to `1` or below —
+`setcap` is the narrower, per-binary grant and the preferred option.) Without
+either, `mem-scan` fails immediately with a clear permission error naming
+both fixes, rather than a bare I/O error.
 
 ## Configuration
 

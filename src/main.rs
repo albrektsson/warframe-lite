@@ -73,6 +73,8 @@ async fn main() -> Result<()> {
         Some("inventory-grid-file") => return inventory_grid_file().await,
         Some("relic-scan") => return relic_scan(&config).await,
         Some("reward-png") => return reward_png(&config).await,
+        #[cfg(feature = "mem-scan")]
+        Some("mem-scan") => return mem_scan_cmd().await,
         _ => {}
     }
 
@@ -147,6 +149,11 @@ DIAGNOSTICS
 
 Config: ~/.config/warframe-lite/config.toml   Docs: README.md
 "
+    );
+    #[cfg(feature = "mem-scan")]
+    print!(
+        "\nPHASE 4 (feature-gated, needs your live confirmation)\n    \
+         mem-scan               Read Foundry state from the live game via memory-reading\n"
     );
 }
 
@@ -229,6 +236,139 @@ fn capture_window(out: Option<String>) -> Result<()> {
     cap.image.save(&out).map_err(|e| anyhow::anyhow!("saving {out}: {e}"))?;
     println!("  saved to {out}");
     Ok(())
+}
+
+/// Read the live Warframe process's memory for the session authz, echo it
+/// once to DE's inventory endpoint, and print the parsed Foundry state (see
+/// `wf_mem`'s docs and ADR-0001/ADR-0013). Running this subcommand at all
+/// **is** the map's required in-the-moment consent — no separate interactive
+/// prompt. A failed marker scan, a failed API call, or a missing
+/// `CAP_SYS_PTRACE`/`ptrace_scope` capability each surface as a single clear
+/// error from `wf_mem` (see `process.rs`/`inventory.rs`) — no retry, printed
+/// once by `main`'s top-level `Result` handling.
+#[cfg(feature = "mem-scan")]
+async fn mem_scan_cmd() -> Result<()> {
+    println!("\n== mem-scan: Foundry ==");
+    let client = wf_data::http_client();
+    let raw = wf_mem::scan_and_fetch(&client).await?;
+    let foundry = wf_mem::parse_foundry(&raw)?;
+    print_foundry(&foundry);
+    Ok(())
+}
+
+/// Print parsed Foundry state in the app's existing output style (cf.
+/// `print_fissures`/`relics_cmd`) — aligned columns, not a raw JSON dump.
+#[cfg(feature = "mem-scan")]
+fn print_foundry(state: &wf_mem::FoundryState) {
+    if state.pending.is_empty() && state.recipes.is_empty() {
+        println!("  Foundry is empty — no builds in progress, no blueprints on hand");
+        return;
+    }
+
+    if !state.pending.is_empty() {
+        println!("  in progress ({}):", state.pending.len());
+        for b in &state.pending {
+            println!(
+                "    {:<32} x{:<3} {}",
+                readable_item_name(&b.item_type),
+                b.item_count,
+                b.completion.map(foundry_eta).unwrap_or_else(|| "—".to_string())
+            );
+        }
+    }
+
+    if !state.recipes.is_empty() {
+        println!("  blueprints on hand ({}):", state.recipes.len());
+        for r in &state.recipes {
+            println!("    {:<32} x{}", readable_item_name(&r.item_type), r.item_count);
+        }
+    }
+}
+
+/// DE's public API exposes no display name for these internal paths, so this
+/// is the best a CLI can do without a full item catalogue lookup: take the
+/// last `/`-separated segment and split it on camelCase boundaries, e.g.
+/// `/Lotus/Types/Recipes/Weapons/LatoPrimeBlueprint` -> "Lato Prime Blueprint".
+#[cfg(feature = "mem-scan")]
+fn readable_item_name(item_type: &str) -> String {
+    let leaf = item_type.rsplit('/').next().unwrap_or(item_type);
+    let mut out = String::new();
+    let mut prev: Option<char> = None;
+    for c in leaf.chars() {
+        if c.is_uppercase() && prev.is_some_and(|p| p.is_lowercase() || p.is_ascii_digit()) {
+            out.push(' ');
+        }
+        out.push(c);
+        prev = Some(c);
+    }
+    out
+}
+
+/// Time remaining until a Foundry build's `CompletionDate`, formatted like
+/// `worldstate::Fissure::eta`.
+#[cfg(feature = "mem-scan")]
+fn foundry_eta(completion: time::OffsetDateTime) -> String {
+    format_remaining(completion - time::OffsetDateTime::now_utc())
+}
+
+/// "now" once the duration has elapsed, else the two most significant units
+/// (mirrors `worldstate::format_duration`'s convention).
+#[cfg(feature = "mem-scan")]
+fn format_remaining(d: time::Duration) -> String {
+    let secs = d.whole_seconds();
+    if secs <= 0 {
+        return "now".to_string();
+    }
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let mins = (secs % 3_600) / 60;
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {mins}m")
+    } else {
+        format!("{mins}m")
+    }
+}
+
+#[cfg(all(test, feature = "mem-scan"))]
+mod mem_scan_tests {
+    use super::*;
+
+    #[test]
+    fn readable_item_name_splits_the_leaf_path_segment_on_camel_case() {
+        assert_eq!(
+            readable_item_name("/Lotus/Types/Recipes/Weapons/LatoPrimeBlueprint"),
+            "Lato Prime Blueprint"
+        );
+        assert_eq!(
+            readable_item_name(
+                "/Lotus/Types/Recipes/WeaponParts/AkstilettoPrimeReceiverBlueprint"
+            ),
+            "Akstiletto Prime Receiver Blueprint"
+        );
+    }
+
+    #[test]
+    fn format_remaining_reports_now_for_an_elapsed_or_zero_duration() {
+        assert_eq!(format_remaining(time::Duration::seconds(0)), "now");
+        assert_eq!(format_remaining(time::Duration::seconds(-10)), "now");
+    }
+
+    #[test]
+    fn format_remaining_reports_minutes_under_an_hour() {
+        assert_eq!(format_remaining(time::Duration::minutes(5)), "5m");
+    }
+
+    #[test]
+    fn format_remaining_reports_hours_and_minutes_past_the_hour_mark() {
+        assert_eq!(format_remaining(time::Duration::minutes(125)), "2h 5m");
+    }
+
+    #[test]
+    fn format_remaining_reports_days_and_hours_past_the_day_mark() {
+        assert_eq!(format_remaining(time::Duration::hours(50)), "2d 2h");
+    }
 }
 
 /// Evaluate a set of relic reward names: fuzzy-match each to the item

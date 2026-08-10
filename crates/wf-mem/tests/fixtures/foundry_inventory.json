@@ -1,0 +1,34 @@
+{
+  "_comment": "Synthetic/sanitized — shaped per docs/research/mobile-inventory-api-coverage.md's reconstruction of DE's inventory.php schema (WFHelper's RawInventoryData, read from source). Not a real captured response; the real one from issue #52 has live account data and can't be committed.",
+  "PendingRecipes": [
+    {
+      "_id": { "$oid": "5f1b2c3d4e5f6a7b8c9d0e10" },
+      "ItemType": "/Lotus/Types/Recipes/Weapons/LatoPrimeBlueprint",
+      "ItemCount": 1,
+      "CompletionDate": { "$date": { "$numberLong": "1735689600000" } }
+    },
+    {
+      "_id": { "$oid": "5f1b2c3d4e5f6a7b8c9d0e11" },
+      "ItemType": "/Lotus/Types/Recipes/Weapons/AkstilettoPrimeBlueprint",
+      "ItemCount": 1,
+      "CompletionDate": { "$date": { "$numberLong": "1735776000000" } }
+    }
+  ],
+  "Recipes": [
+    {
+      "_id": { "$oid": "5f1b2c3d4e5f6a7b8c9d0e20" },
+      "ItemType": "/Lotus/Types/Recipes/WeaponParts/LatoPrimeBarrelBlueprint",
+      "ItemCount": 2
+    },
+    {
+      "_id": { "$oid": "5f1b2c3d4e5f6a7b8c9d0e21" },
+      "ItemType": "/Lotus/Types/Recipes/WeaponParts/AkstilettoPrimeReceiverBlueprint"
+    }
+  ],
+  "Suits": [
+    { "ItemType": "/Lotus/Powersuits/Excalibur/ExcaliburSuit", "XP": 1234567 }
+  ],
+  "RegularCredits": 458213,
+  "PremiumCredits": 12,
+  "MasteryRank": 27
+}

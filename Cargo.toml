@@ -13,10 +13,15 @@ members = [
     "crates/wf-settings",
     "crates/wf-tray",
     "crates/wf-browse",
+    "crates/wf-mem",
 ]
 # Build/test everything by default so a bare `cargo build --release` produces all
 # four binaries (wf-lite + the wf-tray/wf-settings/wf-browse companions), not just
-# wf-lite.
+# wf-lite. `wf-mem` is deliberately absent — it's a workspace member (so
+# `cargo build --workspace` and its own tests still work) but not a default one,
+# so a bare `cargo build`/`cargo build --release` never links the memory-reading
+# code; only `cargo build --features mem-scan` on `wf-lite` does (see its
+# Cargo.toml and CLAUDE.md/#55's Notes).
 default-members = [
     ".",
     "crates/wf-config",
@@ -50,6 +55,7 @@ wf-ocr = { path = "crates/wf-ocr" }
 wf-gridscan = { path = "crates/wf-gridscan" }
 wf-relic = { path = "crates/wf-relic" }
 wf-cache = { path = "crates/wf-cache" }
+wf-mem = { path = "crates/wf-mem" }
 
 # Shared third-party
 anyhow = "1"
@@ -75,6 +81,13 @@ license.workspace = true
 name = "wf-lite"
 path = "src/main.rs"
 
+[features]
+# Gates the `mem-scan` subcommand and its `wf-mem` dependency out of the
+# default build entirely (see ADR-0001/ADR-0013 and #55's Notes) — not in
+# the default feature set, so a bare `cargo build`/`cargo build --release`
+# never links the memory-reading code.
+mem-scan = ["dep:wf-mem", "dep:time"]
+
 [dependencies]
 wf-config.workspace = true
 wf-data.workspace = true
@@ -85,9 +98,13 @@ wf-ocr.workspace = true
 wf-gridscan.workspace = true
 wf-relic.workspace = true
 wf-cache.workspace = true
+wf-mem = { workspace = true, optional = true }
 reqwest.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 image.workspace = true
+# Only used to format `mem-scan`'s Foundry completion ETAs; kept optional so
+# it doesn't join the default build's dependency set.
+time = { workspace = true, optional = true }
