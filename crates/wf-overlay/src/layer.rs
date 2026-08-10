@@ -23,7 +23,7 @@ use smithay_client_toolkit::reexports::client::{
 
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region},
-    delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
+    delegate_registry,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -372,11 +372,9 @@ impl ProvidesRegistryState for State {
     registry_handlers![OutputState];
 }
 
-delegate_compositor!(State);
-delegate_output!(State);
-delegate_shm!(State);
-delegate_layer!(State);
 delegate_registry!(State);
+
+smithay_client_toolkit::delegate_dispatch2!(State);
 
 #[cfg(test)]
 mod tests {

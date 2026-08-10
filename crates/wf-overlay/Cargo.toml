@@ -14,4 +14,4 @@ fontdue = "0.9"
 # default-features disabled to avoid the `xkbcommon` system dev dependency
 # (only needed for keyboard input, which a click-through overlay does not use).
 # `calloop` (pure Rust, no system lib) gives us an event loop with timers.
-smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }
+smithay-client-toolkit = { version = "0.21", default-features = false, features = ["calloop"] }
