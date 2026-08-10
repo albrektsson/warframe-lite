@@ -27,7 +27,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use futures::stream::{self, StreamExt};
@@ -46,6 +46,14 @@ const MASTERY_TTL: Duration = Duration::from_secs(24 * 3600);
 /// once the shared cache goes stale; unbounded concurrency, on the other
 /// hand, would fire every lookup at warframe.market in one burst.
 const PRICE_FETCH_CONCURRENCY: usize = 8;
+/// How long a lazily-fetched price that resolved to "no listing found" (see
+/// [`LazyPrice`]) waits before [`BrowseApp::ensure_lazy_prices`] retries it.
+/// Long enough that `relics_tab`'s every-frame, unvirtualized re-render (see
+/// its docs) doesn't refire a fetch dozens of times a second; short enough
+/// that a fetch that failed on its first attempt (ADR-0012's original bug —
+/// a slug with nothing cached yet whose fetch times out gets stuck on `None`
+/// forever) clears up within the same session instead of needing a relaunch.
+const LAZY_PRICE_RETRY_COOLDOWN: Duration = Duration::from_secs(45);
 /// How often the Relics & Plan, Sell, and Farm tabs' Owned relic counts and
 /// active-Fissure flag refresh while the window stays open. Only these two (a
 /// local file and a lightweight world-state fetch) are cheap enough to poll;
@@ -111,11 +119,19 @@ fn main() -> eframe::Result<()> {
     // background task) rather than threading one shared instance across both.
     let client = wf_data::http_client();
     let market_platform = config.market_platform.clone();
+    // The Relics & Plan tab's lazy, auto-retrying relic-level sell prices and
+    // Set prices (see ADR-0012) — empty until a tab that needs them
+    // (Relics & Plan/Sell for relic prices, Relics & Plan/Buy or Farm for Set
+    // prices) is first viewed. Shared between `BrowseApp` (which triggers and
+    // reads fetches from the UI thread) and `load_and_poll`/`poll` (which
+    // fold a snapshot into `Live::compute` every tick).
+    let relic_prices: LazyPriceMap = Arc::new(Mutex::new(HashMap::new()));
+    let set_prices: LazyPriceMap = Arc::new(Mutex::new(HashMap::new()));
     // `load_data` (catalogue/mastery/quantity fetches, plus a price lookup per
     // owned relic) runs in the background rather than blocking the window
     // from opening at all — see the module docs and `BrowseApp`'s "Loading…"
     // placeholder.
-    rt.spawn(load_and_poll(loaded.clone(), config));
+    rt.spawn(load_and_poll(loaded.clone(), config, relic_prices.clone(), set_prices.clone()));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -128,7 +144,15 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             apply_theme(&cc.egui_ctx);
-            Ok(Box::new(BrowseApp::new(loaded, wishlist, rt_handle, client, market_platform)))
+            Ok(Box::new(BrowseApp::new(
+                loaded,
+                wishlist,
+                rt_handle,
+                client,
+                market_platform,
+                relic_prices,
+                set_prices,
+            )))
         }),
     )
 }
@@ -261,6 +285,65 @@ enum RelicPriceState {
     Ready(HashMap<String, Option<u32>>),
 }
 
+/// One item's lazily-fetched, auto-retrying market price — the Relics & Plan
+/// tab's relic-level sell prices and Set prices both use this shape (see
+/// ADR-0012). Unlike [`RelicPriceState`] (fetched once, on row expand, never
+/// retried), `Ready`'s `plat: None` case records when it resolved so
+/// [`BrowseApp::ensure_lazy_prices`] knows when [`LAZY_PRICE_RETRY_COOLDOWN`]
+/// has elapsed and it's time to try again — for as long as a tab that needs
+/// it stays open.
+#[derive(Clone, Copy)]
+enum LazyPrice {
+    Loading,
+    Ready { plat: Option<u32>, resolved_at: Instant },
+}
+
+/// Shared between the UI thread — which triggers fetches from
+/// `relics_tab`/`sell_tab`/`buy_or_farm_tab` and reads them back every frame
+/// — and the background `load_and_poll`/`poll` task, which folds a snapshot
+/// (see [`snapshot_prices`]) into each [`Live::compute`] tick. Two instances
+/// exist: one for relic-level sell prices (keyed by market slug, shared by
+/// the Relics & Plan and Sell tabs), one for Set prices (keyed by built-prime
+/// name, shared by the Relics & Plan and Buy or Farm tabs) — both tabs in
+/// each pair read the same underlying map, since whichever loads first
+/// legitimately triggers the fetch the other needs too.
+type LazyPriceMap = Arc<Mutex<HashMap<String, LazyPrice>>>;
+
+/// Whether a `LazyPriceMap` entry (`None` if the key is absent) should have a
+/// fetch (re)triggered right now — the decision [`BrowseApp::ensure_lazy_prices`]
+/// applies per key: fetch when never attempted, or when the last attempt
+/// resolved to "no listing" and [`LAZY_PRICE_RETRY_COOLDOWN`] has elapsed
+/// since; skip while a fetch is already in flight, or a resolved price is
+/// known, or the cooldown hasn't elapsed yet.
+fn needs_fetch(current: Option<&LazyPrice>, now: Instant) -> bool {
+    match current {
+        None => true,
+        Some(LazyPrice::Ready { plat: None, resolved_at }) => {
+            now.duration_since(*resolved_at) >= LAZY_PRICE_RETRY_COOLDOWN
+        }
+        _ => false,
+    }
+}
+
+/// Collapse a [`LazyPriceMap`] into the plain `key → resolved plat` map the
+/// pure `wf_relic` planning functions (`mastery_plan`, `sell_picks`,
+/// `buy_or_farm_plan`) already expect — a `Loading` entry is treated the same
+/// as "not yet fetched" (absent), matching how every other price map in this
+/// app represents "unresolved." Used to fold each `poll` tick's map state
+/// into the pure planning layer; UI rendering reads the map directly instead
+/// (see [`lazy_price_str`]) so a just-landed price shows immediately rather
+/// than waiting for the next tick's snapshot.
+fn snapshot_prices(map: &LazyPriceMap) -> HashMap<String, Option<u32>> {
+    map.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter_map(|(k, v)| match v {
+            LazyPrice::Ready { plat, .. } => Some((k.clone(), *plat)),
+            LazyPrice::Loading => None,
+        })
+        .collect()
+}
+
 /// The Relics EV tab's per-row read-only lookups, bundled (mirroring
 /// [`wf_relic::RelicContext`]) so [`BrowseApp::relic_ev_row`] doesn't carry
 /// them as separate parameters.
@@ -269,6 +352,22 @@ struct RelicEvContext<'a> {
     item_index: &'a Arc<ItemIndex>,
     quantities: &'a PartQuantities,
     owned_parts: &'a wf_relic::OwnedPrimeParts,
+}
+
+/// The Relics & Plan tab's per-frame snapshot from [`Loaded`], bundled
+/// (mirroring [`RelicEvContext`]) so its `loaded_or_placeholder` call doesn't
+/// grow into an unreadable tuple now that this tab's lazy pricing (see
+/// ADR-0012) pulls in more fields than the original
+/// `plans`/`owned_age_range`/`ages`/`active_tiers`.
+struct RelicsTabData {
+    plans: Option<Vec<PrimePlan>>,
+    owned_age_range: Option<(Duration, Duration)>,
+    ages: HashMap<String, Duration>,
+    active_tiers: HashSet<String>,
+    priceable_relic_slugs: Vec<String>,
+    unmastered_primes: Vec<String>,
+    index: Arc<RelicIndex>,
+    item_index: Arc<ItemIndex>,
 }
 
 /// The Relics & Plan / Sell / Farm tabs' data — refreshed periodically by
@@ -301,6 +400,21 @@ struct Live {
     /// `part_market` is catalogue-wide, but its plat price waits for the next
     /// launch, same as every other owned-driven price in this app).
     ducat_picks: Vec<wf_relic::DucatPick>,
+    /// Market slugs of every relic with Confirmed *or* Seen evidence (see
+    /// [`wf_relic::owned_evidence`]) — the lazy relic-price fetch's target
+    /// set for the Relics & Plan and Sell tabs (see ADR-0012). Unlike
+    /// `sell_picks`'/`mastery_plan`'s own filtering, this is not
+    /// Confirmed-only: a Seen-only relic is displayed in the Relics & Plan
+    /// tab (see [`wf_relic::RelicEvidence::SeenOnly`] at its render site) and
+    /// so needs a price fetched for it too, even though it never earns a
+    /// sellable count from `owned_counts()`.
+    priceable_relic_slugs: Vec<String>,
+    /// Every unmastered Prime — the lazy Set-price fetch's target set for the
+    /// Relics & Plan and Buy or Farm tabs (see ADR-0012). Ownership-
+    /// independent, like [`wf_relic::buy_or_farm_plan`]'s own use of the same
+    /// set: it's driven by `PartQuantities`/mastery, not owned-relic
+    /// evidence.
+    unmastered_primes: Vec<String>,
 }
 
 /// Launch-time [`load_data`] plus the first [`Live::compute`] derived from
@@ -383,6 +497,11 @@ impl Live {
         let ages = owned.map(|o| wf_relic::intact_ages(&o.value)).unwrap_or_default();
         let ducat_picks =
             wf_relic::ducat_picks(owned_parts, part_market, &prices.ducats, quantities, mastery);
+        let priceable_relic_slugs: Vec<String> = evidence
+            .as_ref()
+            .map(|e| index.all().iter().filter(|r| e.contains_key(&r.display)).map(|r| r.slug()).collect())
+            .unwrap_or_default();
+        let unmastered_primes = wf_relic::unmastered_primes(quantities, mastery);
         Self {
             plans,
             sell_picks,
@@ -393,6 +512,8 @@ impl Live {
             active_tiers,
             owned_parts: owned_parts.clone(),
             ducat_picks,
+            priceable_relic_slugs,
+            unmastered_primes,
         }
     }
 }
@@ -401,7 +522,12 @@ impl Live {
 /// ready — unblocking the Mastery/Relics & Plan/Buy or Farm/Sell/Farm tabs'
 /// "Loading…" placeholder — then hand off into [`poll`]'s ongoing refresh
 /// loop for as long as the window stays open.
-async fn load_and_poll(loaded: Arc<Mutex<Option<Loaded>>>, config: Config) {
+async fn load_and_poll(
+    loaded: Arc<Mutex<Option<Loaded>>>,
+    config: Config,
+    relic_prices: LazyPriceMap,
+    set_prices: LazyPriceMap,
+) {
     let LoadedData {
         index,
         mastery,
@@ -409,7 +535,7 @@ async fn load_and_poll(loaded: Arc<Mutex<Option<Loaded>>>, config: Config) {
         owned,
         owned_parts,
         active_tiers,
-        prices,
+        mut prices,
         part_market,
         item_index,
     } = load_data(&config).await;
@@ -420,6 +546,11 @@ async fn load_and_poll(loaded: Arc<Mutex<Option<Loaded>>>, config: Config) {
     let mastery_rows = wf_relic::mastery_browser(&index, &mastery);
     let static_data =
         StaticData { index: &index, mastery: &mastery, quantities: &quantities, part_market: &part_market };
+    // Empty at launch (see `load_data`'s docs) — populated once the Relics &
+    // Plan/Sell/Buy or Farm tabs' lazy fetch (see ADR-0012) has landed
+    // anything, which `poll`'s own snapshot below picks up on its next tick.
+    prices.sell = snapshot_prices(&relic_prices);
+    prices.set = snapshot_prices(&set_prices);
     let live = Live::compute(owned.as_ref(), &owned_parts, &static_data, &prices, active_tiers);
     *lock_loaded(&loaded) = Some(Loaded {
         mastery_rows,
@@ -430,22 +561,47 @@ async fn load_and_poll(loaded: Arc<Mutex<Option<Loaded>>>, config: Config) {
         item_index: item_index.clone(),
     });
 
-    poll(loaded, index, mastery, quantities, part_market, prices, config.platform).await;
+    poll(PollArgs {
+        loaded,
+        index,
+        mastery,
+        quantities,
+        part_market,
+        prices,
+        relic_prices,
+        set_prices,
+        platform: config.platform,
+    })
+    .await;
 }
 
-/// Re-read `owned-relics.json` and re-fetch world state every [`POLL_INTERVAL`],
-/// refreshing `loaded`'s `live` field — the only two things cheap/fast-changing
-/// enough to poll. The relic catalogue, mastery, and Sell/Farm/Ducats-tab prices
-/// stay exactly as loaded at launch; only re-running the app refreshes those.
-async fn poll(
+/// [`poll`]'s inputs, bundled to keep the function under clippy's
+/// `too_many_arguments` threshold — each field is exactly one of
+/// [`load_and_poll`]'s own locals, handed off unchanged for the rest of the
+/// window's lifetime (only `prices.sell`/`.set` and `loaded` itself actually
+/// change after that, via the lazy price maps and each poll tick's write).
+struct PollArgs {
     loaded: Arc<Mutex<Option<Loaded>>>,
     index: Arc<RelicIndex>,
     mastery: MasterySet,
     quantities: Arc<PartQuantities>,
     part_market: Arc<HashMap<PrimePart, PartMarketInfo>>,
     prices: Prices,
+    relic_prices: LazyPriceMap,
+    set_prices: LazyPriceMap,
     platform: String,
-) {
+}
+
+/// Re-read `owned-relics.json` and re-fetch world state every [`POLL_INTERVAL`],
+/// refreshing `loaded`'s `live` field — the only two things cheap/fast-changing
+/// enough to poll, plus a fresh snapshot of `relic_prices`/`set_prices` (see
+/// ADR-0012) so a lazy fetch that lands between ticks shows up without
+/// waiting on user interaction. The relic catalogue, mastery, and Farm/Ducats-
+/// tab prices stay exactly as loaded at launch; only re-running the app
+/// refreshes those.
+async fn poll(args: PollArgs) {
+    let PollArgs { loaded, index, mastery, quantities, part_market, mut prices, relic_prices, set_prices, platform } =
+        args;
     let client = wf_data::http_client();
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -464,6 +620,8 @@ async fn poll(
             quantities: &quantities,
             part_market: &part_market,
         };
+        prices.sell = snapshot_prices(&relic_prices);
+        prices.set = snapshot_prices(&set_prices);
         let fresh = Live::compute(owned.as_ref(), &owned_parts, &static_data, &prices, active_tiers);
         if let Some(l) = lock_loaded(&loaded).as_mut() {
             l.live = fresh;
@@ -475,8 +633,9 @@ async fn poll(
 /// Prime Part build quantities, their scanned Owned relic counts (if any),
 /// their scanned owned-Prime-Part counts (if any), which relic tiers
 /// currently have an active Fissure, and — for owned relics only — each
-/// relic's resolved sell price and each already-mastered reward's resolved
-/// part price.
+/// already-mastered reward's resolved part price. Relic-level sell prices and
+/// Set prices are *not* included (`prices.sell`/`.set` start empty); those
+/// are fetched lazily per [`LazyPriceMap`] instead (see ADR-0012).
 struct LoadedData {
     index: RelicIndex,
     mastery: MasterySet,
@@ -523,10 +682,12 @@ where
 }
 
 /// Load the relic catalogue, the player's mastered set, their scanned Owned
-/// relic counts, active Fissure tiers, and (once, up front) both relic sell
-/// prices and mastered-reward part prices for every owned relic — falling
-/// back to empty values on failure rather than blocking the GUI from opening
-/// at all.
+/// relic counts, active Fissure tiers, and (once, up front) mastered-reward
+/// part prices for every owned relic (Farm tab) and every owned Prime Part
+/// (Ducats tab) — falling back to empty values on failure rather than
+/// blocking the GUI from opening at all. Relic-level sell prices and Set
+/// prices are fetched lazily instead (see ADR-0012), so `prices.sell`/`.set`
+/// on the returned [`LoadedData`] always start empty.
 async fn load_data(config: &Config) -> LoadedData {
     let client = wf_data::http_client();
     let index = RelicIndex::load_cached(&client, CATALOGUE_TTL).await.unwrap_or_else(|e| {
@@ -558,21 +719,17 @@ async fn load_data(config: &Config) -> LoadedData {
         ItemIndex::new(Vec::new())
     });
 
-    let mut sell_prices = HashMap::new();
+    // Relic-level sell prices (Relics & Plan/Sell tabs) and Set prices
+    // (Relics & Plan/Buy or Farm tabs) are no longer fetched here: both are
+    // now fetched lazily, on first view of a tab that needs them, with
+    // automatic per-item retry (see ADR-0012 and
+    // `BrowseApp::ensure_lazy_prices`) rather than once, eagerly, with no
+    // retry if a lookup times out.
     let mut farm_prices = HashMap::new();
     if let Some(owned) = &owned {
         // Prices are only needed for relics with a confirmed count (what the
-        // tabs rank); seen-only copies don't drive the guide.
+        // Farm tab ranks); seen-only copies don't drive it.
         let counts = wf_relic::owned_counts(&owned.value);
-
-        let relic_slugs: Vec<String> = index
-            .all()
-            .iter()
-            .filter(|relic| counts.get(&relic.display).copied().unwrap_or(0) > 0)
-            .map(|relic| relic.slug())
-            .collect();
-        sell_prices = fetch_prices(relic_slugs, &cache, &market, |slug| (slug.clone(), slug)).await;
-
         let reward_names = wf_relic::farm_reward_names(&counts, &index, &mastery);
         let resolved: Vec<(String, String)> = reward_names
             .into_iter()
@@ -580,18 +737,6 @@ async fn load_data(config: &Config) -> LoadedData {
             .collect();
         farm_prices = fetch_prices(resolved, &cache, &market, |(name, slug)| (name, slug)).await;
     }
-
-    // Set prices are needed for the Buy-or-Farm tab regardless of whether any
-    // relics have been scanned yet — it's driven by PartQuantities/mastery,
-    // not owned-relic evidence.
-    let unmastered = wf_relic::unmastered_primes(&quantities, &mastery);
-    let resolved_sets: Vec<(String, String)> = unmastered
-        .into_iter()
-        .filter_map(|prime| {
-            item_index.best_match(&format!("{prime} Set")).map(|m| (prime, m.item.slug.clone()))
-        })
-        .collect();
-    let set_prices = fetch_prices(resolved_sets, &cache, &market, |(prime, slug)| (prime, slug)).await;
 
     // Ducats-tab pricing: every owned Prime Part's plat price, resolved once
     // at launch like sell/farm/set pricing above. A newly-scanned part shows
@@ -624,7 +769,12 @@ async fn load_data(config: &Config) -> LoadedData {
         owned,
         owned_parts,
         active_tiers,
-        prices: Prices { sell: sell_prices, farm: farm_prices, set: set_prices, ducats: ducat_prices },
+        prices: Prices {
+            sell: HashMap::new(),
+            farm: farm_prices,
+            set: HashMap::new(),
+            ducats: ducat_prices,
+        },
         part_market,
         item_index,
     }
@@ -723,7 +873,16 @@ struct BrowseApp {
     /// Per-relic reward pricing for the Relics EV tab's lazy, on-expand fetch
     /// (see [`RelicPriceState`]) — written to by tasks spawned on
     /// [`Self::rt_handle`], read every frame to render EV/plat once ready.
-    relic_prices: Arc<Mutex<HashMap<String, RelicPriceState>>>,
+    /// Unrelated to the Relics & Plan tab's own lazy pricing below despite
+    /// the similar name — this one fetches a whole relic's reward map at
+    /// once, keyed by relic display, and is never retried.
+    relic_ev_prices: Arc<Mutex<HashMap<String, RelicPriceState>>>,
+    /// The Relics & Plan tab's lazy, auto-retrying relic-level sell prices
+    /// (keyed by market slug) and Set prices (keyed by built-prime name) —
+    /// see [`LazyPriceMap`] and ADR-0012. Shared with `load_and_poll`/`poll`
+    /// (via `main`), which fold a snapshot into every `Live::compute` tick.
+    relics_plan_relic_prices: LazyPriceMap,
+    relics_plan_set_prices: LazyPriceMap,
     /// Handle onto `main`'s tokio runtime, so the Relics EV tab can spawn an
     /// on-demand price fetch from inside `eframe::App::ui` (which runs
     /// synchronously on the UI thread, unlike [`load_and_poll`]/[`poll`]).
@@ -741,6 +900,8 @@ impl BrowseApp {
         rt_handle: tokio::runtime::Handle,
         client: reqwest::Client,
         market_platform: String,
+        relics_plan_relic_prices: LazyPriceMap,
+        relics_plan_set_prices: LazyPriceMap,
     ) -> Self {
         Self {
             tab: Tab::Mastery,
@@ -760,7 +921,9 @@ impl BrowseApp {
             ducats_mastered_only: true,
             loaded,
             wishlist,
-            relic_prices: Arc::new(Mutex::new(HashMap::new())),
+            relic_ev_prices: Arc::new(Mutex::new(HashMap::new())),
+            relics_plan_relic_prices,
+            relics_plan_set_prices,
             rt_handle,
             client,
             market_platform,
@@ -794,7 +957,7 @@ impl BrowseApp {
     /// entry (price `None`), so [`wf_relic::expected_value`] sees every
     /// reward accounted for once the fetch completes.
     fn spawn_relic_price_fetch(&self, relic: RelicInfo, item_index: Arc<ItemIndex>) {
-        let relic_prices = self.relic_prices.clone();
+        let relic_prices = self.relic_ev_prices.clone();
         relic_prices
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -821,6 +984,49 @@ impl BrowseApp {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .insert(relic.display, RelicPriceState::Ready(prices));
+        });
+    }
+
+    /// Ensure every `(key, slug)` pair in `needed` has a price fetch in
+    /// flight, freshly resolved, or correctly waiting out
+    /// [`LAZY_PRICE_RETRY_COOLDOWN`] in `map` — the Relics & Plan/Sell/Buy or
+    /// Farm tabs call this every frame they render (see ADR-0012), so a price
+    /// still missing after its first attempt is retried automatically for as
+    /// long as one of those tabs stays open. Cheap to call unconditionally:
+    /// each key is marked `Loading` synchronously, before its fetch is
+    /// spawned, so a key already in flight (or not yet due for retry) is
+    /// skipped without touching the network — the guard against `relics_tab`
+    /// refiring a fetch every frame despite having no expand/collapse to gate
+    /// on, unlike the Relics EV tab's [`Self::spawn_relic_price_fetch`].
+    fn ensure_lazy_prices(&self, needed: Vec<(String, String)>, map: &LazyPriceMap) {
+        let now = Instant::now();
+        let mut to_fetch: Vec<(String, String)> = Vec::new();
+        {
+            let mut guard = map.lock().unwrap_or_else(|p| p.into_inner());
+            for (key, slug) in needed {
+                if needs_fetch(guard.get(&key), now) {
+                    guard.insert(key.clone(), LazyPrice::Loading);
+                    to_fetch.push((key, slug));
+                }
+            }
+        }
+        if to_fetch.is_empty() {
+            return;
+        }
+
+        let map = map.clone();
+        let client = self.client.clone();
+        let market_platform = self.market_platform.clone();
+        self.rt_handle.spawn(async move {
+            let market = wf_data::market::MarketClient::new(client, market_platform);
+            let cache = wf_relic::price_cache();
+            let resolved = fetch_prices(to_fetch, &cache, &market, |(key, slug)| (key, slug)).await;
+            cache.save();
+            let resolved_at = Instant::now();
+            let mut guard = map.lock().unwrap_or_else(|p| p.into_inner());
+            for (key, plat) in resolved {
+                guard.insert(key, LazyPrice::Ready { plat, resolved_at });
+            }
         });
     }
 
@@ -992,11 +1198,39 @@ impl BrowseApp {
         // Clone the pieces this frame needs and drop the lock immediately,
         // rather than holding it across the whole render below — the only
         // other lock-holder is the background poller's brief write.
-        let Some((plans, owned_age_range, ages, active_tiers)) = self.loaded_or_placeholder(ui, |l| {
-            (l.live.plans.clone(), l.live.owned_age_range, l.live.ages.clone(), l.live.active_tiers.clone())
-        }) else {
+        let Some(RelicsTabData {
+            plans,
+            owned_age_range,
+            ages,
+            active_tiers,
+            priceable_relic_slugs,
+            unmastered_primes,
+            index,
+            item_index,
+        }) = self.loaded_or_placeholder(ui, |l| RelicsTabData {
+            plans: l.live.plans.clone(),
+            owned_age_range: l.live.owned_age_range,
+            ages: l.live.ages.clone(),
+            active_tiers: l.live.active_tiers.clone(),
+            priceable_relic_slugs: l.live.priceable_relic_slugs.clone(),
+            unmastered_primes: l.live.unmastered_primes.clone(),
+            index: l.index.clone(),
+            item_index: l.item_index.clone(),
+        })
+        else {
             return;
         };
+        // Fire (or retry) this tab's lazy Set/relic price fetches every frame
+        // it renders (see ADR-0012) — cheap: `ensure_lazy_prices` only spawns
+        // a fetch for a key that's not already `Loading` or still on cooldown.
+        self.ensure_lazy_prices(
+            priceable_relic_slugs.iter().map(|s| (s.clone(), s.clone())).collect(),
+            &self.relics_plan_relic_prices,
+        );
+        self.ensure_lazy_prices(
+            set_price_targets(&unmastered_primes, &item_index),
+            &self.relics_plan_set_prices,
+        );
         let Some(mut plans) = plans else {
             ui.label(NO_OWNED_DATA_MSG);
             return;
@@ -1050,7 +1284,10 @@ impl BrowseApp {
                 ui.horizontal(|ui| {
                     ui.strong(&p.prime);
                     ui.weak(format!("owned {}", p.total_owned));
-                    ui.weak(format!("Set: {}", plat_str(p.set_plat)));
+                    ui.weak(format!(
+                        "Set: {}",
+                        lazy_price_str(&self.relics_plan_set_prices, &p.prime)
+                    ));
                 });
                 egui::Grid::new(format!("relics_plan_grid_{}", p.prime))
                     .num_columns(3)
@@ -1075,7 +1312,14 @@ impl BrowseApp {
                                         active_tiers.contains(wf_relic::tier_of(&r.relic_display));
                                     let flag = if is_live { "*" } else { "" };
                                     let stale = stale_marker(&ages, &r.relic_display);
-                                    let price = r.plat.map(|p| format!(" ({p}p)")).unwrap_or_default();
+                                    let price = relic_slug(&index, &r.relic_display)
+                                        .map(|slug| {
+                                            format!(
+                                                " ({})",
+                                                lazy_price_str(&self.relics_plan_relic_prices, &slug)
+                                            )
+                                        })
+                                        .unwrap_or_default();
                                     let qty = match r.evidence {
                                         wf_relic::RelicEvidence::Confirmed(n) => format!("x{n}"),
                                         wf_relic::RelicEvidence::SeenOnly => "seen".to_string(),
@@ -1172,7 +1416,7 @@ impl BrowseApp {
     ) {
         let RelicEvContext { item_index, quantities, owned_parts } = *ctx;
         let pricing =
-            self.relic_prices.lock().unwrap_or_else(|p| p.into_inner()).get(&relic.display).cloned();
+            self.relic_ev_prices.lock().unwrap_or_else(|p| p.into_inner()).get(&relic.display).cloned();
 
         let mut header = relic.display.clone();
         if owned > 0 {
@@ -1258,11 +1502,18 @@ impl BrowseApp {
     /// total gap-fill cost — so buying the Set can be weighed against farming
     /// the missing pieces.
     fn buy_or_farm_tab(&mut self, ui: &mut egui::Ui) {
-        let Some((plans, ages)) =
-            self.loaded_or_placeholder(ui, |l| (l.live.bom_plans.clone(), l.live.ages.clone()))
-        else {
+        let Some((plans, ages, unmastered_primes, item_index)) = self.loaded_or_placeholder(ui, |l| {
+            (l.live.bom_plans.clone(), l.live.ages.clone(), l.live.unmastered_primes.clone(), l.item_index.clone())
+        }) else {
             return;
         };
+        // Reads the same Set-price `LazyPriceMap` the Relics & Plan tab does
+        // (see ADR-0012) — whichever of the two the player opens first
+        // legitimately triggers the fetch the other one needs too.
+        self.ensure_lazy_prices(
+            set_price_targets(&unmastered_primes, &item_index),
+            &self.relics_plan_set_prices,
+        );
 
         if plans.is_empty() {
             ui.label("no unmastered primes found");
@@ -1275,7 +1526,10 @@ impl BrowseApp {
                 ui.horizontal(|ui| {
                     ui.strong(&p.prime);
                     ui.weak(format!("{}/{total} parts covered", p.covered));
-                    ui.weak(format!("Set: {}", plat_str(p.set_plat)));
+                    ui.weak(format!(
+                        "Set: {}",
+                        lazy_price_str(&self.relics_plan_set_prices, &p.prime)
+                    ));
                     ui.weak(format!("cost to fill: {}", plat_str(p.cost_to_fill)));
                 });
                 if p.gaps.is_empty() {
@@ -1313,11 +1567,26 @@ impl BrowseApp {
     }
 
     fn sell_tab(&mut self, ui: &mut egui::Ui) {
-        let Some((picks, owned_age_range, ages)) = self.loaded_or_placeholder(ui, |l| {
-            (l.live.sell_picks.clone(), l.live.owned_age_range, l.live.ages.clone())
-        }) else {
+        let Some((picks, owned_age_range, ages, priceable_relic_slugs, index)) =
+            self.loaded_or_placeholder(ui, |l| {
+                (
+                    l.live.sell_picks.clone(),
+                    l.live.owned_age_range,
+                    l.live.ages.clone(),
+                    l.live.priceable_relic_slugs.clone(),
+                    l.index.clone(),
+                )
+            })
+        else {
             return;
         };
+        // Reads the same relic-level `LazyPriceMap` the Relics & Plan tab
+        // does (see ADR-0012) — whichever of the two the player opens first
+        // legitimately triggers the fetch the other one needs too.
+        self.ensure_lazy_prices(
+            priceable_relic_slugs.iter().map(|s| (s.clone(), s.clone())).collect(),
+            &self.relics_plan_relic_prices,
+        );
         let Some(mut picks) = picks else {
             ui.label(NO_OWNED_DATA_MSG);
             return;
@@ -1374,7 +1643,9 @@ impl BrowseApp {
                 ui.end_row();
 
                 for p in &picks {
-                    let plat = plat_str(p.plat);
+                    let plat = relic_slug(&index, &p.display)
+                        .map(|slug| lazy_price_str(&self.relics_plan_relic_prices, &slug))
+                        .unwrap_or_else(|| plat_str(p.plat));
                     ui.label(&p.display);
                     ui.label(p.count.to_string());
                     ui.label(plat);
@@ -1697,9 +1968,55 @@ fn stale_marker(ages: &HashMap<String, Duration>, display: &str) -> String {
 }
 
 /// Render a resolved plat price, or `"—"` when unresolved — the shared
-/// convention across the Relics & Plan, Sell, Farm, and Buy-or-Farm tabs.
+/// convention across the Farm tab's mastered-reward prices, which stay
+/// eagerly fetched at launch and never need a distinct "still loading" state.
 fn plat_str(v: Option<u32>) -> String {
     v.map(|v| format!("{v}p")).unwrap_or_else(|| "—".into())
+}
+
+/// Render a lazily-fetched, auto-retrying price cell (see [`LazyPrice`]):
+/// the resolved plat price once known, `"…"` while a fetch is in flight,
+/// hasn't started yet, or is waiting out its retry cooldown, or an explicit
+/// `"no listing"` once a fetch has genuinely resolved to no price — distinct
+/// states instead of blank space that reads as broken (see ADR-0012). Used by
+/// the Relics & Plan, Sell, and Buy or Farm tabs wherever `plat_str` used to
+/// render a relic-slug or built-prime-name price.
+///
+/// Reads `map` directly rather than trusting the plan/pick's own baked-in
+/// price (`PrimePlan::set_plat`, `RelicPick::plat`, …): those are only as
+/// fresh as the last [`Live::compute`] tick, which can lag up to
+/// [`POLL_INTERVAL`] behind a fetch [`BrowseApp::ensure_lazy_prices`] just
+/// landed — reading `map` live means a just-resolved price (or "no listing")
+/// shows the frame it lands, not up to 15s later.
+fn lazy_price_str(map: &LazyPriceMap, key: &str) -> String {
+    match map.lock().unwrap_or_else(|p| p.into_inner()).get(key) {
+        Some(LazyPrice::Ready { plat: Some(p), .. }) => format!("{p}p"),
+        Some(LazyPrice::Ready { plat: None, .. }) => "no listing".to_string(),
+        _ => "…".to_string(),
+    }
+}
+
+/// Every unmastered Prime's Set-item slug — the [`BrowseApp::ensure_lazy_prices`]
+/// input for the lazy Set-price fetch, shared by the Relics & Plan and Buy or
+/// Farm tabs since both read the same [`LazyPriceMap`] (see ADR-0012). Mirrors
+/// `load_data`'s original eager `resolved_sets` computation exactly.
+fn set_price_targets(unmastered_primes: &[String], item_index: &ItemIndex) -> Vec<(String, String)> {
+    unmastered_primes
+        .iter()
+        .filter_map(|prime| {
+            item_index.best_match(&format!("{prime} Set")).map(|m| (prime.clone(), m.item.slug.clone()))
+        })
+        .collect()
+}
+
+/// A relic's market slug by its exact display label (e.g. `"Axi H3"`) — the
+/// key the Relics & Plan/Sell tabs' relic-level [`LazyPriceMap`] uses.
+/// Exact-match only, unlike [`RelicIndex::best_match`]'s fuzzy OCR lookup:
+/// `display` here always came from a [`RelicInfo`] in `index` in the first
+/// place (see `wf_relic::relics::relic_sourced_parts`), so an exact match is
+/// enough.
+fn relic_slug(index: &RelicIndex, display: &str) -> Option<String> {
+    index.all().iter().find(|r| r.display == display).map(|r| r.slug())
 }
 
 /// The Relics & Plan tab's combined `owned / need` cell, e.g. `"— / x1"`
@@ -1809,6 +2126,8 @@ mod tests {
             rt.handle().clone(),
             wf_data::http_client(),
             "pc".to_string(),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
         );
         app.set_wishlisted("Ember Prime Systems", true);
         let on_disk = wf_cache::load_blob::<wf_relic::Wishlist>(wf_relic::WISHLIST_FILE)
@@ -1824,5 +2143,81 @@ mod tests {
 
         std::env::remove_var("XDG_CACHE_HOME");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn needs_fetch_when_never_attempted() {
+        assert!(needs_fetch(None, Instant::now()));
+    }
+
+    #[test]
+    fn needs_fetch_is_false_while_a_fetch_is_already_in_flight() {
+        assert!(!needs_fetch(Some(&LazyPrice::Loading), Instant::now()));
+    }
+
+    #[test]
+    fn needs_fetch_is_false_once_a_price_is_resolved_even_if_stale() {
+        let resolved_at = Instant::now() - LAZY_PRICE_RETRY_COOLDOWN * 10;
+        let ready = LazyPrice::Ready { plat: Some(42), resolved_at };
+        assert!(!needs_fetch(Some(&ready), Instant::now()));
+    }
+
+    #[test]
+    fn needs_fetch_waits_out_the_cooldown_after_a_no_listing_result() {
+        let resolved_at = Instant::now();
+        let ready = LazyPrice::Ready { plat: None, resolved_at };
+        assert!(!needs_fetch(Some(&ready), resolved_at + LAZY_PRICE_RETRY_COOLDOWN / 2));
+    }
+
+    #[test]
+    fn needs_fetch_retries_a_no_listing_result_once_the_cooldown_elapses() {
+        let resolved_at = Instant::now();
+        let ready = LazyPrice::Ready { plat: None, resolved_at };
+        assert!(needs_fetch(Some(&ready), resolved_at + LAZY_PRICE_RETRY_COOLDOWN));
+    }
+
+    #[test]
+    fn snapshot_prices_treats_loading_the_same_as_absent() {
+        let now = Instant::now();
+        let map: LazyPriceMap = Arc::new(Mutex::new(HashMap::from([
+            ("resolved".to_string(), LazyPrice::Ready { plat: Some(15), resolved_at: now }),
+            ("empty".to_string(), LazyPrice::Ready { plat: None, resolved_at: now }),
+            ("loading".to_string(), LazyPrice::Loading),
+        ])));
+        let snapshot = snapshot_prices(&map);
+        assert_eq!(snapshot.get("resolved"), Some(&Some(15)));
+        assert_eq!(snapshot.get("empty"), Some(&None));
+        assert_eq!(snapshot.get("loading"), None);
+    }
+
+    #[test]
+    fn lazy_price_str_distinguishes_loading_from_no_listing_from_priced() {
+        let now = Instant::now();
+        let map: LazyPriceMap = Arc::new(Mutex::new(HashMap::from([
+            ("no_listing".to_string(), LazyPrice::Ready { plat: None, resolved_at: now }),
+            ("priced".to_string(), LazyPrice::Ready { plat: Some(7), resolved_at: now }),
+            ("loading".to_string(), LazyPrice::Loading),
+        ])));
+        assert_eq!(lazy_price_str(&map, "priced"), "7p");
+        // No entry yet reads as still-loading, not broken.
+        assert_eq!(lazy_price_str(&map, "never_seen"), "…");
+        assert_eq!(lazy_price_str(&map, "loading"), "…");
+        // A completed fetch that genuinely found no price is explicit, not blank.
+        assert_eq!(lazy_price_str(&map, "no_listing"), "no listing");
+    }
+
+    #[test]
+    fn lazy_price_str_shows_a_freshly_landed_price_immediately() {
+        // A fetch that lands between `poll` ticks writes straight into the
+        // map; `lazy_price_str` must reflect that the same frame rather than
+        // waiting up to `POLL_INTERVAL` for `Live::compute`'s next snapshot
+        // to bake it into a plan/pick's own `plat`/`set_plat` field — that
+        // staleness previously showed a real price as "no listing" for as
+        // long as 15s (see ADR-0012 review).
+        let map: LazyPriceMap = Arc::new(Mutex::new(HashMap::from([(
+            "axi_h3_relic".to_string(),
+            LazyPrice::Ready { plat: Some(30), resolved_at: Instant::now() },
+        )])));
+        assert_eq!(lazy_price_str(&map, "axi_h3_relic"), "30p");
     }
 }
