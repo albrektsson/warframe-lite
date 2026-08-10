@@ -1,0 +1,36 @@
+{
+  "_comment": "Synthetic/sanitized — shaped per docs/research/mobile-inventory-api-coverage.md's reconstruction of DE's inventory.php schema and WFHelper's rivenFingerprint.ts (read from source), corrected against a real live scan (issue #59): most Upgrades[] entries are plain fused mods (an UpgradeFingerprint carrying only `lvl`, no `compat`/`challenge`), and a real riven can be still-veiled (a `challenge`, no `compat` yet) as well as unveiled (`compat` present). Not a real captured response; the real one from issue #52 has live account data and can't be committed.",
+  "Upgrades": [
+    {
+      "_id": { "$oid": "5f1b2c3d4e5f6a7b8c9d0e30" },
+      "ItemType": "/Lotus/Upgrades/Mods/Randomized/LotusRifleRandomModRare",
+      "ItemCount": 1,
+      "UpgradeFingerprint": "{\"compat\":\"/Lotus/Weapons/Tenno/Rifle/Soma/SomaPrimeRifle\",\"pol\":\"AP_ATTACK\",\"lvlReq\":10,\"lvl\":8,\"rerolls\":3,\"buffs\":[{\"Tag\":\"WeaponCritChanceMod\",\"Value\":823451120},{\"Tag\":\"WeaponDamageAmountMod\",\"Value\":512009887}],\"curses\":[{\"Tag\":\"WeaponRecoilMod\",\"Value\":190442017}]}"
+    },
+    {
+      "_id": { "$oid": "5f1b2c3d4e5f6a7b8c9d0e31" },
+      "ItemType": "/Lotus/Upgrades/Mods/Randomized/LotusModularMeleeRandomModRare",
+      "ItemCount": 1,
+      "UpgradeFingerprint": "\"{\\\"compat\\\":\\\"/Lotus/Weapons/Tenno/Melee/Zaws/LongSword/ZawLongSword\\\",\\\"pol\\\":\\\"AP_TACTIC\\\",\\\"lvlReq\\\":8,\\\"lvl\\\":6,\\\"rerolls\\\":5,\\\"buffs\\\":[{\\\"Tag\\\":\\\"WeaponCritChanceMod\\\",\\\"Value\\\":700000000}],\\\"curses\\\":[]}\""
+    },
+    {
+      "_id": { "$oid": "5f1b2c3d4e5f6a7b8c9d0e32" },
+      "ItemType": "/Lotus/Upgrades/Mods/Randomized/LotusPistolRandomModRare",
+      "ItemCount": 1,
+      "UpgradeFingerprint": "{\"lvl\":0,\"challenge\":{\"Challenge\":\"/Lotus/Types/Challenges/RandomizedKill\",\"Required\":50}}"
+    },
+    {
+      "_id": { "$oid": "5f1b2c3d4e5f6a7b8c9d0e33" },
+      "ItemType": "/Lotus/Upgrades/Mods/Warframe/RedirectionMod",
+      "ItemCount": 1,
+      "XP": 30000
+    },
+    {
+      "_id": { "$oid": "5f1b2c3d4e5f6a7b8c9d0e34" },
+      "ItemType": "/Lotus/Upgrades/Mods/Warframe/VitalityMod",
+      "ItemCount": 1,
+      "UpgradeFingerprint": "\"{\\\"rerolls\\\":0}\""
+    }
+  ],
+  "MasteryRank": 27
+}

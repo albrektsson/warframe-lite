@@ -153,7 +153,7 @@ Config: ~/.config/warframe-lite/config.toml   Docs: README.md
     #[cfg(feature = "mem-scan")]
     print!(
         "\nPHASE 4 (feature-gated, needs your live confirmation)\n    \
-         mem-scan               Read Foundry state from the live game via memory-reading\n"
+         mem-scan               Read Foundry + Riven state from the live game via memory-reading\n"
     );
 }
 
@@ -248,11 +248,17 @@ fn capture_window(out: Option<String>) -> Result<()> {
 /// once by `main`'s top-level `Result` handling.
 #[cfg(feature = "mem-scan")]
 async fn mem_scan_cmd() -> Result<()> {
-    println!("\n== mem-scan: Foundry ==");
     let client = wf_data::http_client();
     let raw = wf_mem::scan_and_fetch(&client).await?;
+
+    println!("\n== mem-scan: Foundry ==");
     let foundry = wf_mem::parse_foundry(&raw)?;
     print_foundry(&foundry);
+
+    println!("\n== mem-scan: Rivens ==");
+    let rivens = wf_mem::parse_rivens(&raw)?;
+    print_rivens(&rivens);
+
     Ok(())
 }
 
@@ -281,6 +287,52 @@ fn print_foundry(state: &wf_mem::FoundryState) {
         println!("  blueprints on hand ({}):", state.recipes.len());
         for r in &state.recipes {
             println!("    {:<32} x{}", readable_item_name(&r.item_type), r.item_count);
+        }
+    }
+}
+
+/// Print parsed Riven state in the app's existing output style (cf.
+/// `print_foundry`) — aligned columns, not a raw JSON dump. Plain fused mods
+/// never reach here (`wf_mem::parse_rivens` drops those — see its module
+/// doc); a still-veiled riven does, with no weapon resolved yet.  `Value`s
+/// inside `buffs`/`curses` are DE's encoded roll ints, not displayable
+/// percentages (see `wf_mem::riven`'s module doc for why this crate doesn't
+/// decode them) — only each stat's `Tag` name is shown, since that's what's
+/// actually comparable against the riven's in-game stat lines.
+#[cfg(feature = "mem-scan")]
+fn print_rivens(state: &wf_mem::RivenState) {
+    if state.rivens.is_empty() {
+        println!("  no rivens found");
+        return;
+    }
+
+    println!("  rivens ({}):", state.rivens.len());
+    for r in &state.rivens {
+        let weapon = r
+            .weapon_unique_name
+            .as_deref()
+            .map(readable_item_name)
+            .unwrap_or_else(|| "veiled".to_string());
+        let rank = r.rank.map(|v| format!("{v}/8")).unwrap_or_else(|| "—".to_string());
+        let mastery = r.mastery_req.map(|v| format!("MR{v}")).unwrap_or_else(|| "—".to_string());
+        let rerolls = r.rerolls.map(|v| v.to_string()).unwrap_or_else(|| "—".to_string());
+        println!(
+            "    {:<32} {:<28} rank {:<4} {:<5} rerolls {}",
+            readable_item_name(&r.item_type),
+            weapon,
+            rank,
+            mastery,
+            rerolls
+        );
+        if !r.buffs.is_empty() || !r.curses.is_empty() {
+            let tags = |stats: &[wf_mem::RivenStat]| -> String {
+                if stats.is_empty() {
+                    "—".to_string()
+                } else {
+                    stats.iter().map(|s| s.tag.as_str()).collect::<Vec<_>>().join(", ")
+                }
+            };
+            println!("      buffs: {}   curses: {}", tags(&r.buffs), tags(&r.curses));
         }
     }
 }
