@@ -263,6 +263,10 @@ async fn mem_scan_cmd() -> Result<()> {
     let level_keys = wf_mem::parse_level_keys(&raw)?;
     print_level_keys(&level_keys);
 
+    println!("\n== mem-scan: Equipment ==");
+    let equipment = wf_mem::parse_owned_equipment(&raw)?;
+    print_owned_equipment(&equipment);
+
     Ok(())
 }
 
@@ -356,6 +360,33 @@ fn print_level_keys(state: &wf_mem::LevelKeyState) {
     println!("  entries ({}):", state.level_keys.len());
     for k in &state.level_keys {
         println!("    {:<32} x{}", readable_item_name(&k.item_type), k.item_count);
+    }
+}
+
+/// Print raw owned-equipment state in the app's existing output style (cf.
+/// `print_level_keys`) — aligned columns, grouped by equipment category, not
+/// a raw JSON dump. This is a raw ownership exposure only (see
+/// `wf_mem::equipment`'s module doc): no cross-reference against `MasterySet`
+/// to flag "built but not yet mastered" (per #61's explicit out-of-scope
+/// call) — that pairing is left for a future ticket.
+#[cfg(feature = "mem-scan")]
+fn print_owned_equipment(state: &wf_mem::OwnedEquipment) {
+    if state.items.is_empty() {
+        println!("  no owned equipment found");
+        return;
+    }
+
+    println!("  {} items owned:", state.items.len());
+    for category in wf_mem::EquipmentCategory::ALL {
+        let items: Vec<_> =
+            state.items.iter().filter(|i| i.category == category).collect();
+        if items.is_empty() {
+            continue;
+        }
+        println!("  {} ({}):", category.label(), items.len());
+        for item in items {
+            println!("    {:<32} x{}", readable_item_name(&item.item_type), item.item_count);
+        }
     }
 }
 

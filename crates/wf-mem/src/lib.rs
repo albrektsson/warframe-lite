@@ -16,12 +16,14 @@
 //! the explicit in-the-moment consent this crate's design assumes — it never
 //! prompts for confirmation itself.
 
+mod equipment;
 mod foundry;
 mod inventory;
 mod level_keys;
 mod process;
 mod riven;
 
+pub use equipment::{parse_owned_equipment, EquipmentCategory, OwnedEquipment, OwnedItem};
 pub use foundry::{parse_foundry, FoundryState, OwnedRecipe, PendingBuild};
 pub use inventory::fetch_inventory;
 pub use level_keys::{parse_level_keys, LevelKey, LevelKeyState};

@@ -1,0 +1,47 @@
+{
+  "_comment": "Synthetic/sanitized — shaped per docs/research/mobile-inventory-api-coverage.md's reconstruction of DE's inventory.php schema (RawInventoryEntry: ItemType/ItemCount, one entry per owned equipment array). Not a real captured response; the real one from issue #52 has live account data and can't be committed.",
+  "Suits": [
+    {
+      "_id": { "$oid": "5f1b2c3d4e5f6a7b8c9d0e40" },
+      "ItemType": "/Lotus/Powersuits/Excalibur/ExcaliburPrimeSuit",
+      "ItemCount": 1,
+      "XP": 1234567
+    }
+  ],
+  "LongGuns": [
+    {
+      "_id": { "$oid": "5f1b2c3d4e5f6a7b8c9d0e41" },
+      "ItemType": "/Lotus/Weapons/Tenno/Rifle/LatoPrimeRifle",
+      "ItemCount": 1,
+      "XP": 400000
+    }
+  ],
+  "Pistols": [
+    {
+      "_id": { "$oid": "5f1b2c3d4e5f6a7b8c9d0e42" },
+      "ItemType": "/Lotus/Weapons/Tenno/Pistol/LexPrimePistol",
+      "ItemCount": 1
+    }
+  ],
+  "OperatorAmps": [
+    {
+      "_id": { "$oid": "5f1b2c3d4e5f6a7b8c9d0e43" },
+      "ItemType": "/Lotus/Weapons/Tenno/Amps/AmpPrismaGear"
+    }
+  ],
+  "MechSuits": [
+    {
+      "_id": { "$oid": "5f1b2c3d4e5f6a7b8c9d0e44" },
+      "ItemType": "/Lotus/Powersuits/Bonewidow/BonewidowSuit",
+      "ItemCount": 1
+    }
+  ],
+  "LevelKeys": [
+    {
+      "_id": { "$oid": "5f1b2c3d4e5f6a7b8c9d0e45" },
+      "ItemType": "/Lotus/Types/Game/Projections/MesoA1RelicItem",
+      "ItemCount": 4
+    }
+  ],
+  "RegularCredits": 458213
+}
