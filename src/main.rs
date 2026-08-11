@@ -267,6 +267,10 @@ async fn mem_scan_cmd() -> Result<()> {
     let equipment = wf_mem::parse_owned_equipment(&raw)?;
     print_owned_equipment(&equipment);
 
+    println!("\n== mem-scan: Owned Relics (MiscItems VoidProjection) ==");
+    let relics = wf_mem::parse_owned_relics(&raw)?;
+    print_owned_relics(&relics);
+
     Ok(())
 }
 
@@ -387,6 +391,25 @@ fn print_owned_equipment(state: &wf_mem::OwnedEquipment) {
         for item in items {
             println!("    {:<32} x{}", readable_item_name(&item.item_type), item.item_count);
         }
+    }
+}
+
+/// Print raw owned-relic state in the app's existing output style (cf.
+/// `print_level_keys`) — aligned columns, not a raw JSON dump. This is a raw
+/// exposure only (see `wf_mem::relics`'s module doc): no tier/reward-pool/
+/// refinement decoding, no cross-reference against WFCD's `warframe-items`
+/// catalogue, no dedup against the existing OCR-based Seen/Confirmed relic
+/// scan (ADR-0009) — those all stay untouched and out of scope here.
+#[cfg(feature = "mem-scan")]
+fn print_owned_relics(state: &wf_mem::OwnedRelicState) {
+    if state.relics.is_empty() {
+        println!("  no owned-relic entries found");
+        return;
+    }
+
+    println!("  entries ({}):", state.relics.len());
+    for r in &state.relics {
+        println!("    {:<32} x{}", readable_item_name(&r.item_type), r.item_count);
     }
 }
 
