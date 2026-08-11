@@ -79,7 +79,7 @@ const NO_OWNED_PARTS_MSG: &str = "no owned Prime Part data yet. Run `wf-lite ove
      and open the in-game Inventory/Sell screen once — it scans automatically as you scroll.";
 /// Relic tiers offered by the tier-filter checkboxes, in drop order.
 const TIERS: [&str; 5] = ["Lith", "Meso", "Neo", "Axi", "Requiem"];
-/// Placement anchors offered by the Settings tab's anchor combobox — ported
+/// Placement anchors offered by the Settings section's anchor combobox — ported
 /// from the standalone `wf-settings` crate (#72: its UI folded into this
 /// crate's tab bar; `wf-settings` keeps its own copy for its own standalone
 /// dev/embedding build).
@@ -146,7 +146,7 @@ pub fn run() -> eframe::Result<()> {
     // from opening at all — see the module docs and `BrowseApp`'s "Loading…"
     // placeholder.
     //
-    // The new Settings tab (#72) needs its own long-lived, mutable `Config`
+    // The Settings section (#72, folded into Home at #77) needs its own long-lived, mutable `Config`
     // to edit and save, same as the standalone `wf-settings` crate does —
     // cloned here *before* `config` is moved into `load_and_poll`, so a
     // change made on that tab doesn't retroactively affect the background
@@ -158,7 +158,11 @@ pub fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("warframe-lite browse")
-            .with_inner_size([700.0, 700.0]),
+            // Resizable, wider default than the old fixed 700x700 (#77) —
+            // the grouped two-tier nav (see `Group`) and denser tabs like
+            // Mastery/Relics & Plan need more room to breathe.
+            .with_inner_size([1040.0, 720.0])
+            .with_min_inner_size([760.0, 560.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -805,8 +809,11 @@ async fn load_data(config: &Config) -> LoadedData {
 }
 
 /// The browser's tabs: Home, Mastery, Relics & Plan, Relics EV, Buy or Farm,
-/// Sell, Farm, Ducats, Owned, and Settings. Home (not Mastery) is selected on
-/// open (#72) — see `BrowseApp::new`.
+/// Sell, Farm, Ducats, and Owned. Home (not Mastery) is selected on open
+/// (#72) — see `BrowseApp::new`. Settings used to be its own tab too, but
+/// folded into Home (#77) — this app doesn't have enough options to earn a
+/// dedicated destination. Reachable through [`Group`]'s two-tier nav rather
+/// than a single flat row (#77) — see `impl eframe::App for BrowseApp`.
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
     Home,
@@ -818,8 +825,86 @@ enum Tab {
     Farm,
     Ducats,
     Owned,
-    Settings,
 }
+
+impl Tab {
+    /// Display label — distinct from the variant name so each one says what
+    /// it acts on (#77): a *relic* (the thing you crack) or a *Prime Part*
+    /// (what a relic drops, that builds a prime). The old flat "Market"
+    /// grouping bundled Sell/Farm (relic-level) with Ducats (part-level)
+    /// under one unclear label; [`Group::Relics`] now only groups
+    /// relic-level tabs, and Ducats/Buy or Farm Parts stay visibly
+    /// part-level.
+    fn label(&self) -> &'static str {
+        match self {
+            Tab::Home => "Home",
+            Tab::Mastery => "Mastery",
+            Tab::Relics => "Relic Plan",
+            Tab::RelicsEv => "Relic Value",
+            Tab::BuyOrFarm => "Buy or Farm Parts",
+            Tab::Sell => "Sell Relics",
+            Tab::Farm => "Farm Relics",
+            Tab::Ducats => "Ducats",
+            Tab::Owned => "Owned Relics",
+        }
+    }
+}
+
+/// The shell's top-level nav (#77) — four groups instead of the old flat
+/// 10-tab row (or the five-group "Home/Plan/Market/Owned/Settings" first
+/// pass): Settings folds into Home rather than staying a destination of its
+/// own, and `Relics`/`Ducats` split by *what they act on* rather than being
+/// lumped into one "Market" group. `Relics` is every owned-relic action
+/// (inventory, sell-whole, crack-for-parts, plus the relic-catalogue
+/// reference); `Ducats` is the one Prime-Part (post-crack) action; `Progress`
+/// is explicitly "parts you still need."
+#[derive(Clone, Copy, PartialEq)]
+enum Group {
+    Home,
+    Progress,
+    Relics,
+    Ducats,
+}
+
+impl Group {
+    fn label(&self) -> &'static str {
+        match self {
+            Group::Home => "Home",
+            Group::Progress => "Progress",
+            Group::Relics => "Relics",
+            Group::Ducats => "Ducats",
+        }
+    }
+
+    fn of(tab: Tab) -> Self {
+        match tab {
+            Tab::Home => Group::Home,
+            Tab::Mastery | Tab::Relics | Tab::BuyOrFarm => Group::Progress,
+            Tab::Owned | Tab::Sell | Tab::Farm | Tab::RelicsEv => Group::Relics,
+            Tab::Ducats => Group::Ducats,
+        }
+    }
+
+    fn children(&self) -> &'static [Tab] {
+        match self {
+            Group::Progress => &[Tab::Mastery, Tab::Relics, Tab::BuyOrFarm],
+            Group::Relics => &[Tab::Owned, Tab::Sell, Tab::Farm, Tab::RelicsEv],
+            Group::Home | Group::Ducats => &[],
+        }
+    }
+
+    fn default_tab(&self) -> Tab {
+        match self {
+            Group::Home => Tab::Home,
+            Group::Progress => Tab::Mastery,
+            // Opens on the inventory itself, not an action on it.
+            Group::Relics => Tab::Owned,
+            Group::Ducats => Tab::Ducats,
+        }
+    }
+}
+
+const GROUPS: [Group; 4] = [Group::Home, Group::Progress, Group::Relics, Group::Ducats];
 
 #[derive(Clone, Copy, PartialEq)]
 enum MasteryFilter {
@@ -919,18 +1004,18 @@ struct BrowseApp {
     /// what the Home tab's Scan Memory action uses (#72).
     client: reqwest::Client,
     market_platform: String,
-    /// The Settings tab's own long-lived, mutable `Config` — cloned from the
-    /// launch-time config before it was moved into `load_and_poll` (see
+    /// The Settings section's own long-lived, mutable `Config` — cloned from
+    /// the launch-time config before it was moved into `load_and_poll` (see
     /// `run`'s docs). Edited and saved here the same way the standalone
     /// `wf-settings` crate's `SettingsApp` does; a change here does not
     /// retroactively affect the background loader/poller's own copy.
     config: Config,
     config_path: PathBuf,
-    /// Editable text buffer for the Settings tab's account id field —
+    /// Editable text buffer for the Settings section's account id field —
     /// doubles as the Home tab's "account set?" readout (#72), same as
     /// `SettingsApp::account_id`.
     account_id: String,
-    /// The Settings tab's own status line (Save/Detect/Copy feedback) —
+    /// The Settings section's own status line (Save/Detect/Copy feedback) —
     /// named distinctly from `scan_status` (the Home tab's Scan Memory
     /// result) so the two are never confused.
     settings_status: String,
@@ -1095,8 +1180,9 @@ impl BrowseApp {
 
     /// The Home tab (#72): the default tab on open, replacing the old
     /// Mastery default. A brief status readout — whether a Mastery account
-    /// id is configured (mirrors the Settings tab's own field, not a
-    /// separate read) — plus the Scan Memory button.
+    /// id is configured (mirrors the Settings section's own field, not a
+    /// separate read) — plus the Scan Memory button, and (#77) the Settings
+    /// section itself at the bottom (see [`Self::settings_tab`]).
     ///
     /// A deliberate click is the map's required consent (see this module's
     /// docs and CONTEXT.md's Notes) — no confirmation dialog, and
@@ -1109,7 +1195,7 @@ impl BrowseApp {
         ui.add_space(8.0);
 
         if self.account_id.trim().is_empty() {
-            ui.label("Mastery account id: not set — set it on the Settings tab");
+            ui.label("Mastery account id: not set — set it below");
         } else {
             ui.label(format!("Mastery account id: {}", self.account_id.trim()));
         }
@@ -1143,6 +1229,16 @@ impl BrowseApp {
             }
         };
         ui.label(line);
+
+        // Settings folded in here rather than kept as its own destination
+        // (#77) — this app doesn't have (and isn't expected to grow) enough
+        // options to earn a dedicated tab. `settings_tab` is otherwise
+        // unchanged; its own `ui.heading("Settings")` now reads as a
+        // sub-section of Home.
+        ui.add_space(18.0);
+        ui.separator();
+        ui.add_space(8.0);
+        self.settings_tab(ui);
     }
 
     /// Fire the Home tab's Scan Memory action (#72) on `rt_handle` — never on
@@ -2001,14 +2097,17 @@ impl BrowseApp {
         }
     }
 
-    /// The Settings tab (#72): placement/opacity/fissure-panel toggle,
-    /// Mastery account id (with "Detect from log"), hotkey-bind help, and
-    /// Save — ported from the standalone `wf-settings` crate's `SettingsApp`
-    /// UI body, now editing `self.config`/`self.config_path` instead of a
-    /// dedicated app struct. A change here doesn't retroactively affect the
-    /// background loader/poller's own `Config` snapshot (see `run`'s docs) —
-    /// same "restart to apply placement changes" convention `wf-settings`
-    /// already documented.
+    /// Settings: placement/opacity/fissure-panel toggle, Mastery account id
+    /// (with "Detect from log"), hotkey-bind help, and Save — ported from
+    /// the standalone `wf-settings` crate's `SettingsApp` UI body, now
+    /// editing `self.config`/`self.config_path` instead of a dedicated app
+    /// struct. Originally its own tab (#72); folded into the bottom of
+    /// [`Self::home_tab`] instead (#77) — this app doesn't have enough
+    /// options to earn a dedicated destination, so this is now called from
+    /// there rather than matched on directly. A change here doesn't
+    /// retroactively affect the background loader/poller's own `Config`
+    /// snapshot (see `run`'s docs) — same "restart to apply placement
+    /// changes" convention `wf-settings` already documented.
     fn settings_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading("Settings");
         ui.add_space(8.0);
@@ -2383,18 +2482,42 @@ impl eframe::App for BrowseApp {
         ui.ctx().request_repaint_after(if still_loading { LOADING_REPAINT } else { POLL_INTERVAL });
 
         egui::CentralPanel::default().show(ui, |ui| {
+            let current_group = Group::of(self.tab);
+
+            // Primary row: larger, so it reads as the main nav. No
+            // `.strong()` here — `apply_theme` points strong text at the
+            // same ACCENT color `selectable_label` fills the selected tab
+            // with, so a selected "strong" label would render as invisible
+            // teal-on-teal text (hit this exact bug while prototyping).
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Home, "Home");
-                ui.selectable_value(&mut self.tab, Tab::Mastery, "Mastery");
-                ui.selectable_value(&mut self.tab, Tab::Relics, "Relics & Plan");
-                ui.selectable_value(&mut self.tab, Tab::RelicsEv, "Relics EV");
-                ui.selectable_value(&mut self.tab, Tab::BuyOrFarm, "Buy or Farm");
-                ui.selectable_value(&mut self.tab, Tab::Sell, "Sell");
-                ui.selectable_value(&mut self.tab, Tab::Farm, "Farm");
-                ui.selectable_value(&mut self.tab, Tab::Ducats, "Ducats");
-                ui.selectable_value(&mut self.tab, Tab::Owned, "Owned");
-                ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
+                for g in GROUPS {
+                    let text = egui::RichText::new(g.label()).size(16.0);
+                    if ui.selectable_label(current_group == g, text).clicked() {
+                        self.tab = g.default_tab();
+                    }
+                    ui.add_space(6.0);
+                }
             });
+
+            // Sub-tab row: smaller, nested in a darker band, only shown for
+            // a group that actually has children — so the two nav tiers are
+            // told apart at a glance instead of reading as one flat row of
+            // same-weight buttons (#77).
+            if !current_group.children().is_empty() {
+                egui::Frame::new()
+                    .fill(ui.visuals().extreme_bg_color)
+                    .inner_margin(egui::Margin::symmetric(10, 4))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for &child in current_group.children() {
+                                let text = egui::RichText::new(child.label()).size(12.5);
+                                if ui.selectable_label(self.tab == child, text).clicked() {
+                                    self.tab = child;
+                                }
+                            }
+                        });
+                    });
+            }
             ui.separator();
 
             match self.tab {
@@ -2407,7 +2530,6 @@ impl eframe::App for BrowseApp {
                 Tab::Farm => self.farm_tab(ui),
                 Tab::Ducats => self.ducats_tab(ui),
                 Tab::Owned => self.owned_tab(ui),
-                Tab::Settings => self.settings_tab(ui),
             }
         });
     }

@@ -267,11 +267,13 @@ impl ksni::Tray for WfTray {
             StandardItem {
                 label: "Settings…".into(),
                 icon_name: "configure".into(),
-                // Settings is now a tab inside the browse window rather than
-                // its own (#72) — `browse` and `settings` are the same
-                // subcommand as of that ticket, but only one code path
-                // should exist here, so this goes straight to `browse`
-                // rather than through the `settings` alias.
+                // Settings lives inside the browse window rather than its
+                // own (#72) — first as its own tab, now (#77) folded into
+                // the bottom of Home, so `browse` already lands here
+                // directly. `browse` and `settings` are the same subcommand
+                // as of #72, but only one code path should exist here, so
+                // this goes straight to `browse` rather than through the
+                // `settings` alias.
                 activate: Box::new(|_| run_detached(&["browse"])),
                 ..Default::default()
             }
