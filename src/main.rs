@@ -74,7 +74,7 @@ async fn main() -> Result<()> {
         Some("relic-scan") => return relic_scan(&config).await,
         Some("reward-png") => return reward_png(&config).await,
         #[cfg(feature = "mem-scan")]
-        Some("mem-scan") => return mem_scan_cmd().await,
+        Some("mem-scan") => return mem_scan_cmd(&config).await,
         _ => {}
     }
 
@@ -247,7 +247,7 @@ fn capture_window(out: Option<String>) -> Result<()> {
 /// error from `wf_mem` (see `process.rs`/`inventory.rs`) — no retry, printed
 /// once by `main`'s top-level `Result` handling.
 #[cfg(feature = "mem-scan")]
-async fn mem_scan_cmd() -> Result<()> {
+async fn mem_scan_cmd(config: &Config) -> Result<()> {
     let client = wf_data::http_client();
     let raw = wf_mem::scan_and_fetch(&client).await?;
 
@@ -270,6 +270,10 @@ async fn mem_scan_cmd() -> Result<()> {
     println!("\n== mem-scan: Owned Relics (MiscItems VoidProjection) ==");
     let relics = wf_mem::parse_owned_relics(&raw)?;
     print_owned_relics(&relics);
+
+    println!("\n== mem-scan: Owned but Unmastered ==");
+    let mastery = load_mastery(config, &client).await;
+    print_owned_but_unmastered(&owned_but_unmastered(&equipment, &mastery));
 
     Ok(())
 }
@@ -371,8 +375,8 @@ fn print_level_keys(state: &wf_mem::LevelKeyState) {
 /// `print_level_keys`) — aligned columns, grouped by equipment category, not
 /// a raw JSON dump. This is a raw ownership exposure only (see
 /// `wf_mem::equipment`'s module doc): no cross-reference against `MasterySet`
-/// to flag "built but not yet mastered" (per #61's explicit out-of-scope
-/// call) — that pairing is left for a future ticket.
+/// here — see `owned_but_unmastered`/`print_owned_but_unmastered` for that
+/// pairing (#65), rendered as its own section.
 #[cfg(feature = "mem-scan")]
 fn print_owned_equipment(state: &wf_mem::OwnedEquipment) {
     if state.items.is_empty() {
@@ -410,6 +414,42 @@ fn print_owned_relics(state: &wf_mem::OwnedRelicState) {
     println!("  entries ({}):", state.relics.len());
     for r in &state.relics {
         println!("    {:<32} x{}", readable_item_name(&r.item_type), r.item_count);
+    }
+}
+
+/// Owned equipment (#62's raw ownership set) whose internal path names a
+/// Prime and isn't yet mastered per `mastery` (#61's cross-reference,
+/// surfacing what `XPInfo`-based mastery can't see: a freshly-built,
+/// still-rank-0 Prime). Non-Prime equipment never appears here — `MasterySet`
+/// only ever tracks Primes (see its own module doc), so cross-referencing a
+/// vanilla item would always read "unmastered" without meaning anything.
+#[cfg(feature = "mem-scan")]
+fn owned_but_unmastered<'a>(
+    equipment: &'a wf_mem::OwnedEquipment,
+    mastery: &wf_relic::MasterySet,
+) -> Vec<&'a wf_mem::OwnedItem> {
+    equipment
+        .items
+        .iter()
+        .filter(|item| item.item_type.to_ascii_lowercase().contains("prime"))
+        .filter(|item| !mastery.is_mastered_by_path(&item.item_type))
+        .collect()
+}
+
+/// Print the owned-but-unmastered cross-reference in the app's existing
+/// output style (cf. `print_level_keys`). With no `account_id` configured,
+/// `mastery` is empty (`load_mastery`'s documented "indicators simply off"
+/// convention), so every owned Prime prints here rather than none — expected,
+/// not a bug.
+#[cfg(feature = "mem-scan")]
+fn print_owned_but_unmastered(items: &[&wf_mem::OwnedItem]) {
+    if items.is_empty() {
+        println!("  none — every owned Prime is already mastered");
+        return;
+    }
+    println!("  {} owned Prime(s) not yet mastered:", items.len());
+    for item in items {
+        println!("    {:<32} x{}", readable_item_name(&item.item_type), item.item_count);
     }
 }
 
@@ -496,6 +536,48 @@ mod mem_scan_tests {
     #[test]
     fn format_remaining_reports_days_and_hours_past_the_day_mark() {
         assert_eq!(format_remaining(time::Duration::hours(50)), "2d 2h");
+    }
+
+    fn owned(item_type: &str) -> wf_mem::OwnedItem {
+        wf_mem::OwnedItem {
+            category: wf_mem::EquipmentCategory::Warframes,
+            item_type: item_type.to_string(),
+            item_count: 1,
+        }
+    }
+
+    #[test]
+    fn owned_but_unmastered_keeps_an_owned_prime_below_the_mastery_cap() {
+        let equipment = wf_mem::OwnedEquipment {
+            items: vec![owned("/Lotus/Powersuits/Excalibur/ExcaliburPrimeSuit")],
+        };
+        let mastery = wf_relic::MasterySet::default(); // nothing mastered
+
+        let gaps = owned_but_unmastered(&equipment, &mastery);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].item_type, "/Lotus/Powersuits/Excalibur/ExcaliburPrimeSuit");
+    }
+
+    #[test]
+    fn owned_but_unmastered_drops_an_already_mastered_prime() {
+        let equipment = wf_mem::OwnedEquipment {
+            items: vec![owned("/Lotus/Powersuits/Excalibur/ExcaliburPrimeSuit")],
+        };
+        let mastery = wf_relic::MasterySet::from_xp([(
+            "/Lotus/Powersuits/Excalibur/ExcaliburPrimeSuit".to_string(),
+            900_000,
+        )]);
+
+        assert!(owned_but_unmastered(&equipment, &mastery).is_empty());
+    }
+
+    #[test]
+    fn owned_but_unmastered_ignores_non_prime_equipment() {
+        let equipment =
+            wf_mem::OwnedEquipment { items: vec![owned("/Lotus/Powersuits/Volt/VoltSuit")] };
+        let mastery = wf_relic::MasterySet::default();
+
+        assert!(owned_but_unmastered(&equipment, &mastery).is_empty());
     }
 }
 

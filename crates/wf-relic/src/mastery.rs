@@ -70,6 +70,21 @@ impl MasterySet {
         let core = reward_core(reward_item_name);
         !core.is_empty() && self.mastered.iter().any(|m| m.contains(&core))
     }
+
+    /// Whether the item at internal-path `item_type` — as `Suits`/`LongGuns`/
+    /// etc. equipment-array entries and `XPInfo` entries alike name it, e.g.
+    /// `/Lotus/Powersuits/Excalibur/ExcaliburPrimeSuit` — has been mastered.
+    /// Unlike [`Self::is_mastered`] (which matches a relic-reward *display*
+    /// name via substring containment, since reward text and internal paths
+    /// don't line up word-for-word), this applies the exact same leaf+flatten+
+    /// codename-translate pipeline [`Self::from_xp`] built `mastered` from, so
+    /// it compares a raw owned-equipment path by equality — no containment
+    /// heuristic needed, since both sides go through the same transform of
+    /// the same underlying DE internal name.
+    pub fn is_mastered_by_path(&self, item_type: &str) -> bool {
+        let key = translate_codename(&flatten(leaf_of(item_type)));
+        !key.is_empty() && self.mastered.contains(&key)
+    }
 }
 
 /// Fetch and build a [`MasterySet`] for `account_id` (24-hex) on PC.
@@ -143,7 +158,11 @@ pub async fn load_cached(
     // (see `canonical`) changed — bump the name so old caches are ignored.
     // `-v4`: matching moved from a canonical-key set to substring containment
     // with codename translation — bump so old-format cached keys aren't reused.
-    let file = format!("mastery-v4-{account_id}.json");
+    // `-v5`: `cap_for` no longer gives every sentinel *weapon* the 900k frame
+    // cap meant only for the sentinel's own body — bump so a cache built
+    // under the old bug doesn't keep hiding a mastered sentinel weapon
+    // between 450k-900k XP (issue #65).
+    let file = format!("mastery-v5-{account_id}.json");
     if let Some(cached) = wf_cache::load_blob::<MasterySet>(&file) {
         if cached.age() < ttl {
             tracing::info!("mastery from cache ({} items)", cached.value.len());
@@ -200,11 +219,18 @@ struct XpEntry {
     xp: u64,
 }
 
-/// Rank-30 affinity cap for an item, chosen by its category path.
+/// Rank-30 affinity cap for an item, chosen by its category path. Sentinel
+/// **bodies** get the frame cap (`/SentinelPowersuits/`, e.g.
+/// `.../Sentinels/SentinelPowersuits/PrimeWyrmPowerSuit`) same as a Warframe;
+/// sentinel **weapons** (`.../Sentinels/SentinelWeapons/PrimeLaserRifle`) are
+/// still weapons and must fall through to the weapon cap — matching on the
+/// broader `/sentinels/` parent segment used to catch both and wrongly gave
+/// every sentinel weapon a 900k cap instead of 450k, live-verified as a real
+/// false "not mastered" for a weapon already at 453,843 XP (issue #65).
 fn cap_for(path: &str) -> u64 {
     let p = path.to_ascii_lowercase();
     if p.contains("/powersuits/")
-        || p.contains("/sentinels/")
+        || p.contains("/sentinelpowersuits/")
         || p.contains("kubrow")
         || p.contains("catbrow")
         || p.contains("necromech")
@@ -375,6 +401,20 @@ mod tests {
     }
 
     #[test]
+    fn caps_a_sentinel_body_at_the_frame_cap_but_its_weapon_at_the_weapon_cap() {
+        // Both nest under the same `/Sentinels/` parent — only the powersuit
+        // (the pet body) gets the frame cap; its weapon is still a weapon.
+        assert_eq!(
+            cap_for("/Lotus/Types/Sentinels/SentinelPowersuits/PrimeWyrmPowerSuit"),
+            FRAME_CAP
+        );
+        assert_eq!(
+            cap_for("/Lotus/Types/Sentinels/SentinelWeapons/PrimeLaserRifle"),
+            WEAPON_CAP
+        );
+    }
+
+    #[test]
     fn reward_core_strips_prime_and_components_in_order() {
         assert_eq!(reward_core("Gram Prime Blueprint"), "gram");
         assert_eq!(reward_core("Ember Prime Systems Blueprint"), "ember");
@@ -486,5 +526,53 @@ mod tests {
         assert!(!set.is_mastered("Braton Prime Receiver")); // below cap → not mastered
         assert!(!set.is_mastered("Volnus Prime Blueprint")); // absent
         assert!(!set.is_mastered("Boltor Prime Blueprint")); // vanilla-only mastery ≠ Prime
+    }
+
+    #[test]
+    fn is_mastered_by_path_matches_the_exact_path_that_built_the_set() {
+        let set = MasterySet::from_xp([(
+            "/Lotus/Powersuits/Excalibur/ExcaliburPrimeSuit".to_string(),
+            900_000,
+        )]);
+        assert!(set.is_mastered_by_path("/Lotus/Powersuits/Excalibur/ExcaliburPrimeSuit"));
+        assert!(!set.is_mastered_by_path("/Lotus/Powersuits/Volt/VoltPrimeSuit"));
+        // Unrelated to `from_xp`'s substring-containment counterpart —
+        // exact-key matching, so a differently-shaped path for the same item
+        // doesn't accidentally satisfy it just by sharing a substring.
+        assert!(!set.is_mastered_by_path("/Lotus/Powersuits/Excalibur/Excalibur"));
+    }
+
+    #[test]
+    fn is_mastered_by_path_translates_a_codename_path_like_from_xp_does() {
+        // Hildryn's dev codename is "IronFrame" (see `CODENAME_TO_DISPLAY`) —
+        // `from_xp` translates it when building `mastered`, so the query side
+        // must apply the same translation or the two never agree.
+        let set = MasterySet::from_xp([(
+            "/Lotus/Powersuits/IronFrame/IronFramePrime".to_string(),
+            900_000,
+        )]);
+        assert!(set.is_mastered_by_path("/Lotus/Powersuits/IronFrame/IronFramePrime"));
+    }
+
+    #[test]
+    fn is_mastered_by_path_treats_a_sentinel_weapon_as_mastered_at_the_weapon_cap() {
+        // Regression for the `cap_for` bug this ticket's live cross-reference
+        // surfaced: a sentinel weapon at 453,843 XP (above the 450k weapon
+        // cap, below the 900k frame cap it was wrongly given) read as
+        // "not mastered" on a real account despite being mastered in-game.
+        let set = MasterySet::from_xp([(
+            "/Lotus/Types/Sentinels/SentinelWeapons/PrimeLaserRifle".to_string(),
+            453_843,
+        )]);
+        assert!(set.is_mastered_by_path("/Lotus/Types/Sentinels/SentinelWeapons/PrimeLaserRifle"));
+    }
+
+    #[test]
+    fn is_mastered_by_path_is_false_for_an_owned_but_below_cap_prime() {
+        let set = MasterySet::from_xp([(
+            "/Lotus/Weapons/Tenno/LongGuns/BratonPrime".to_string(),
+            100_000, // below the weapon cap — not mastered
+        )]);
+        assert!(!set.is_mastered_by_path("/Lotus/Weapons/Tenno/LongGuns/BratonPrime"));
     }
 }
