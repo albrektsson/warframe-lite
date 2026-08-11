@@ -166,12 +166,13 @@ game**. Summary of what shipped:
   supervises the overlay, and exposes the app's modes via its menu). `wf-lite
   settings` / `wf-lite tray` launch them; a `.desktop` file makes the tray a
   launcher entry.
-- **Distribution ✅.** The overlay is a single self-contained binary (no external
+- **Distribution.** The overlay is a single self-contained binary (no external
   link-time deps: libwayland is dlopen'd, x11rb is pure Rust, rustls uses `ring`);
-  the one runtime piece is the `tesseract` CLI for the relic OCR. Releases build
-  against an older glibc (Ubuntu 22.04) for broad compatibility and attach all
-  three binaries; a Fedora COPR/RPM spec and per-distro tesseract notes are
-  provided. musl-static is unsuitable (the overlay dlopens libwayland).
+  OCR (opt-in) links `libtesseract`/`libleptonica` in-process rather than
+  shelling out to a CLI (ADR-0008). musl-static is unsuitable (the overlay
+  dlopens libwayland). No packaged/prebuilt releases (GitHub Releases,
+  Fedora/COPR) are published pre-1.0 — build from source; packaging is
+  deferred until after 1.0.
 
 **Two hardest Linux unknowns de-risked (verified against the running game):**
 

@@ -13,6 +13,10 @@ wf-config.workspace = true
 wf-data.workspace = true
 wf-relic.workspace = true
 wf-cache.workspace = true
+# For the Home tab's Scan Memory button (#72): runs the mem-scan pipeline
+# in-process, the same way `wf-lite`'s own `mem-scan` subcommand does — see
+# `home_tab`/`spawn_scan` in `src/lib.rs`.
+wf-mem.workspace = true
 futures.workspace = true
 reqwest.workspace = true
 tracing.workspace = true

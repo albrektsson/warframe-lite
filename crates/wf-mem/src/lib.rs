@@ -20,6 +20,7 @@ mod equipment;
 mod foundry;
 mod inventory;
 mod level_keys;
+mod persist;
 mod process;
 mod relics;
 mod riven;
@@ -28,6 +29,7 @@ pub use equipment::{parse_owned_equipment, EquipmentCategory, OwnedEquipment, Ow
 pub use foundry::{parse_foundry, FoundryState, OwnedRecipe, PendingBuild};
 pub use inventory::fetch_inventory;
 pub use level_keys::{parse_level_keys, LevelKey, LevelKeyState};
+pub use persist::{write_owned_relics, RelicsWriteReport};
 pub use process::{find_pids, scan_authz, Authz};
 pub use relics::{parse_owned_relics, OwnedRelic, OwnedRelicState};
 pub use riven::{parse_rivens, Riven, RivenState, RivenStat};

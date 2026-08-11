@@ -138,13 +138,19 @@ wf-gridscan = { workspace = true, optional = true }
 wf-relic.workspace = true
 wf-cache.workspace = true
 wf-mem = { workspace = true, optional = true }
-# The tray/settings/browse subsystems, linked in so `wf-lite`'s `tray`
-# (and its default bare invocation), `settings`, and `browse` subcommands
-# run them in-process instead of spawning separately-installed sibling
-# binaries (see #69). Their own `[[bin]]` targets stay for standalone
-# dev/embedding builds (`cargo run -p wf-tray`, etc.) — see the map (#68).
+# The tray/browse subsystems, linked in so `wf-lite`'s `tray` (and its
+# default bare invocation) and `browse` subcommands run them in-process
+# instead of spawning separately-installed sibling binaries (see #69). Their
+# own `[[bin]]` targets stay for standalone dev/embedding builds (`cargo run
+# -p wf-tray`, etc.) — see the map (#68). `wf-settings` is deliberately not
+# listed here (#72): its standalone settings window was folded into
+# `wf-browse`'s tab bar as a Settings tab, so nothing in this binary calls
+# `wf_settings::run()` anymore (`wf-lite`'s `settings` subcommand is now a
+# harmless alias for `browse`, see `src/main.rs`). `wf-settings` itself stays
+# a workspace member — a standalone, independently buildable/testable crate
+# for dev/embedding (`cargo run -p wf-settings`, `cargo test -p
+# wf-settings`) — just no longer wired into the shipped binary.
 wf-tray.workspace = true
-wf-settings.workspace = true
 wf-browse.workspace = true
 reqwest.workspace = true
 anyhow.workspace = true

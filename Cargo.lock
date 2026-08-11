@@ -3783,7 +3783,6 @@ dependencies = [
  "wf-ocr",
  "wf-overlay",
  "wf-relic",
- "wf-settings",
  "wf-tray",
 ]
 
@@ -4069,6 +4068,7 @@ dependencies = [
  "wf-cache",
  "wf-config",
  "wf-data",
+ "wf-mem",
  "wf-relic",
 ]
 
@@ -4142,6 +4142,8 @@ dependencies = [
  "serde_json",
  "time",
  "tracing",
+ "wf-cache",
+ "wf-relic",
 ]
 
 [[package]]

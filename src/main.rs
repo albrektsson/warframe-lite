@@ -7,14 +7,20 @@
 //! dispatched from `main`. `status` shows live Void Fissures and a bare
 //! `<market_slug>` prices that item.
 //!
-//! `tray`/`settings`/`browse` run the [`wf_tray`]/[`wf_settings`]/
-//! [`wf_browse`] crates in-process — they're linked into this binary as
-//! libraries, not spawned as separately-installed sibling binaries (see
-//! #69). The one place a real child process is still spawned for these
-//! subsystems is `wf_tray`'s own overlay supervision, which re-execs this
-//! same binary (`std::env::current_exe()`) with the `overlay` subcommand so
-//! the overlay can be started/stopped/crash-isolated independently of the
-//! tray.
+//! `tray`/`browse` run the [`wf_tray`]/[`wf_browse`] crates in-process —
+//! they're linked into this binary as libraries, not spawned as
+//! separately-installed sibling binaries (see #69). The one place a real
+//! child process is still spawned for these subsystems is `wf_tray`'s own
+//! overlay supervision, which re-execs this same binary
+//! (`std::env::current_exe()`) with the `overlay` subcommand so the overlay
+//! can be started/stopped/crash-isolated independently of the tray.
+//!
+//! `settings` is a harmless alias for `browse` (#72): the standalone
+//! settings window was folded into `wf-browse`'s tab bar as a Settings tab,
+//! so `wf-lite` no longer depends on the `wf-settings` crate at all — it
+//! stays in the workspace as a standalone, independently
+//! buildable/embeddable crate (`cargo run -p wf-settings`), just not wired
+//! into this binary's command dispatch.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -88,11 +94,15 @@ async fn main() -> Result<()> {
         Some("mastery") => return mastery_cmd(&config).await,
         Some("set-account") => return set_account_cmd(&config_path),
         Some("detect-account") => return detect_account_cmd(&config, &config_path).await,
-        Some("settings") => return run_settings(),
+        // `settings` now opens the same browse window as `browse` (#72):
+        // Settings became a tab inside `wf-browse` rather than its own
+        // window, so this is a harmless alias for any existing muscle-memory
+        // or scripts — it doesn't auto-select the Settings tab, landing on
+        // the new default Home tab instead, same as `browse`.
+        Some("settings") | Some("browse") => return run_browse(),
         // No subcommand behaves like `tray`: launch the tray, which
         // auto-starts the overlay when the game window appears (#69).
         None | Some("tray") => return wf_tray::run().await,
-        Some("browse") => return run_browse(),
         Some("relic") => return relic_eval(&config).await,
         Some("relics") => return relics_cmd(&config).await,
         Some("mastery-plan") => return mastery_plan_cmd(&config).await,
@@ -151,8 +161,8 @@ RUN IT
     tray                  Tray icon: waits for the game, auto-runs the overlay
                            (also what a bare `wf-lite`, with no command, runs)
     overlay               Show the live overlay (live fissures + relic picker)
-    settings              Open the graphical settings window
-    browse                Open the mastery/relic browser (Mastery/Relics/Sell)
+    browse                Open the mastery/relic browser (Home/Mastery/Relics/
+                           Sell/Settings — `settings` is an alias for this)
     toggle | show | hide  Show/hide a running overlay
     copy                  Copy the current best-pick reward (name + plat) to the clipboard
 
@@ -466,48 +476,25 @@ fn print_owned_relics(state: &wf_mem::OwnedRelicState, relic_names: &wf_relic::R
     }
 }
 
-/// Write every decoded owned-relic entry to `owned-relics.json` as an exact,
-/// [`wf_relic::Source::MemScan`]-tagged snapshot (ADR-0009's revision): the
-/// mem-scanned inventory becomes the new ground truth, and any prior entry
-/// not covered by it is dropped as a confirmed zero (see
-/// [`wf_relic::apply_exact_snapshot`]'s doc for why absence is authoritative
-/// here). Running `mem-scan` at all is already the map's required
-/// in-the-moment consent (see [`mem_scan_cmd`]'s doc) — no separate opt-in is
-/// needed to let its findings take effect. An entry `relic_names` couldn't
-/// decode (no `(code, refinement)` to key `owned-relics.json` by) is skipped
-/// here — already visible to the human via `print_owned_relics`'s
-/// `(undecoded)` rows — but also logged as a warning so it isn't silently
-/// dropped from view if this command's output scrolls by unread.
+/// Print the outcome of writing owned-relic entries to `owned-relics.json`.
+/// The actual decode+snapshot+apply+save logic now lives in
+/// [`wf_mem::write_owned_relics`] (#72) — shared with `wf-browse`'s Home-tab
+/// Scan Memory button, which calls the same function in-process and formats
+/// its own status line from the same [`wf_mem::RelicsWriteReport`]. This is a
+/// thin wrapper that preserves the CLI's exact console text (undecoded
+/// entries were already visible via `print_owned_relics`'s `(undecoded)`
+/// rows; `wf_mem::write_owned_relics` also logs a `tracing::warn!` for them,
+/// same as before this refactor).
 #[cfg(feature = "mem-scan")]
 fn write_owned_relics(state: &wf_mem::OwnedRelicState, relic_names: &wf_relic::RelicNameIndex) {
-    let mut snapshot: Vec<(String, wf_relic::Refinement, u32)> = Vec::new();
-    let mut undecoded = 0usize;
-    for r in &state.relics {
-        let decoded = relic_names
-            .lookup(&r.item_type)
-            .and_then(|id| wf_relic::Refinement::from_label(&id.refinement).map(|refinement| (id.display(), refinement)));
-        match decoded {
-            Some((code, refinement)) => snapshot.push((code, refinement, r.item_count)),
-            None => undecoded += 1,
-        }
-    }
-    if undecoded > 0 {
-        let (noun, verb) = if undecoded == 1 { ("entry", "was") } else { ("entries", "were") };
-        tracing::warn!(
-            "mem-scan: {undecoded} owned-relic {noun} could not be decoded and {verb} not applied to {}",
-            wf_relic::OWNED_RELICS_FILE
+    let report = wf_mem::write_owned_relics(state, relic_names);
+    if report.saved {
+        println!(
+            "  wrote {} entries to {} ({} undecoded, skipped)",
+            report.written,
+            wf_relic::OWNED_RELICS_FILE,
+            report.undecoded
         );
-    }
-
-    let mut owned: wf_relic::OwnedRelics = wf_cache::load_blob_or_reset(wf_relic::OWNED_RELICS_FILE);
-    wf_relic::apply_exact_snapshot(&mut owned, &snapshot);
-    match wf_cache::save_blob(wf_relic::OWNED_RELICS_FILE, &owned) {
-        Ok(()) => println!(
-            "  wrote {} entries to {} ({undecoded} undecoded, skipped)",
-            snapshot.len(),
-            wf_relic::OWNED_RELICS_FILE
-        ),
-        Err(e) => tracing::warn!("failed to write {}: {e}", wf_relic::OWNED_RELICS_FILE),
     }
 }
 
@@ -976,8 +963,11 @@ fn set_account_cmd(config_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Run the settings window in-process (the `wf_settings` crate is linked into
+/// Run the browse window in-process (the `wf_browse` crate is linked into
 /// `wf-lite`, not shelled out to as a separate installed binary — see #69).
+/// Both `wf-lite`'s `browse` subcommand and its `settings` alias (#72: the
+/// standalone settings window was folded into `wf-browse`'s tab bar) land
+/// here.
 ///
 /// Called directly (not via `spawn_blocking`, unlike `run_overlay`'s calloop
 /// loop): `eframe`/`winit` panics if its event loop is created off the
@@ -989,11 +979,6 @@ fn set_account_cmd(config_path: &std::path::Path) -> Result<()> {
 /// itself, so a direct, synchronous call here blocks that same thread until
 /// the window closes — fine, since this is the last thing `main` does
 /// before returning; nothing else needs that thread meanwhile.
-fn run_settings() -> Result<()> {
-    wf_settings::run().map_err(|e| anyhow::anyhow!("settings window failed: {e}"))
-}
-
-/// Run the browse window in-process, same rationale as [`run_settings`].
 fn run_browse() -> Result<()> {
     wf_browse::run().map_err(|e| anyhow::anyhow!("browse window failed: {e}"))
 }

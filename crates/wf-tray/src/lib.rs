@@ -25,12 +25,17 @@
 
 use std::path::PathBuf;
 use std::process::Child;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use ksni::TrayMethods;
 
 const POLL: Duration = Duration::from_secs(2);
+/// How much of a failed scan's error message `status_text` shows in the
+/// tooltip/menu status line — long enough to be useful (the setcap-hint
+/// command itself is well under this), short enough not to blow out the
+/// tray's tooltip width.
+const SCAN_STATUS_MAX_LEN: usize = 160;
 
 /// The warframe-lite mark (a hexagon enclosing an "M"), bundled as a PNG so the
 /// tray icon lives inside the binary — no dependency on an installed icon theme,
@@ -72,6 +77,7 @@ pub async fn run() -> anyhow::Result<()> {
         game_present: false,
         overlay: None,
         overlay_visible: true,
+        scan_status: Arc::new(Mutex::new(None)),
     };
     let handle = tray
         .spawn()
@@ -100,6 +106,16 @@ struct WfTray {
     overlay: Option<Child>,
     /// Our intended overlay visibility (what the last show/hide asked for).
     overlay_visible: bool,
+    /// The last `Scan Memory` outcome (#72), `None` until the first click.
+    /// `Arc<Mutex<>>` so it can be cloned into the detached reaping thread
+    /// [`run_scan`] runs on while the live `WfTray` instance (which `ksni`
+    /// owns/mutates via its own internal synchronization) still sees updates
+    /// through the same underlying `Mutex` — `menu()`/`tool_tip()`/
+    /// `status_text()` are rebuilt fresh from `&self` each time the tray is
+    /// queried, so reading this at render time is sufficient; no need to
+    /// touch `ksni`'s `Handle`/`update` async mechanism `run()`'s polling
+    /// loop uses.
+    scan_status: Arc<Mutex<Option<Result<(), String>>>>,
 }
 
 impl WfTray {
@@ -108,17 +124,27 @@ impl WfTray {
     }
 
     fn status_text(&self) -> String {
-        if self.running() {
+        let mut text = if self.running() {
             if self.overlay_visible {
-                "Overlay running".into()
+                "Overlay running".to_string()
             } else {
-                "Overlay running (hidden)".into()
+                "Overlay running (hidden)".to_string()
             }
         } else if self.game_present {
-            "Warframe detected — overlay stopped".into()
+            "Warframe detected — overlay stopped".to_string()
         } else {
-            "Waiting for Warframe…".into()
+            "Waiting for Warframe…".to_string()
+        };
+        if let Some(scan) = self.scan_status.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            match scan {
+                Ok(()) => text.push_str(" — last scan: ok"),
+                Err(e) => {
+                    text.push_str(" — last scan failed: ");
+                    text.push_str(&truncate(e, SCAN_STATUS_MAX_LEN));
+                }
+            }
         }
+        text
     }
 
     fn start_overlay(&mut self) {
@@ -241,7 +267,12 @@ impl ksni::Tray for WfTray {
             StandardItem {
                 label: "Settings…".into(),
                 icon_name: "configure".into(),
-                activate: Box::new(|_| run_detached(&["settings"])),
+                // Settings is now a tab inside the browse window rather than
+                // its own (#72) — `browse` and `settings` are the same
+                // subcommand as of that ticket, but only one code path
+                // should exist here, so this goes straight to `browse`
+                // rather than through the `settings` alias.
+                activate: Box::new(|_| run_detached(&["browse"])),
                 ..Default::default()
             }
             .into(),
@@ -260,6 +291,23 @@ impl ksni::Tray for WfTray {
                 label: "Detect account id".into(),
                 icon_name: "system-search".into(),
                 activate: Box::new(|_| run_detached(&["detect-account"])),
+                ..Default::default()
+            }
+            .into(),
+        );
+        items.push(
+            StandardItem {
+                label: "Scan Memory".into(),
+                icon_name: "view-refresh".into(),
+                // A click alone is sufficient consent, matching the CLI's own
+                // bar (#72) — no confirmation dialog, no preflight
+                // permission/game-running check. Runs on a detached thread
+                // (see `run_scan`) so the blocking child wait never stalls
+                // the tray's DBus event loop.
+                activate: Box::new(|this: &mut Self| {
+                    let scan_status = this.scan_status.clone();
+                    std::thread::spawn(move || run_scan(scan_status));
+                }),
                 ..Default::default()
             }
             .into(),
@@ -322,6 +370,55 @@ fn run_detached(args: &[&str]) {
             });
         }
         Err(e) => tracing::error!("could not run {args:?}: {e}"),
+    }
+}
+
+/// Run `<self> mem-scan` and fold the outcome into `scan_status` (#72). Only
+/// ever called from a dedicated `std::thread::spawn` (see the `Scan Memory`
+/// menu item's `activate`), never straight from a synchronous `ksni`
+/// callback — `Command::output()` both spawns *and blocks waiting* for the
+/// child, and the tray's DBus event loop must never stall on that.
+///
+/// Deliberately still a subprocess re-exec, not `wf-mem` linked in-process
+/// like `wf-browse`'s Home tab (the other half of #72): pulling
+/// memory-reading code straight into the tray would contradict this crate's
+/// whole crash-isolation design (see the module doc — a scan panic could
+/// then take the tray down with it) and would pull `wf-relic`/`wf-cache` in
+/// transitively for one menu item. `wf-lite mem-scan` already prints the
+/// exact guidance on failure (the setcap-permission hint, or the "not
+/// running"/"no session marker" bails) to its own stderr; this only relays
+/// the last line of whatever it printed, never re-derives or reformats it.
+fn run_scan(scan_status: Arc<Mutex<Option<Result<(), String>>>>) {
+    let bin = self_binary();
+    let result = match std::process::Command::new(&bin).arg("mem-scan").output() {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(last_stderr_line(&out.stderr)),
+        Err(e) => Err(format!("couldn't run {}: {e}", bin.display())),
+    };
+    *scan_status.lock().unwrap_or_else(|p| p.into_inner()) = Some(result);
+}
+
+/// The last non-empty line of a failed child's stderr — `wf-lite mem-scan`'s
+/// own errors are single-line (see `wf_mem::process`'s permission hint /
+/// not-running / no-marker bails), so this captures the actual message
+/// without any surrounding `tracing`/log noise. Falls back to a generic note
+/// if stderr was empty or not valid UTF-8 text.
+fn last_stderr_line(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "see terminal for details".to_string())
+}
+
+/// Truncate `s` to at most `max_chars` characters, marking truncation with a
+/// trailing `…` (mirrors `wf-lite`'s own `truncate_str`).
+fn truncate(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        s.chars().take(max_chars.saturating_sub(1)).chain(['…']).collect()
     }
 }
 

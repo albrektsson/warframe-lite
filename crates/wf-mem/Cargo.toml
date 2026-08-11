@@ -11,3 +11,9 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
+# For `persist::write_owned_relics` (#72): the decode+snapshot+apply+save
+# logic shared by `wf-lite mem-scan` and `wf-browse`'s Home-tab Scan Memory
+# button, moved here out of `wf-lite`'s `src/main.rs` so both call one
+# implementation. Neither crate depends back on `wf-mem` — no circularity.
+wf-relic.workspace = true
+wf-cache.workspace = true

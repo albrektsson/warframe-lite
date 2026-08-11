@@ -79,6 +79,21 @@ const NO_OWNED_PARTS_MSG: &str = "no owned Prime Part data yet. Run `wf-lite ove
      and open the in-game Inventory/Sell screen once — it scans automatically as you scroll.";
 /// Relic tiers offered by the tier-filter checkboxes, in drop order.
 const TIERS: [&str; 5] = ["Lith", "Meso", "Neo", "Axi", "Requiem"];
+/// Placement anchors offered by the Settings tab's anchor combobox — ported
+/// from the standalone `wf-settings` crate (#72: its UI folded into this
+/// crate's tab bar; `wf-settings` keeps its own copy for its own standalone
+/// dev/embedding build).
+const ANCHORS: &[&str] = &[
+    "top-left",
+    "top-right",
+    "bottom-left",
+    "bottom-right",
+    "top",
+    "bottom",
+    "left",
+    "right",
+    "center",
+];
 
 /// Accent color for selection/hover/active widget state — a muted teal,
 /// distinct from both egui's default blue and Warframe's own UI palette.
@@ -130,6 +145,14 @@ pub fn run() -> eframe::Result<()> {
     // owned relic) runs in the background rather than blocking the window
     // from opening at all — see the module docs and `BrowseApp`'s "Loading…"
     // placeholder.
+    //
+    // The new Settings tab (#72) needs its own long-lived, mutable `Config`
+    // to edit and save, same as the standalone `wf-settings` crate does —
+    // cloned here *before* `config` is moved into `load_and_poll`, so a
+    // change made on that tab doesn't retroactively affect the background
+    // loader/poller's own copy (consistent with `wf-settings`' existing
+    // "restart to apply placement changes" convention; not hot-propagated).
+    let settings_config = config.clone();
     rt.spawn(load_and_poll(loaded.clone(), config, relic_prices.clone(), set_prices.clone()));
 
     let options = eframe::NativeOptions {
@@ -151,6 +174,8 @@ pub fn run() -> eframe::Result<()> {
                 market_platform,
                 relic_prices,
                 set_prices,
+                settings_config,
+                config_path,
             )))
         }),
     )
@@ -779,10 +804,12 @@ async fn load_data(config: &Config) -> LoadedData {
     }
 }
 
-/// The browser's tabs: Mastery, Relics & Plan, Relics EV, Buy or Farm, Sell,
-/// Farm, Ducats, and Owned.
+/// The browser's tabs: Home, Mastery, Relics & Plan, Relics EV, Buy or Farm,
+/// Sell, Farm, Ducats, Owned, and Settings. Home (not Mastery) is selected on
+/// open (#72) — see `BrowseApp::new`.
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
+    Home,
     Mastery,
     Relics,
     RelicsEv,
@@ -791,6 +818,7 @@ enum Tab {
     Farm,
     Ducats,
     Owned,
+    Settings,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -887,12 +915,39 @@ struct BrowseApp {
     /// synchronously on the UI thread, unlike [`load_and_poll`]/[`poll`]).
     rt_handle: tokio::runtime::Handle,
     /// Shared HTTP client for on-demand price fetches — separate from
-    /// `load_data`'s own (which stays scoped to its background task).
+    /// `load_data`'s own (which stays scoped to its background task). Also
+    /// what the Home tab's Scan Memory action uses (#72).
     client: reqwest::Client,
     market_platform: String,
+    /// The Settings tab's own long-lived, mutable `Config` — cloned from the
+    /// launch-time config before it was moved into `load_and_poll` (see
+    /// `run`'s docs). Edited and saved here the same way the standalone
+    /// `wf-settings` crate's `SettingsApp` does; a change here does not
+    /// retroactively affect the background loader/poller's own copy.
+    config: Config,
+    config_path: PathBuf,
+    /// Editable text buffer for the Settings tab's account id field —
+    /// doubles as the Home tab's "account set?" readout (#72), same as
+    /// `SettingsApp::account_id`.
+    account_id: String,
+    /// The Settings tab's own status line (Save/Detect/Copy feedback) —
+    /// named distinctly from `scan_status` (the Home tab's Scan Memory
+    /// result) so the two are never confused.
+    settings_status: String,
+    /// Whether a Scan Memory task is currently in flight. UI-thread-only
+    /// (not shared with the spawned task): set on click, cleared once
+    /// `home_tab` observes `scan_status` land a fresh result.
+    scanning: bool,
+    /// The Home tab's Scan Memory result (#72), written by a task spawned on
+    /// `rt_handle` and read every frame `home_tab` renders. `Ok(summary
+    /// text)` on success, `Err(display text)` on failure — every `wf_mem`
+    /// error propagates via its own `Display` verbatim (e.g. the exact
+    /// `sudo setcap cap_sys_ptrace=+ep <path>` hint), never reworded here.
+    scan_status: Arc<Mutex<Option<Result<String, String>>>>,
 }
 
 impl BrowseApp {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         loaded: Arc<Mutex<Option<Loaded>>>,
         wishlist: wf_relic::Wishlist,
@@ -901,9 +956,12 @@ impl BrowseApp {
         market_platform: String,
         relics_plan_relic_prices: LazyPriceMap,
         relics_plan_set_prices: LazyPriceMap,
+        config: Config,
+        config_path: PathBuf,
     ) -> Self {
+        let account_id = config.account_id.clone().unwrap_or_default();
         Self {
-            tab: Tab::Mastery,
+            tab: Tab::Home,
             filter: String::new(),
             mastery_filter: MasteryFilter::All,
             mastery_sort: MasterySort::Alphabetical,
@@ -926,6 +984,12 @@ impl BrowseApp {
             rt_handle,
             client,
             market_platform,
+            config,
+            config_path,
+            account_id,
+            settings_status: String::new(),
+            scanning: false,
+            scan_status: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1026,6 +1090,74 @@ impl BrowseApp {
             for (key, plat) in resolved {
                 guard.insert(key, LazyPrice::Ready { plat, resolved_at });
             }
+        });
+    }
+
+    /// The Home tab (#72): the default tab on open, replacing the old
+    /// Mastery default. A brief status readout — whether a Mastery account
+    /// id is configured (mirrors the Settings tab's own field, not a
+    /// separate read) — plus the Scan Memory button.
+    ///
+    /// A deliberate click is the map's required consent (see this module's
+    /// docs and CONTEXT.md's Notes) — no confirmation dialog, and
+    /// deliberately no preflight "is the game running" / "do we have the
+    /// capability" check before it: the real scan's own error already
+    /// surfaces the right guidance reactively once it lands, exactly like
+    /// the CLI (`wf-lite mem-scan`).
+    fn home_tab(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Home");
+        ui.add_space(8.0);
+
+        if self.account_id.trim().is_empty() {
+            ui.label("Mastery account id: not set — set it on the Settings tab");
+        } else {
+            ui.label(format!("Mastery account id: {}", self.account_id.trim()));
+        }
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(10.0);
+
+        // A landed result clears the in-flight flag the first frame it's
+        // observed; `spawn_scan` clears `scan_status` back to `None` the
+        // moment it fires a new scan, so this never flashes a stale result
+        // while a fresh scan is running.
+        let current = self.scan_status.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if self.scanning && current.is_some() {
+            self.scanning = false;
+        }
+
+        if ui.add_enabled(!self.scanning, egui::Button::new("Scan Memory")).clicked() {
+            self.spawn_scan();
+        }
+        ui.add_space(6.0);
+
+        let line = if self.scanning {
+            "scanning…".to_string()
+        } else {
+            match &current {
+                None => "idle — click Scan Memory to read Foundry/Rivens/owned relics from the \
+                          running game"
+                    .to_string(),
+                Some(Ok(summary)) => format!("done: {summary}"),
+                Some(Err(e)) => format!("failed: {e}"),
+            }
+        };
+        ui.label(line);
+    }
+
+    /// Fire the Home tab's Scan Memory action (#72) on `rt_handle` — never on
+    /// the UI thread. Marks `scanning` immediately and resets `scan_status`
+    /// to `None` so `home_tab` shows "scanning…" instead of a stale result
+    /// from a previous run while this one is in flight.
+    fn spawn_scan(&mut self) {
+        self.scanning = true;
+        *self.scan_status.lock().unwrap_or_else(|p| p.into_inner()) = None;
+
+        let scan_status = self.scan_status.clone();
+        let client = self.client.clone();
+        self.rt_handle.spawn(async move {
+            let result = run_memory_scan(&client).await;
+            *scan_status.lock().unwrap_or_else(|p| p.into_inner()) = Some(result);
         });
     }
 
@@ -1868,6 +2000,193 @@ impl BrowseApp {
             clear_owned_entry(&code, refinement);
         }
     }
+
+    /// The Settings tab (#72): placement/opacity/fissure-panel toggle,
+    /// Mastery account id (with "Detect from log"), hotkey-bind help, and
+    /// Save — ported from the standalone `wf-settings` crate's `SettingsApp`
+    /// UI body, now editing `self.config`/`self.config_path` instead of a
+    /// dedicated app struct. A change here doesn't retroactively affect the
+    /// background loader/poller's own `Config` snapshot (see `run`'s docs) —
+    /// same "restart to apply placement changes" convention `wf-settings`
+    /// already documented.
+    fn settings_tab(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Settings");
+        ui.add_space(8.0);
+
+        egui::Grid::new("browse_settings_placement")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("Anchor");
+                egui::ComboBox::from_id_salt("browse_settings_anchor")
+                    .selected_text(&self.config.overlay.anchor)
+                    .show_ui(ui, |ui| {
+                        for a in ANCHORS {
+                            ui.selectable_value(&mut self.config.overlay.anchor, (*a).to_string(), *a);
+                        }
+                    });
+                ui.end_row();
+
+                ui.label("Margin X");
+                ui.add(egui::DragValue::new(&mut self.config.overlay.margin_x).range(0..=2000));
+                ui.end_row();
+
+                ui.label("Margin Y");
+                ui.add(egui::DragValue::new(&mut self.config.overlay.margin_y).range(0..=2000));
+                ui.end_row();
+
+                ui.label("Opacity");
+                ui.add(egui::Slider::new(&mut self.config.overlay.opacity, 0.1..=1.0));
+                ui.end_row();
+
+                ui.label("Fissure panel");
+                ui.checkbox(&mut self.config.overlay.fissures, "show (off = reward picker only)");
+                ui.end_row();
+            });
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.label("Mastery account id");
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.account_id)
+                    .hint_text("24-hex account id")
+                    .desired_width(240.0),
+            );
+            if ui.button("Detect from log").clicked() {
+                self.detect_account();
+            }
+        });
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.label("Show/hide hotkey");
+        ui.label(
+            egui::RichText::new(
+                "Wayland can't let the overlay grab a global key. Bind this command \
+                 as a KDE custom shortcut:",
+            )
+            .weak(),
+        );
+        ui.horizontal(|ui| {
+            ui.code("wf-lite toggle");
+            if ui.button("Copy").clicked() {
+                ui.ctx().copy_text("wf-lite toggle".to_string());
+                self.settings_status = "Copied command".to_string();
+            }
+            if ui.button("Open KDE shortcuts").clicked() {
+                open_kde_shortcuts(&mut self.settings_status);
+            }
+        });
+
+        ui.add_space(14.0);
+        ui.horizontal(|ui| {
+            if ui.button("Save").clicked() {
+                self.save_settings();
+            }
+            ui.label(egui::RichText::new(&self.settings_status).weak());
+        });
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("Restart `wf-lite overlay` to apply placement changes.")
+                .small()
+                .weak(),
+        );
+    }
+
+    /// Save `self.config` (including the account id text buffer) to
+    /// `self.config_path` — ported from `wf-settings`' `SettingsApp::save`.
+    fn save_settings(&mut self) {
+        self.config.account_id = if self.account_id.trim().is_empty() {
+            None
+        } else {
+            Some(self.account_id.trim().to_string())
+        };
+        match self.config.save(&self.config_path) {
+            Ok(()) => self.settings_status = format!("Saved to {}", self.config_path.display()),
+            Err(e) => self.settings_status = format!("Save failed: {e:#}"),
+        }
+    }
+
+    /// Run `<self> detect-account` (re-execing this process's own binary),
+    /// then reload `self.config` so the detected id appears in the field —
+    /// the same re-exec-and-reload pattern `wf-settings`'
+    /// `SettingsApp::detect_account` uses.
+    fn detect_account(&mut self) {
+        let bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("wf-lite"));
+        let out = std::process::Command::new(&bin).arg("detect-account").output();
+        match out {
+            Ok(o) if o.status.success() => {
+                self.config = Config::load(&self.config_path).unwrap_or_default();
+                self.account_id = self.config.account_id.clone().unwrap_or_default();
+                self.settings_status = "Detected and saved account id".to_string();
+            }
+            Ok(o) => {
+                let err = String::from_utf8_lossy(&o.stderr);
+                let msg = err
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "see terminal for details".to_string());
+                self.settings_status = format!("Detect failed: {msg}");
+            }
+            Err(e) => self.settings_status = format!("Couldn't run {}: {e}", bin.display()),
+        }
+    }
+}
+
+/// Best-effort: open KDE's global-shortcuts settings module — ported from
+/// `wf-settings` (#72).
+fn open_kde_shortcuts(status: &mut String) {
+    for (cmd, args) in [
+        ("systemsettings", &["kcm_keys"][..]),
+        ("kcmshell6", &["kcm_keys"][..]),
+        ("kcmshell5", &["kcm_keys"][..]),
+    ] {
+        if std::process::Command::new(cmd).args(args).spawn().is_ok() {
+            *status = "Opened KDE shortcut settings".to_string();
+            return;
+        }
+    }
+    *status = "Couldn't open KDE settings — add a custom shortcut manually".to_string();
+}
+
+/// The Home tab's Scan Memory action's actual work (see
+/// [`BrowseApp::spawn_scan`]), factored out as a plain async fn so its
+/// error path is a single `?`-chain. Runs the same pipeline
+/// `wf-lite mem-scan` does — `wf_mem::scan_and_fetch` →
+/// `wf_mem::parse_owned_relics` → `wf_relic::RelicNameIndex::load_cached` →
+/// `wf_mem::write_owned_relics` (the shared decode+snapshot+apply+save
+/// logic, #72) — refreshing `owned-relics.json` so the Relics & Plan/Sell/
+/// Farm tabs' existing [`POLL_INTERVAL`] refresh picks it up without a
+/// restart.
+///
+/// Every `wf_mem`/`wf_relic` error propagates via its own `Display`
+/// verbatim (`{e:#}`, matching this crate's and `wf-lite`'s existing
+/// convention for inline error text) — never reworded — so a missing
+/// `cap_sys_ptrace` grant surfaces the exact same `sudo setcap
+/// cap_sys_ptrace=+ep <path>` guidance the CLI shows.
+async fn run_memory_scan(client: &reqwest::Client) -> Result<String, String> {
+    let raw = wf_mem::scan_and_fetch(client).await.map_err(|e| format!("{e:#}"))?;
+    let relics = wf_mem::parse_owned_relics(&raw).map_err(|e| format!("{e:#}"))?;
+    let relic_names = wf_relic::RelicNameIndex::load_cached(client, CATALOGUE_TTL)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("relic name index load failed ({e:#}); owned relics shown undecoded");
+            wf_relic::RelicNameIndex::empty()
+        });
+
+    let report = wf_mem::write_owned_relics(&relics, &relic_names);
+    if !report.saved {
+        return Err(format!("scanned successfully but failed to write {}", wf_relic::OWNED_RELICS_FILE));
+    }
+    Ok(format!(
+        "wrote {} entries to {} ({} undecoded, skipped)",
+        report.written,
+        wf_relic::OWNED_RELICS_FILE,
+        report.undecoded
+    ))
 }
 
 /// Order refinements display in: Intact first, Radiant last.
@@ -2065,6 +2384,7 @@ impl eframe::App for BrowseApp {
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.tab, Tab::Home, "Home");
                 ui.selectable_value(&mut self.tab, Tab::Mastery, "Mastery");
                 ui.selectable_value(&mut self.tab, Tab::Relics, "Relics & Plan");
                 ui.selectable_value(&mut self.tab, Tab::RelicsEv, "Relics EV");
@@ -2073,10 +2393,12 @@ impl eframe::App for BrowseApp {
                 ui.selectable_value(&mut self.tab, Tab::Farm, "Farm");
                 ui.selectable_value(&mut self.tab, Tab::Ducats, "Ducats");
                 ui.selectable_value(&mut self.tab, Tab::Owned, "Owned");
+                ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
             });
             ui.separator();
 
             match self.tab {
+                Tab::Home => self.home_tab(ui),
                 Tab::Mastery => self.mastery_tab(ui),
                 Tab::Relics => self.relics_tab(ui),
                 Tab::RelicsEv => self.relics_ev_tab(ui),
@@ -2085,6 +2407,7 @@ impl eframe::App for BrowseApp {
                 Tab::Farm => self.farm_tab(ui),
                 Tab::Ducats => self.ducats_tab(ui),
                 Tab::Owned => self.owned_tab(ui),
+                Tab::Settings => self.settings_tab(ui),
             }
         });
     }
@@ -2127,6 +2450,8 @@ mod tests {
             "pc".to_string(),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
+            Config::default(),
+            PathBuf::from("config.toml"),
         );
         app.set_wishlisted("Ember Prime Systems", true);
         let on_disk = wf_cache::load_blob::<wf_relic::Wishlist>(wf_relic::WISHLIST_FILE)
