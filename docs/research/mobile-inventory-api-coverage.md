@@ -314,10 +314,27 @@ domain model:
   new capability there.
 - **Owned relics**: warframe-lite currently sources this from OCR-scanning
   the in-game Void Relics screen (ADR-0009), explicitly because no API
-  source exists. `inventory.php`'s `LevelKeys[]` array is exactly the
-  authoritative relic-ownership data that scan is standing in for — worth
-  flagging as a potential future consideration if Phase 4 goes ahead, though
-  it is out of scope for this ticket's question.
+  source exists. This note originally guessed `LevelKeys[]` was the
+  authoritative relic-ownership data that scan stands in for — **wrong,
+  corrected by live verification**: [issue #60](https://github.com/albrektsson/warframe-lite/issues/60)
+  found `LevelKeys[]` holds only legacy mission Keys on a real account, no
+  Void Relics at all. The actual field, confirmed live in
+  [issue #63](https://github.com/albrektsson/warframe-lite/issues/63), is
+  `MiscItems[]`: owned relics appear there as entries whose `ItemType`
+  matches `/Lotus/Types/Game/Projections/T{1-5}VoidProjection...{Refinement}`
+  — DE's internal name for a relic is "VoidProjection", not "Relic" or
+  "LevelKey" — each with a real `ItemCount` (1–61 observed on one account
+  across 487 distinct relic+refinement entries). `T1`–`T4` line up with the
+  game's Lith/Meso/Neo/Axi eras in that order (consistent with community
+  knowledge, not independently re-derived here); a `T5` tier also appeared
+  (`...ImmortalA...`), unmapped to any known era name. The trailing
+  refinement suffix (`Bronze`/`Silver`/`Gold`/`Platinum`) plausibly maps to
+  Intact/Exceptional/Flawless/Radiant by position and frequency (`Bronze`
+  dominant, `Platinum` next-most-common, `Silver`/`Gold` rare — matching
+  typical refinement behavior), but this wasn't cross-referenced against a
+  primary source and needs confirming before being relied on. See
+  [issue #63](https://github.com/albrektsson/warframe-lite/issues/63) for
+  the full live-verification detail.
 
 ## Caveats and gaps
 
