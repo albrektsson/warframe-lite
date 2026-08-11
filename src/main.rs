@@ -269,7 +269,8 @@ async fn mem_scan_cmd(config: &Config) -> Result<()> {
 
     println!("\n== mem-scan: Owned Relics (MiscItems VoidProjection) ==");
     let relics = wf_mem::parse_owned_relics(&raw)?;
-    print_owned_relics(&relics);
+    let relic_names = load_relic_names(&client).await;
+    print_owned_relics(&relics, &relic_names);
 
     println!("\n== mem-scan: Owned but Unmastered ==");
     let mastery = load_mastery(config, &client).await;
@@ -398,22 +399,39 @@ fn print_owned_equipment(state: &wf_mem::OwnedEquipment) {
     }
 }
 
-/// Print raw owned-relic state in the app's existing output style (cf.
-/// `print_level_keys`) — aligned columns, not a raw JSON dump. This is a raw
-/// exposure only (see `wf_mem::relics`'s module doc): no tier/reward-pool/
-/// refinement decoding, no cross-reference against WFCD's `warframe-items`
-/// catalogue, no dedup against the existing OCR-based Seen/Confirmed relic
-/// scan (ADR-0009) — those all stay untouched and out of scope here.
+/// Print owned-relic state in the app's existing output style (cf.
+/// `print_level_keys`) — aligned columns, not a raw JSON dump. Each entry is
+/// decoded to its player-facing tier/code/refinement (e.g. "Axi B3
+/// (Intact)") via `relic_names`; an entry `relic_names` doesn't recognize
+/// (fetch failure, or a genuinely new/unlisted relic) falls back to the raw
+/// internal name rather than being dropped — an undecoded entry still shows
+/// the player *has* it, just not resolved to a code yet. Still no dedup
+/// against the existing OCR-based Seen/Confirmed relic scan (ADR-0009) — that
+/// pipeline is untouched and out of scope here.
 #[cfg(feature = "mem-scan")]
-fn print_owned_relics(state: &wf_mem::OwnedRelicState) {
+fn print_owned_relics(state: &wf_mem::OwnedRelicState, relic_names: &wf_relic::RelicNameIndex) {
     if state.relics.is_empty() {
         println!("  no owned-relic entries found");
         return;
     }
 
-    println!("  entries ({}):", state.relics.len());
+    let mut decoded: Vec<(wf_relic::RelicIdentity, &wf_mem::OwnedRelic)> = Vec::new();
+    let mut undecoded: Vec<&wf_mem::OwnedRelic> = Vec::new();
     for r in &state.relics {
-        println!("    {:<32} x{}", readable_item_name(&r.item_type), r.item_count);
+        match relic_names.lookup(&r.item_type) {
+            Some(id) => decoded.push((id.clone(), r)),
+            None => undecoded.push(r),
+        }
+    }
+    decoded.sort_by(|(a, _), (b, _)| a.sort_key().cmp(&b.sort_key()));
+    undecoded.sort_by(|a, b| a.item_type.cmp(&b.item_type));
+
+    println!("  entries ({}):", state.relics.len());
+    for (id, r) in &decoded {
+        println!("    {:<24} ({:<11}) x{}", id.display(), id.refinement, r.item_count);
+    }
+    for r in undecoded {
+        println!("    {:<24} {:<13}x{}", readable_item_name(&r.item_type), "(undecoded)", r.item_count);
     }
 }
 
@@ -1631,6 +1649,21 @@ async fn load_vaulted(client: &reqwest::Client, items: &wf_relic::ItemIndex) -> 
         Err(e) => {
             tracing::warn!("relic table load failed ({e:#}); vaulted status unavailable");
             HashMap::new()
+        }
+    }
+}
+
+/// Best-effort raw-owned-relic-name → player-facing-identity lookup (see
+/// [`wf_relic::RelicNameIndex`]): an empty index (owned relics shown
+/// undecoded, see `print_owned_relics`) is returned if the WFCD name
+/// catalogue can't be loaded, so `mem-scan` still runs.
+#[cfg(feature = "mem-scan")]
+async fn load_relic_names(client: &reqwest::Client) -> wf_relic::RelicNameIndex {
+    match wf_relic::RelicNameIndex::load_cached(client, CATALOGUE_TTL).await {
+        Ok(index) => index,
+        Err(e) => {
+            tracing::warn!("relic name index load failed ({e:#}); owned relics shown undecoded");
+            wf_relic::RelicNameIndex::empty()
         }
     }
 }

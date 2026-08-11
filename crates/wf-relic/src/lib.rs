@@ -10,6 +10,7 @@ pub mod owned_parts;
 pub mod part_market;
 pub mod part_quantities;
 pub mod regions;
+pub mod relic_names;
 pub mod relics;
 pub mod wishlist;
 
@@ -28,6 +29,7 @@ pub use part_quantities::{EquipmentCategory, PartQuantities, CATEGORY_ORDER};
 pub use regions::{
     InventoryGridRegions, InventorySlot, Rect, RelicGridRegions, RelicSlot, RewardRegions,
 };
+pub use relic_names::{RelicIdentity, RelicNameIndex};
 pub use relics::{
     active_tier_reward_names, expected_value, farm_picks, farm_reward_names, mastery_browser,
     mastery_plan, rank as rank_relics, sell_picks, tier_of, vaulted_rewards, EvRefinement,
