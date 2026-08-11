@@ -313,6 +313,10 @@ async fn mem_scan_cmd(config: &Config) -> Result<()> {
     print_owned_relics(&relics, &relic_names);
     write_owned_relics(&relics, &relic_names);
 
+    println!("\n== mem-scan: Owned Parts (MiscItems built components) ==");
+    let parts = wf_mem::parse_owned_parts(&raw)?;
+    print_owned_parts(&parts);
+
     println!("\n== mem-scan: Owned but Unmastered ==");
     let mastery = load_mastery(config, &client).await;
     print_owned_but_unmastered(&owned_but_unmastered(&equipment, &mastery));
@@ -495,6 +499,25 @@ fn write_owned_relics(state: &wf_mem::OwnedRelicState, relic_names: &wf_relic::R
             wf_relic::OWNED_RELICS_FILE,
             report.undecoded
         );
+    }
+}
+
+/// Print raw owned-part state in the app's existing output style (cf.
+/// `print_level_keys`) — aligned columns, not a raw JSON dump. This is a raw
+/// exposure only (see `wf_mem::owned_parts`'s module doc, mirroring #64's
+/// `print_owned_relics` before its own #67 decode step): no `(FrameOrWeapon,
+/// Part)` split, no `Helmet` -> `Neuroptics` rename, no catalogue
+/// cross-reference or `owned-prime-parts.json` wiring — that's #81.
+#[cfg(feature = "mem-scan")]
+fn print_owned_parts(state: &wf_mem::OwnedPartsState) {
+    if state.parts.is_empty() {
+        println!("  no owned-part entries found");
+        return;
+    }
+
+    println!("  entries ({}):", state.parts.len());
+    for p in &state.parts {
+        println!("    {:<32} x{}", readable_item_name(&p.item_type), p.item_count);
     }
 }
 

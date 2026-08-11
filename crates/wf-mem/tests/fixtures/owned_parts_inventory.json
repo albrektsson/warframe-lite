@@ -1,0 +1,47 @@
+{
+  "_comment": "Synthetic/sanitized — shaped per issue #79's live-verified findings: owned built-component ownership is MiscItems[] entries under two ItemType patterns, /Lotus/Types/Recipes/WarframeRecipes/{Frame}{Part}Component and /Lotus/Types/Recipes/Weapons/WeaponParts/{Weapon}{Part}. Not a real captured response; the real one has live account data and can't be committed.",
+  "MiscItems": [
+    {
+      "_id": { "$oid": "5f1b2c3d4e5f6a7b8c9d0e50" },
+      "ItemType": "/Lotus/Types/Recipes/WarframeRecipes/VorunaPrimeSystemsComponent",
+      "ItemCount": 1
+    },
+    {
+      "_id": { "$oid": "5f1b2c3d4e5f6a7b8c9d0e51" },
+      "ItemType": "/Lotus/Types/Recipes/WarframeRecipes/VorunaPrimeHelmetComponent"
+    },
+    {
+      "_id": { "$oid": "5f1b2c3d4e5f6a7b8c9d0e52" },
+      "ItemType": "/Lotus/Types/Recipes/WarframeRecipes/AshChassisComponent"
+    },
+    {
+      "_id": { "$oid": "5f1b2c3d4e5f6a7b8c9d0e53" },
+      "ItemType": "/Lotus/Types/Recipes/Weapons/WeaponParts/RubicoPrimeReceiver",
+      "ItemCount": 1
+    },
+    {
+      "_id": { "$oid": "5f1b2c3d4e5f6a7b8c9d0e54" },
+      "ItemType": "/Lotus/Types/Recipes/Weapons/WeaponParts/GorgonWraithBarrel",
+      "ItemCount": 9
+    },
+    {
+      "_id": { "$oid": "5f1b2c3d4e5f6a7b8c9d0e55" },
+      "ItemType": "/Lotus/Types/Recipes/Weapons/WeaponParts/ShadePrimeSystems",
+      "ItemCount": 2
+    },
+    {
+      "_id": { "$oid": "5f1b2c3d4e5f6a7b8c9d0e56" },
+      "ItemType": "/Lotus/Types/Items/MiscItems/EnduringEndo",
+      "ItemCount": 50000
+    },
+    {
+      "_id": { "$oid": "5f1b2c3d4e5f6a7b8c9d0e57" },
+      "ItemType": "/Lotus/Types/Game/Projections/T3VoidProjectionAtlasPrimeCBronze",
+      "ItemCount": 52
+    }
+  ],
+  "LevelKeys": [
+    { "ItemType": "/Lotus/Types/Game/Projections/MesoA1RelicItem", "ItemCount": 4 }
+  ],
+  "RegularCredits": 458213
+}
