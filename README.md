@@ -28,9 +28,15 @@ credentials.
 
 ## Install & run
 
-warframe-lite is a single self-contained binary — no runtime other than glibc, a
-`dlopen`'d `libwayland-client.so.0` (present on every Wayland desktop), and the
-`tesseract` CLI for the relic OCR feature.
+warframe-lite is a single self-contained binary — no runtime other than glibc and a
+`dlopen`'d `libwayland-client.so.0` (present on every Wayland desktop). The relic
+OCR features (the automatic reward picker, the owned-relic scanner, and the
+`ocr`/`ocr-file`/`relic-file`/`relic-scan` commands) are an **opt-in build-time
+feature** (`--features ocr`, see [Build](#build)) — a binary built with it links
+`libtesseract`/`libleptonica` **in-process** (ADR-0008), so it needs those shared
+libraries present at runtime, not a `tesseract` CLI on `PATH`. A binary built
+*without* the feature runs fine without either library; those commands just print
+a message pointing at a rebuild instead.
 
 **1. Get the binary.** Download `wf-lite` from the
 [latest release](https://github.com/albrektsson/warframe-lite/releases/latest)
@@ -44,16 +50,20 @@ Release binaries are built against **glibc 2.35** (Ubuntu 22.04), so they run on
 any current distro (Fedora 39+, Arch, Debian 12, Ubuntu 22.04+). On an older
 glibc, build from source (see [Build](#build)).
 
-**2. Install tesseract** (only needed for the relic reward picker):
+**2. Install tesseract's runtime libraries** (only if your binary was built with
+the `ocr` feature — skip this if it wasn't; the reward picker and OCR commands
+just tell you so instead of failing confusingly):
 
 | Distro | Command |
 |---|---|
-| Fedora | `sudo dnf install tesseract tesseract-langpack-eng` |
-| Arch | `sudo pacman -S tesseract tesseract-data-eng` |
-| Debian / Ubuntu | `sudo apt install tesseract-ocr` |
+| Fedora | `sudo dnf install tesseract-libs tesseract-langpack-eng leptonica` |
+| Arch | `sudo pacman -S tesseract tesseract-data-eng leptonica` |
+| Debian / Ubuntu | `sudo apt install tesseract-ocr` (pulls in `libtesseract`/`libleptonica`) |
 | Bazzite / atomic | `brew install tesseract` |
 
-Any reachable `tesseract` works; override the path with the `WF_TESSERACT` env var.
+These packages happen to also ship the `tesseract` CLI binary, but wf-lite never
+invokes it — it links `libtesseract.so`/`libleptonica.so` directly in-process
+(ADR-0008), so only the shared libraries actually matter.
 
 **3. Run it — the tray is the easy way.** Launch **`wf-tray`** (from a menu
 shortcut or terminal). It sits in the KDE system tray, waits for Warframe to
@@ -95,9 +105,13 @@ wf-lite set-account <id>
 
 ### Fedora (COPR / RPM)
 
-A Fedora `.spec` builds from source with the standard Rust macros and pulls in
-`tesseract` as a dependency — see
-[`packaging/warframe-lite.spec`](packaging/warframe-lite.spec). It can also back a
+A Fedora `.spec` builds from source with the standard Rust macros — see
+[`packaging/warframe-lite.spec`](packaging/warframe-lite.spec). It currently
+declares the `ocr` feature's `BuildRequires` (`tesseract-devel`,
+`leptonica-devel`, `clang`) and `Requires` (`tesseract-libs`, `leptonica`)
+unconditionally; whether the officially-published build actually passes
+`--features ocr` is still an open question (tracked on the wayfinder map, #68)
+independent of the `ocr` feature's existence. It can also back a
 [COPR](https://copr.fedorainfracloud.org/) repo for `dnf install warframe-lite`.
 
 ## Commands
@@ -115,16 +129,36 @@ wf-lite toggle             # show/hide a running overlay (also: show / hide)
 wf-lite copy               # copy the current best-pick reward (name + plat) to the clipboard
 wf-lite capture [out.png]  # capture the Warframe window to a PNG
 wf-lite relic [names…]     # evaluate reward names → matched item + plat
-wf-lite relic-scan         # capture the reward screen, OCR the names, rank them
+wf-lite relic-scan         # (feature-gated: ocr) capture the reward screen, OCR the names, rank them
 wf-lite detect-account     # auto-detect your account id from EE.log (verified)
 wf-lite set-account <id>   # save your account id for mastery lookup
 wf-lite mastery [id]       # report your mastered-item count
 wf-lite logstats           # parse whole EE.log history, report coverage/events
 wf-lite logwatch           # follow EE.log live, print recognized events
-wf-lite mem-scan           # (feature-gated) read live Foundry state — see "mem-scan" below
+wf-lite mem-scan           # read live Foundry state — see "mem-scan" below
 ```
 
-### mem-scan (Phase 4, feature-gated)
+### OCR / relic-grid scanning (opt-in feature)
+
+The relic OCR features — `ocr`, `ocr-file`, `relic-file`, `relic-scan`,
+`relic-grid-file`, `inventory-grid-file`, and the live overlay's automatic
+reward-picker and owned-relic/Prime-Part scanners — need the `ocr` cargo
+feature at build time:
+
+```
+cargo build --release --features ocr
+```
+
+Without it, those commands print a short message pointing at this rebuild
+instead of failing to compile or erroring confusingly, and the overlay
+(`wf-lite overlay`/`wf-lite tray`) still runs normally — fissures, the
+control socket, and manual reward evaluation (`wf-lite relic`) all work — just
+without automatic reward/relic detection. Building *with* `--features ocr`
+needs `tesseract-devel`/`libtesseract-dev`-style headers, `leptonica-devel`/
+`libleptonica-dev`-style headers, and `clang` (for the FFI bindgen step) —
+see [Build](#build).
+
+### mem-scan (Phase 4)
 
 `mem-scan` reads Foundry state (in-progress and owned Prime blueprints)
 straight out of the running game's own memory, then echoes the session token
@@ -134,10 +168,15 @@ it finds there once to DE's own `inventory.php` endpoint — see
 for why this is a read, not a held credential. Nothing it reads is ever
 cached or written to disk.
 
-It's opt-in at build time and isn't part of the default build:
+It's part of `wf-lite`'s default build ([ADR-0016](docs/adr/0016-mem-scan-is-default-compiled-not-opt-in.md)),
+so a bare `cargo build --release` already includes it; the `mem-scan` cargo
+feature still exists so tests/CI can build without it via
+`--no-default-features`:
 
 ```
-cargo build --release --features mem-scan
+cargo build --release                                     # includes mem-scan (default)
+cargo build --release --no-default-features --features mem-scan  # explicit, equivalent
+cargo build --release --no-default-features                # excludes mem-scan
 ```
 
 Running `wf-lite mem-scan` at all **is** the explicit in-the-moment consent
@@ -210,7 +249,19 @@ cargo test
 This builds all three binaries into `target/release/`: `wf-lite` (the overlay/CLI)
 plus the `wf-tray` and `wf-settings` companions. `wf-lite tray` / `wf-lite settings`
 expect the companion binaries next to `wf-lite`, so keep them together when you
-install (e.g. all into `~/.local/bin`).
+install (e.g. all into `~/.local/bin`). The plain build above needs none of
+`tesseract-devel`/`leptonica-devel`/`clang` — the relic OCR features
+(reward picker, relic-grid/Inventory-Sell scanning, `ocr`/`ocr-file`/
+`relic-file`/`relic-scan`/`relic-grid-file`/`inventory-grid-file`) are an
+opt-in cargo feature (mirroring `mem-scan`'s pattern):
+
+```
+cargo build --release --features ocr
+```
+
+which does need those three build-time packages (`libtesseract`/
+`libleptonica` are FFI-linked in-process, ADR-0008) plus the runtime
+libraries from [Install & run](#install--run) at run time.
 
 ## License
 

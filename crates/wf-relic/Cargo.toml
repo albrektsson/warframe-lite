@@ -4,10 +4,22 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Gates the `regions` module (grid coordinates/slot types for the relic-grid
+# and Inventory/Sell scanners, ADR-0006) and its `wf-gridscan` dependency out
+# by default — `wf-gridscan` is itself a hard dependency of `wf-ocr`
+# (relic-grid scanning *is* OCR), so leaving it unconditional here would
+# force `libtesseract-dev`/`libleptonica-dev`/`clang` on every build of
+# `wf-relic`, defeating `wf-lite`'s `ocr` feature (#71). Enabled
+# transitively by `wf-lite`'s `ocr` feature (`wf-relic/grid-scan`); the rest
+# of this crate (catalogue, mastery, pricing, owned-relic tracking, etc.)
+# stays available either way.
+grid-scan = ["dep:wf-gridscan"]
+
 [dependencies]
 wf-data.workspace = true
 wf-cache.workspace = true
-wf-gridscan.workspace = true
+wf-gridscan = { workspace = true, optional = true }
 anyhow.workspace = true
 tracing.workspace = true
 reqwest.workspace = true

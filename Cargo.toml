@@ -15,13 +15,25 @@ members = [
     "crates/wf-browse",
     "crates/wf-mem",
 ]
-# Build/test everything by default so a bare `cargo build --release` produces all
-# four binaries (wf-lite + the wf-tray/wf-settings/wf-browse companions), not just
-# wf-lite. `wf-mem` is deliberately absent — it's a workspace member (so
-# `cargo build --workspace` and its own tests still work) but not a default one,
-# so a bare `cargo build`/`cargo build --release` never links the memory-reading
-# code; only `cargo build --features mem-scan` on `wf-lite` does (see its
-# Cargo.toml and CLAUDE.md/#55's Notes).
+# Build/test everything by default so a bare `cargo build --release` produces
+# the single `wf-lite` binary (tray, overlay, settings, browse, mem-scan all
+# linked in — see #68/#69/#70). `wf-mem` was deliberately absent from this
+# list under map #55 (kept a workspace member so `cargo build --workspace`
+# and its own tests still worked, but excluded from the default build). Map
+# #68 (issue #70) reversed that: `wf-mem` is now a default member too,
+# matching `mem-scan` becoming part of `wf-lite`'s default feature set (see
+# its Cargo.toml) — a bare `cargo build`/`cargo build --release` now links
+# the memory-reading code. This is a build-time default only; it does not
+# change the consent model — `wf-lite mem-scan` being explicitly invoked
+# (ADR-0013) remains the sole consent gate, and `--no-default-features`
+# still excludes `mem-scan` for testing (see #58/#67).
+#
+# `wf-ocr` and `wf-gridscan` are absent for the mirror-image reason:
+# `wf-gridscan`'s whole reason to exist is OCR-driven grid scanning (it's a
+# hard dependency of `wf-ocr`), so both sit behind `wf-lite`'s `ocr` feature
+# (#71) — a bare build needs neither `libtesseract-dev`, `libleptonica-dev`,
+# nor `clang`. Both remain workspace members so `cargo build --workspace`/
+# their own tests still work standalone.
 default-members = [
     ".",
     "crates/wf-config",
@@ -29,13 +41,12 @@ default-members = [
     "crates/wf-log",
     "crates/wf-capture",
     "crates/wf-overlay",
-    "crates/wf-ocr",
-    "crates/wf-gridscan",
     "crates/wf-relic",
     "crates/wf-cache",
     "crates/wf-settings",
     "crates/wf-tray",
     "crates/wf-browse",
+    "crates/wf-mem",
 ]
 
 [workspace.package]
@@ -56,6 +67,9 @@ wf-gridscan = { path = "crates/wf-gridscan" }
 wf-relic = { path = "crates/wf-relic" }
 wf-cache = { path = "crates/wf-cache" }
 wf-mem = { path = "crates/wf-mem" }
+wf-settings = { path = "crates/wf-settings" }
+wf-tray = { path = "crates/wf-tray" }
+wf-browse = { path = "crates/wf-browse" }
 
 # Shared third-party
 anyhow = "1"
@@ -82,11 +96,36 @@ name = "wf-lite"
 path = "src/main.rs"
 
 [features]
-# Gates the `mem-scan` subcommand and its `wf-mem` dependency out of the
-# default build entirely (see ADR-0001/ADR-0013 and #55's Notes) — not in
-# the default feature set, so a bare `cargo build`/`cargo build --release`
-# never links the memory-reading code.
+# Gates the `mem-scan` subcommand and its `wf-mem` dependency. Map #55 kept
+# this out of the default build; map #68 (issue #70) reversed that, so
+# `mem-scan` now ships in a bare `cargo build`/`cargo build --release` (see
+# ADR-0016). The flag itself is kept rather than removed, so
+# `--no-default-features` (or `--no-default-features --features mem-scan`)
+# still lets tests and CI exercise both configurations (see #58/#67) — and
+# so the consent model doesn't change: per ADR-0001/ADR-0013, only running
+# `wf-lite mem-scan` itself is consent, never the build-time default.
+default = ["mem-scan"]
 mem-scan = ["dep:wf-mem", "dep:time"]
+# Gates OCR (in-process libtesseract/libleptonica FFI, ADR-0008) and
+# relic-grid scanning out of the default build entirely (#71, mirroring
+# `mem-scan`'s old pattern) — not in the default feature set, so a bare
+# `cargo build`/`cargo build --release` never links against tesseract/
+# leptonica and needs none of `libtesseract-dev`/`libleptonica-dev`/`clang`
+# at build time. `wf-gridscan` is folded in here too rather than left
+# half-gated: it's a hard dependency of `wf-ocr` (relic-grid scanning *is*
+# OCR), so building it without this feature would still force those system
+# deps. `wf-relic/grid-scan` enables the OCR-only slice of `wf-relic` (its
+# `regions` module — grid coordinates/slot types for the relic-grid and
+# Inventory/Sell scanners) that transitively needs `wf-gridscan`; the rest
+# of `wf-relic` (catalogue, mastery, pricing, etc.) stays available either
+# way since `wf-relic` itself remains an unconditional dependency below.
+# Every OCR-dependent CLI command (`ocr`, `ocr-file`, `relic-file`,
+# `relic-scan`, `relic-grid-file`, `inventory-grid-file`) and the live
+# overlay's reward-picker auto-detection route through `src/ocr_enabled.rs`
+# when this feature is on, or `src/ocr_disabled.rs`'s friendly
+# "rebuild with `--features ocr`" stand-in otherwise (see `src/main.rs`'s
+# `mod ocr;`).
+ocr = ["dep:wf-ocr", "dep:wf-gridscan", "wf-relic/grid-scan"]
 
 [dependencies]
 wf-config.workspace = true
@@ -94,11 +133,19 @@ wf-data.workspace = true
 wf-log.workspace = true
 wf-capture.workspace = true
 wf-overlay.workspace = true
-wf-ocr.workspace = true
-wf-gridscan.workspace = true
+wf-ocr = { workspace = true, optional = true }
+wf-gridscan = { workspace = true, optional = true }
 wf-relic.workspace = true
 wf-cache.workspace = true
 wf-mem = { workspace = true, optional = true }
+# The tray/settings/browse subsystems, linked in so `wf-lite`'s `tray`
+# (and its default bare invocation), `settings`, and `browse` subcommands
+# run them in-process instead of spawning separately-installed sibling
+# binaries (see #69). Their own `[[bin]]` targets stay for standalone
+# dev/embedding builds (`cargo run -p wf-tray`, etc.) — see the map (#68).
+wf-tray.workspace = true
+wf-settings.workspace = true
+wf-browse.workspace = true
 reqwest.workspace = true
 anyhow.workspace = true
 tokio.workspace = true

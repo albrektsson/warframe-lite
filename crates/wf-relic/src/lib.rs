@@ -9,6 +9,7 @@ pub mod ducats;
 pub mod owned_parts;
 pub mod part_market;
 pub mod part_quantities;
+#[cfg(feature = "grid-scan")]
 pub mod regions;
 pub mod relic_names;
 pub mod relics;
@@ -26,6 +27,7 @@ pub use ducats::{ducat_picks, DucatPick};
 pub use owned_parts::{OwnedPrimeParts, OWNED_PRIME_PARTS_FILE};
 pub use part_market::{reward_label, resolve as part_market_info, PartMarketInfo};
 pub use part_quantities::{EquipmentCategory, PartQuantities, CATEGORY_ORDER};
+#[cfg(feature = "grid-scan")]
 pub use regions::{
     InventoryGridRegions, InventorySlot, Rect, RelicGridRegions, RelicSlot, RewardRegions,
 };
