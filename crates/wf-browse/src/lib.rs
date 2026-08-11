@@ -1381,11 +1381,12 @@ impl BrowseApp {
             .open(force_open)
             .show(ui, |ui| {
                 egui::Grid::new(format!("mastery_parts_grid_{}", entry.prime))
-                    .num_columns(5)
+                    .num_columns(6)
                     .striped(true)
                     .show(ui, |ui| {
                         ui.strong("part");
-                        ui.strong("owned / need");
+                        ui.strong("owned");
+                        ui.strong("need");
                         ui.strong("vaulted");
                         ui.strong("ducats");
                         ui.strong("wishlist");
@@ -1396,7 +1397,8 @@ impl BrowseApp {
                             ui.label(part);
 
                             let owned = wf_relic::owned_parts::get(owned_parts, &pp);
-                            ui.label(owned_need_cell(owned, Some(*quantity)));
+                            ui.label(owned_count_cell(owned));
+                            ui.label(need_count_cell(Some(*quantity)));
 
                             let info = part_market.get(&pp);
                             if info.is_some_and(|i| i.vaulted) {
@@ -1517,18 +1519,19 @@ impl BrowseApp {
                     ));
                 });
                 egui::Grid::new(format!("relics_plan_grid_{}", p.prime))
-                    .num_columns(3)
+                    .num_columns(4)
                     .striped(true)
                     .show(ui, |ui| {
                         ui.strong("part");
-                        ui.strong("owned / need");
+                        ui.strong("owned");
+                        ui.strong("need");
                         ui.strong("relics you own that can still drop it");
                         ui.end_row();
 
                         for g in &p.parts {
-                            let need = owned_need_cell(g.owned, g.build_quantity);
                             ui.label(&g.part.part);
-                            ui.label(need);
+                            ui.label(owned_count_cell(g.owned));
+                            ui.label(need_count_cell(g.build_quantity));
                             ui.horizontal_wrapped(|ui| {
                                 for (i, r) in g.relics.iter().enumerate() {
                                     if i > 0 {
@@ -1670,13 +1673,14 @@ impl BrowseApp {
             .open(force_open)
             .show(ui, |ui| {
                 egui::Grid::new(format!("relic_ev_grid_{}", relic.display))
-                    .num_columns(4)
+                    .num_columns(5)
                     .striped(true)
                     .show(ui, |ui| {
                         ui.strong("reward");
                         ui.strong("ducats");
                         ui.strong("plat");
-                        ui.strong("owned / need");
+                        ui.strong("owned");
+                        ui.strong("need");
                         ui.end_row();
 
                         for reward in &relic.rewards {
@@ -1707,11 +1711,15 @@ impl BrowseApp {
                             let pp = wf_relic::mastery::prime_part(&reward.item_name);
                             let part_owned = wf_relic::owned_parts::get(owned_parts, &pp);
                             let need = quantities.get(&pp);
-                            let cell = owned_need_cell(part_owned, need);
-                            if need.is_some_and(|n| part_owned.unwrap_or(0) < n) {
-                                ui.colored_label(STALE_COLOR, cell);
+                            let short = need.is_some_and(|n| part_owned.unwrap_or(0) < n);
+                            let owned_cell = owned_count_cell(part_owned);
+                            let need_cell = need_count_cell(need);
+                            if short {
+                                ui.colored_label(STALE_COLOR, owned_cell);
+                                ui.colored_label(STALE_COLOR, need_cell);
                             } else {
-                                ui.weak(cell);
+                                ui.weak(owned_cell);
+                                ui.weak(need_cell);
                             }
                             ui.end_row();
                         }
@@ -1763,16 +1771,16 @@ impl BrowseApp {
                     ui.weak("all parts covered");
                 } else {
                     egui::Grid::new(format!("buy_or_farm_grid_{}", p.prime))
-                        .num_columns(3)
+                        .num_columns(4)
                         .striped(true)
                         .show(ui, |ui| {
                             ui.strong("part");
-                            ui.strong("owned / need");
+                            ui.strong("owned");
+                            ui.strong("need");
                             ui.strong("cheapest relic");
                             ui.end_row();
 
                             for g in &p.gaps {
-                                let need = owned_need_cell(g.owned, g.build_quantity);
                                 let relic = g
                                     .relics
                                     .first()
@@ -1782,7 +1790,8 @@ impl BrowseApp {
                                     })
                                     .unwrap_or_else(|| "—".to_string());
                                 ui.label(&g.part.part);
-                                ui.label(need);
+                                ui.label(owned_count_cell(g.owned));
+                                ui.label(need_count_cell(g.build_quantity));
                                 ui.label(relic);
                                 ui.end_row();
                             }
@@ -1860,12 +1869,14 @@ impl BrowseApp {
         }
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("sell_grid").num_columns(6).striped(true).show(ui, |ui| {
+            egui::Grid::new("sell_grid").num_columns(8).striped(true).show(ui, |ui| {
                 ui.strong("relic");
                 ui.strong("owned");
                 ui.strong("plat");
                 ui.strong("unmastered");
-                ui.strong("parts owned");
+                ui.strong("worst-off part");
+                ui.strong("part owned");
+                ui.strong("part need");
                 ui.strong("scanned");
                 ui.end_row();
 
@@ -1877,7 +1888,9 @@ impl BrowseApp {
                     ui.label(p.count.to_string());
                     ui.label(plat);
                     ui.label(p.unmastered.len().to_string());
-                    ui.label(parts_owned_cell(&p.parts_owned));
+                    ui.label(worst_off_part_cell(&p.parts_owned));
+                    ui.label(p.parts_owned.as_ref().map(|s| owned_count_cell(s.owned)).unwrap_or_default());
+                    ui.label(p.parts_owned.as_ref().map(|s| need_count_cell(s.need)).unwrap_or_default());
                     ui.label(age_cell(&ages, &p.display));
                     ui.end_row();
                 }
@@ -1992,9 +2005,10 @@ impl BrowseApp {
         }
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("ducats_grid").num_columns(5).striped(true).show(ui, |ui| {
+            egui::Grid::new("ducats_grid").num_columns(6).striped(true).show(ui, |ui| {
                 ui.strong("part");
-                ui.strong("owned / need");
+                ui.strong("owned");
+                ui.strong("need");
                 ui.strong("ducats");
                 ui.strong("plat");
                 ui.strong("efficiency");
@@ -2002,7 +2016,8 @@ impl BrowseApp {
 
                 for p in &rows {
                     ui.label(format!("{} {}", p.part.prime, p.part.part));
-                    ui.label(owned_need_cell(Some(p.owned), p.build_quantity));
+                    ui.label(p.owned.to_string());
+                    ui.label(need_count_cell(p.build_quantity));
                     ui.label(p.ducats.map(|d| format!("{d}d")).unwrap_or_else(|| "—".to_string()));
                     ui.label(plat_str(p.plat));
                     ui.label(
@@ -2436,27 +2451,35 @@ fn relic_slug(index: &RelicIndex, display: &str) -> Option<String> {
     index.all().iter().find(|r| r.display == display).map(|r| r.slug())
 }
 
-/// The Relics & Plan tab's combined `owned / need` cell, e.g. `"— / x1"`
-/// (never scanned) or `"1 / x1"` (confirmed). Never renders `0` for an
-/// unscanned part — unknown stays `—` (see ADR-0011's precedent, applied to
-/// Prime Part owned counts).
-fn owned_need_cell(owned: Option<u32>, need: Option<u32>) -> String {
-    let owned = owned.map(|o| o.to_string()).unwrap_or_else(|| "—".to_string());
-    let need = need.map(|q| format!("x{q}")).unwrap_or_else(|| "—".to_string());
-    format!("{owned} / {need}")
+/// How many of a Prime Part the player owns, for its own grid column. Never
+/// renders a bare `0` for an unscanned part — an absent entry means "never
+/// scanned" (owned-part counts currently come only from the opt-in OCR
+/// scanner, off by default — see issue #78), not "confirmed zero owned"
+/// (ADR-0011's never-guess-an-unknown-quantity precedent). Spelling that out
+/// as `"not scanned"` rather than a bare `—` is deliberate: a lone dash next
+/// to real numbers reads too easily as zero.
+fn owned_count_cell(owned: Option<u32>) -> String {
+    owned.map(|o| o.to_string()).unwrap_or_else(|| "not scanned".to_string())
 }
 
-/// The Sell tab's `parts owned` column: the relic's worst-off unmastered
-/// Prime Part (see [`wf_relic::PrimePartGroup`]'s sibling,
-/// `wf_relic::RelicPick::parts_owned`) as `"<part> <owned>/<need> +N more"`,
-/// mirroring the overlay's existing "top reward, +N" truncation pattern.
-/// Empty for a relic with no unmastered rewards at all.
-fn parts_owned_cell(summary: &Option<wf_relic::PartsOwnedSummary>) -> String {
+/// How many of a Prime Part a full build needs, for its own grid column. A
+/// plain number — no `x` prefix, since the column header already says
+/// "need". `None` means the build-quantity catalogue has no entry for this
+/// part (rare; see ADR-0011), not that zero are needed.
+fn need_count_cell(need: Option<u32>) -> String {
+    need.map(|q| q.to_string()).unwrap_or_else(|| "—".to_string())
+}
+
+/// The Sell tab's `part` column: the relic's worst-off unmastered Prime Part
+/// (see [`wf_relic::PrimePartGroup`]'s sibling, `wf_relic::RelicPick::parts_owned`),
+/// e.g. `"Receiver"` or `"Receiver (+2 more)"` when other unmastered parts
+/// remain besides the one shown. Empty for a relic with no unmastered
+/// rewards at all. Owned/need counts for this part render in their own
+/// columns via [`owned_count_cell`]/[`need_count_cell`].
+fn worst_off_part_cell(summary: &Option<wf_relic::PartsOwnedSummary>) -> String {
     let Some(s) = summary else { return String::new() };
-    let owned = s.owned.map(|o| o.to_string()).unwrap_or_else(|| "—".to_string());
-    let need = s.need.map(|q| format!("x{q}")).unwrap_or_else(|| "—".to_string());
-    let more = if s.more > 0 { format!(" +{} more", s.more) } else { String::new() };
-    format!("{} {owned}/{need}{more}", s.part.part)
+    let more = if s.more > 0 { format!(" (+{} more)", s.more) } else { String::new() };
+    format!("{}{more}", s.part.part)
 }
 
 /// Shown by the Sell/Farm tabs when the tier/status filters leave nothing to
