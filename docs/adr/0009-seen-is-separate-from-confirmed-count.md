@@ -38,3 +38,48 @@ separately clears the count's own agreement bar.
 relic-grid scan loop in `src/main.rs` that feeds it. Does not touch
 `wf-ocr`'s trust core (`Tally`, `parse_badge`), which ADR-0008 changes for
 unrelated (performance) reasons.
+
+## Revision (2026-08-11): a third source, `wf-mem`'s exact mem-scan
+
+`wf-mem`'s mem-scan (issues [#63](https://github.com/albrektsson/warframe-lite/issues/63)/[#64](https://github.com/albrektsson/warframe-lite/issues/64)/[#66](https://github.com/albrektsson/warframe-lite/issues/66))
+reads owned-relic counts directly from DE's own inventory payload — exact,
+not a frame-agreement estimate. Wiring it into `owned-relics.json` (issue
+[#67](https://github.com/albrektsson/warframe-lite/issues/67)) means the OCR
+loop and mem-scan now both write the same file, so the two-tier Seen/
+Confirmed model above needs a third dimension: **who wrote the current
+count**, not just how sure the writer was.
+
+`OwnedEntry` gains a `source: Source` field (`Ocr` | `MemScan`), stamped
+whenever `count` is set. This doesn't collapse or replace the Seen/Confirmed
+split — a mem-scanned count is definitionally also Confirmed (and Seen) —
+it adds provenance to the Confirmed tier specifically, to answer a question
+Seen/Confirmed alone can't: whether an *existing* confirmed count came from
+an exact read or an OCR frame-agreement estimate.
+
+That answer gates one thing: the OCR scan loop's agreement bar to overwrite
+it. A `MemScan`-sourced count needs `RELIC_AGREEMENT_MEMSCAN_OVERRIDE`
+(`src/main.rs`, 4× the normal `RELIC_AGREEMENT`) agreeing OCR frames before
+it's replaced, instead of the normal two — a single lucky misread pair
+shouldn't be able to clobber a value read straight from game memory. Once
+OCR does clear that higher bar, the entry's source flips back to `Ocr` and
+the normal bar applies from then on; this is a supersede-resistance
+mechanism, not a permanent distrust of OCR for that relic.
+
+mem-scan writes are also, deliberately, more than an additive update: a
+mem-scanned inventory only ever lists relics actually owned (≥1), so a
+`(code, refinement)` *absent* from a fresh scan is authoritative proof of
+zero. `apply_exact_snapshot` (`wf-relic::owned`) clears every existing entry
+the snapshot doesn't cover, alongside writing the ones it does — self-
+correcting the one class of staleness OCR structurally can't fix itself (a
+refined relic's card just disappears from the grid once fully consumed,
+with no eye-icon equivalent to confirm the zero — see ADR-0010). No extra
+opt-in gate: running `wf-lite mem-scan` at all is already this map's
+required in-the-moment consent (see `wf-mem`'s module docs and
+ADR-0001/ADR-0013), so its findings taking effect immediately doesn't need a
+second confirmation.
+
+An owned-relic entry `wf-mem` can't decode to a `(code, refinement)` (no
+catalogue match — see [#66](https://github.com/albrektsson/warframe-lite/issues/66)'s
+rare `(undecoded)` case) is skipped from the snapshot rather than written
+raw or guessed at; `mem-scan`'s own output logs a warning when this happens
+so it isn't silently lost from view.

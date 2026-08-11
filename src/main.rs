@@ -271,6 +271,7 @@ async fn mem_scan_cmd(config: &Config) -> Result<()> {
     let relics = wf_mem::parse_owned_relics(&raw)?;
     let relic_names = load_relic_names(&client).await;
     print_owned_relics(&relics, &relic_names);
+    write_owned_relics(&relics, &relic_names);
 
     println!("\n== mem-scan: Owned but Unmastered ==");
     let mastery = load_mastery(config, &client).await;
@@ -432,6 +433,51 @@ fn print_owned_relics(state: &wf_mem::OwnedRelicState, relic_names: &wf_relic::R
     }
     for r in undecoded {
         println!("    {:<24} {:<13}x{}", readable_item_name(&r.item_type), "(undecoded)", r.item_count);
+    }
+}
+
+/// Write every decoded owned-relic entry to `owned-relics.json` as an exact,
+/// [`wf_relic::Source::MemScan`]-tagged snapshot (ADR-0009's revision): the
+/// mem-scanned inventory becomes the new ground truth, and any prior entry
+/// not covered by it is dropped as a confirmed zero (see
+/// [`wf_relic::apply_exact_snapshot`]'s doc for why absence is authoritative
+/// here). Running `mem-scan` at all is already the map's required
+/// in-the-moment consent (see [`mem_scan_cmd`]'s doc) — no separate opt-in is
+/// needed to let its findings take effect. An entry `relic_names` couldn't
+/// decode (no `(code, refinement)` to key `owned-relics.json` by) is skipped
+/// here — already visible to the human via `print_owned_relics`'s
+/// `(undecoded)` rows — but also logged as a warning so it isn't silently
+/// dropped from view if this command's output scrolls by unread.
+#[cfg(feature = "mem-scan")]
+fn write_owned_relics(state: &wf_mem::OwnedRelicState, relic_names: &wf_relic::RelicNameIndex) {
+    let mut snapshot: Vec<(String, wf_relic::Refinement, u32)> = Vec::new();
+    let mut undecoded = 0usize;
+    for r in &state.relics {
+        let decoded = relic_names
+            .lookup(&r.item_type)
+            .and_then(|id| wf_relic::Refinement::from_label(&id.refinement).map(|refinement| (id.display(), refinement)));
+        match decoded {
+            Some((code, refinement)) => snapshot.push((code, refinement, r.item_count)),
+            None => undecoded += 1,
+        }
+    }
+    if undecoded > 0 {
+        let (noun, verb) = if undecoded == 1 { ("entry", "was") } else { ("entries", "were") };
+        tracing::warn!(
+            "mem-scan: {undecoded} owned-relic {noun} could not be decoded and {verb} not applied to {}",
+            wf_relic::OWNED_RELICS_FILE
+        );
+    }
+
+    let mut owned: wf_relic::OwnedRelics = wf_cache::load_blob_or_reset(wf_relic::OWNED_RELICS_FILE);
+    wf_relic::apply_exact_snapshot(&mut owned, &snapshot);
+    match wf_cache::save_blob(wf_relic::OWNED_RELICS_FILE, &owned) {
+        Ok(()) => println!(
+            "  wrote {} entries to {} ({undecoded} undecoded, skipped)",
+            snapshot.len(),
+            wf_relic::OWNED_RELICS_FILE
+        ),
+        Err(e) => tracing::warn!("failed to write {}: {e}", wf_relic::OWNED_RELICS_FILE),
     }
 }
 
@@ -1156,6 +1202,23 @@ const MIN_NAME_HSPAN: f32 = 0.35;
 /// dwell on the card; mode-voting lets the true value overtake a wrong pair as
 /// the player keeps scrolling (see ADR-0005).
 const RELIC_AGREEMENT: u32 = 2;
+
+/// The agreement bar OCR must clear to overwrite a relic count that was last
+/// written by `wf-mem`'s mem-scan (ADR-0009's revision) rather than OCR
+/// itself. A mem-scanned count is read directly from the game's own
+/// inventory payload — exact, not a frame-agreement estimate — so casually
+/// overwriting it on the strength of a lone lucky pair of misreads would be a
+/// regression, not a refresh. Four times [`RELIC_AGREEMENT`]: high enough
+/// that a stray OCR misread pair can't plausibly clear it, but still
+/// reachable through ordinary repeated scrolling across the relic (a natural
+/// scroll session revisiting a card that many times is rare but not
+/// impossible — see ADR-0009's note that revisits within one continuous
+/// scroll are uncommon at all). Once OCR does clear this bar, the entry's
+/// source flips to `Ocr` (see [`wf_relic::apply_confirmed_count`]) and the
+/// normal, lower [`RELIC_AGREEMENT`] bar applies from then on — the point is
+/// resisting a single bad read, not permanently distrusting OCR for that
+/// relic.
+const RELIC_AGREEMENT_MEMSCAN_OVERRIDE: u32 = RELIC_AGREEMENT * 4;
 
 /// How many frames must resolve the same `(code, refinement)` identity before
 /// it's marked Seen. `RelicIndex::best_match` still occasionally ties two
@@ -2414,9 +2477,18 @@ impl wf_gridscan::ScanLoopBody for RelicScanBody {
                     continue;
                 }
             }
+            // A count last written by mem-scan needs a much higher agreement
+            // bar to overwrite (ADR-0009's revision) — see
+            // RELIC_AGREEMENT_MEMSCAN_OVERRIDE.
+            let required_agreement =
+                if wf_relic::count_source(&self.relic_owned, &key.0, key.1) == Some(wf_relic::Source::MemScan) {
+                    RELIC_AGREEMENT_MEMSCAN_OVERRIDE
+                } else {
+                    RELIC_AGREEMENT
+                };
             let relic_owned = &mut self.relic_owned;
-            if wf_gridscan::confirm_once(&self.tally, &mut self.session_applied, &key, RELIC_AGREEMENT, |confirmed| {
-                wf_relic::apply_confirmed_count(relic_owned, &key.0, key.1, confirmed);
+            if wf_gridscan::confirm_once(&self.tally, &mut self.session_applied, &key, required_agreement, |confirmed| {
+                wf_relic::apply_confirmed_count(relic_owned, &key.0, key.1, confirmed, wf_relic::Source::Ocr);
             }) {
                 changed = true;
             }

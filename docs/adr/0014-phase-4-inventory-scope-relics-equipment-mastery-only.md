@@ -1,5 +1,11 @@
 # Phase 4 inventory scope: relics/equipment/mastery slice only
 
+> **Correction ([ADR-0015](0015-owned-relic-data-is-miscitems-voidprojection-not-levelkeys.md)):**
+> `LevelKeys[]`, named below as the candidate owned-relic replacement field,
+> was an inference from third-party source, not a real payload — live
+> verification found it holds no Void Relics at all. The real field is
+> `MiscItems[]`/`VoidProjection`.
+
 DE's `inventory.php` response covers far more than this app's existing scope
 (CONTEXT.md; [ADR-0007](0007-live-world-state-out-of-scope.md)) — credits and
 platinum, sortie/Archon Hunt/Ayatan/Netracell weekly progress, full account

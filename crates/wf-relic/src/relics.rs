@@ -1542,6 +1542,7 @@ mod tests {
                 crate::owned::OwnedEntry {
                     seen: true,
                     count: Some(wf_cache::Stamped { value: 1, fetched_at: 0 }),
+                    source: crate::owned::Source::Ocr,
                 },
             )]),
         );
