@@ -109,6 +109,24 @@ const RARITY_COMMON_COLOR: egui::Color32 = egui::Color32::from_gray(210);
 const RARITY_UNCOMMON_COLOR: egui::Color32 = egui::Color32::from_rgb(90, 165, 230);
 const RARITY_RARE_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 190, 60);
 
+/// The warframe-lite mark, same bundled PNG as `wf-tray`'s tray icon, decoded
+/// into egui's plain-RGBA `IconData` (unlike ksni's tray pixmap, no ARGB
+/// byte-order swap needed).
+fn app_icon() -> egui::IconData {
+    let bytes = include_bytes!("../assets/icon.png");
+    match image::load_from_memory(bytes) {
+        Ok(img) => {
+            let img = img.to_rgba8();
+            let (width, height) = (img.width(), img.height());
+            egui::IconData { rgba: img.into_vec(), width, height }
+        }
+        Err(e) => {
+            tracing::error!("failed to decode bundled window icon: {e}");
+            egui::IconData::default()
+        }
+    }
+}
+
 /// Open the browse window and run its event loop until closed.
 pub fn run() -> eframe::Result<()> {
     let config_path = Config::default_path().unwrap_or_else(|_| PathBuf::from("config.toml"));
@@ -162,7 +180,15 @@ pub fn run() -> eframe::Result<()> {
             // the grouped two-tier nav (see `Group`) and denser tabs like
             // Mastery/Relics & Plan need more room to breathe.
             .with_inner_size([1040.0, 720.0])
-            .with_min_inner_size([760.0, 560.0]),
+            .with_min_inner_size([760.0, 560.0])
+            .with_icon(app_icon())
+            // Matches `packaging/warframe-lite.desktop`'s filename, which is
+            // how the Wayland compositor's taskbar looks up an app icon for
+            // xdg-shell clients — `with_icon`'s pixel buffer alone only
+            // covers X11 (`_NET_WM_ICON`); without a matching app_id a
+            // KDE/Wayland taskbar falls back to some unrelated default (seen
+            // showing the system default browser's icon instead).
+            .with_app_id("warframe-lite"),
         ..Default::default()
     };
     eframe::run_native(

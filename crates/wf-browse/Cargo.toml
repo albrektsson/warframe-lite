@@ -31,3 +31,6 @@ eframe = { version = "0.35", default-features = false, features = [
     "wayland",
     "x11",
 ] }
+# Decodes the bundled window-icon PNG (same mark as wf-tray) into egui's RGBA
+# IconData.
+image.workspace = true
