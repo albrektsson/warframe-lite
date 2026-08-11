@@ -316,6 +316,8 @@ async fn mem_scan_cmd(config: &Config) -> Result<()> {
     println!("\n== mem-scan: Owned Parts (MiscItems built components) ==");
     let parts = wf_mem::parse_owned_parts(&raw)?;
     print_owned_parts(&parts);
+    let quantities = load_part_quantities(&client).await;
+    write_owned_parts(&parts, &quantities);
 
     println!("\n== mem-scan: Owned but Unmastered ==");
     let mastery = load_mastery(config, &client).await;
@@ -1272,6 +1274,40 @@ async fn load_relic_names(client: &reqwest::Client) -> wf_relic::RelicNameIndex 
             tracing::warn!("relic name index load failed ({e:#}); owned relics shown undecoded");
             wf_relic::RelicNameIndex::empty()
         }
+    }
+}
+
+/// Best-effort WFCD Prime-Part-build-quantities catalogue load (issue #81):
+/// an empty catalogue (every raw owned-part entry dropped, see
+/// [`write_owned_parts`]) is returned if the WFCD dataset can't be loaded,
+/// so `mem-scan` still runs — mirrors [`load_relic_names`]'s same
+/// fail-open convention for the relic side of mem-scan.
+#[cfg(feature = "mem-scan")]
+async fn load_part_quantities(client: &reqwest::Client) -> wf_relic::PartQuantities {
+    match wf_relic::PartQuantities::load_cached(client, CATALOGUE_TTL).await {
+        Ok(quantities) => quantities,
+        Err(e) => {
+            tracing::warn!("part quantities load failed ({e:#}); owned parts shown undecoded");
+            wf_relic::PartQuantities::empty()
+        }
+    }
+}
+
+/// Print the outcome of writing owned-Prime-Part entries to
+/// `owned-prime-parts.json` (issue #81) — mirrors [`write_owned_relics`]'s
+/// wrapper. `skipped` isn't broken out from `written` in this line the way
+/// undecoded relics are: most skips are ordinary non-Prime gear, not a
+/// decode gap (see [`wf_mem::write_owned_parts`]'s doc).
+#[cfg(feature = "mem-scan")]
+fn write_owned_parts(state: &wf_mem::OwnedPartsState, quantities: &wf_relic::PartQuantities) {
+    let report = wf_mem::write_owned_parts(state, quantities);
+    if report.saved {
+        println!(
+            "  wrote {} entries to {} ({} non-Prime/unrecognized, skipped)",
+            report.written,
+            wf_relic::OWNED_PRIME_PARTS_FILE,
+            report.skipped
+        );
     }
 }
 

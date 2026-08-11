@@ -390,6 +390,80 @@ pub fn inventory_prime_part(label: &str, quantities: &PartQuantities) -> Option<
     quantities.has_prime(&pp.prime).then_some(pp)
 }
 
+/// `wf-mem`'s raw owned-part internal-name prefixes (issue #81) —
+/// deliberately duplicated from `wf_mem::owned_parts`'s private constants of
+/// the same names rather than shared: `wf-mem` depends on `wf-relic` (for
+/// `write_owned_parts`'s catalogue cross-reference), so the dependency can't
+/// run the other way, and these two short literals are cheap to keep in
+/// sync compared to a shared micro-crate.
+const WARFRAME_PART_PREFIX: &str = "/Lotus/Types/Recipes/WarframeRecipes/";
+const WEAPON_PART_PREFIX: &str = "/Lotus/Types/Recipes/Weapons/WeaponParts/";
+
+/// Resolve one `wf-mem`-sourced raw owned-part entry's internal `item_type`
+/// (`wf_mem::owned_parts::OwnedPartRaw`, issue #80) to its [`PrimePart`]
+/// identity, if it names a Prime component `quantities`'s WFCD-derived
+/// keyspace recognizes.
+///
+/// Mirrors [`inventory_prime_part`]'s OCR-label decode, but starting from
+/// wf-mem's raw internal path instead of an OCR'd screen label: strips the
+/// `WarframeRecipes/.../Component` or `Weapons/WeaponParts/...` prefix (and
+/// `Component` suffix), camelCase-splits the remaining leaf into words
+/// (`"VorunaPrimeSystems"` -> `"Voruna Prime Systems"`), and applies DE's
+/// internal `Helmet` -> display `Neuroptics` rename before validating
+/// against `quantities` the same way `inventory_prime_part` does. A
+/// non-Prime frame/weapon part (`AshChassisComponent`,
+/// `GorgonWraithBarrel`) or an entry `quantities` doesn't recognize is
+/// dropped (`None`) rather than surfaced under a wrong or guessed identity
+/// — same "unknown, never guessed" precedent as `inventory_prime_part`
+/// (ADR-0011). This is also how non-Prime parts get filtered out of
+/// `owned-prime-parts.json`: they're never looked up by any `PrimePart` key
+/// in the first place, so no explicit "is this a Prime" gate exists
+/// upstream of this function.
+pub fn owned_part_from_item_type(item_type: &str, quantities: &PartQuantities) -> Option<PrimePart> {
+    let label = item_type_to_label(item_type)?;
+    inventory_prime_part(&label, quantities)
+}
+
+/// The `{FrameName}{Part}` or `{WeaponName}{Part}` leaf of a raw owned-part
+/// `item_type`, camelCase-split into a reward-shaped label and with DE's
+/// `Helmet` internal label renamed to its display equivalent, `Neuroptics`.
+/// `None` when `item_type` matches neither of `wf_mem::owned_parts`'s two
+/// naming patterns, or the leaf left after stripping is empty.
+fn item_type_to_label(item_type: &str) -> Option<String> {
+    let leaf = if let Some(rest) = item_type.strip_prefix(WARFRAME_PART_PREFIX) {
+        rest.strip_suffix("Component").filter(|mid| !mid.is_empty())?
+    } else {
+        item_type.strip_prefix(WEAPON_PART_PREFIX).filter(|rest| !rest.is_empty())?
+    };
+    let spaced = camel_case_split(leaf);
+    Some(
+        spaced
+            .split_whitespace()
+            .map(|w| if w == "Helmet" { "Neuroptics" } else { w })
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// Insert a space before each uppercase letter that follows a lowercase
+/// letter or digit, e.g. `"VorunaPrimeSystems"` -> `"Voruna Prime Systems"`.
+/// Mirrors `wf-lite`'s own `readable_item_name` camelCase-splitting
+/// convention (`src/main.rs`), duplicated here rather than shared for the
+/// same reason as [`WARFRAME_PART_PREFIX`] above — `wf-lite`'s binary can't
+/// be a library dependency of `wf-relic`.
+fn camel_case_split(leaf: &str) -> String {
+    let mut out = String::new();
+    let mut prev: Option<char> = None;
+    for c in leaf.chars() {
+        if c.is_uppercase() && prev.is_some_and(|p| p.is_lowercase() || p.is_ascii_digit()) {
+            out.push(' ');
+        }
+        out.push(c);
+        prev = Some(c);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,6 +552,110 @@ mod tests {
         assert_eq!(
             inventory_prime_part("Afuris Prime Link", &quantities),
             Some(PrimePart { prime: "Afuris Prime".to_string(), part: "Link".to_string() })
+        );
+    }
+
+    #[test]
+    fn owned_part_from_item_type_decodes_a_warframe_component_and_renames_helmet() {
+        let quantities = PartQuantities::from_entries_for_test(vec![
+            ("Voruna Prime".to_string(), "Systems".to_string(), 1),
+            ("Voruna Prime".to_string(), "Neuroptics".to_string(), 1),
+        ]);
+        assert_eq!(
+            owned_part_from_item_type(
+                "/Lotus/Types/Recipes/WarframeRecipes/VorunaPrimeSystemsComponent",
+                &quantities
+            ),
+            Some(PrimePart { prime: "Voruna Prime".to_string(), part: "Systems".to_string() })
+        );
+        // DE's internal label is Helmet; the display/catalogue label is Neuroptics.
+        assert_eq!(
+            owned_part_from_item_type(
+                "/Lotus/Types/Recipes/WarframeRecipes/VorunaPrimeHelmetComponent",
+                &quantities
+            ),
+            Some(PrimePart { prime: "Voruna Prime".to_string(), part: "Neuroptics".to_string() })
+        );
+    }
+
+    #[test]
+    fn owned_part_from_item_type_drops_a_non_prime_warframe_component() {
+        let quantities = PartQuantities::from_entries_for_test(vec![(
+            "Voruna Prime".to_string(),
+            "Systems".to_string(),
+            1,
+        )]);
+        // Ash is not a Prime — not in the catalogue, so dropped, not guessed.
+        assert_eq!(
+            owned_part_from_item_type(
+                "/Lotus/Types/Recipes/WarframeRecipes/AshChassisComponent",
+                &quantities
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn owned_part_from_item_type_decodes_a_weapon_part_with_no_component_suffix() {
+        let quantities = PartQuantities::from_entries_for_test(vec![(
+            "Rubico Prime".to_string(),
+            "Receiver".to_string(),
+            1,
+        )]);
+        assert_eq!(
+            owned_part_from_item_type(
+                "/Lotus/Types/Recipes/Weapons/WeaponParts/RubicoPrimeReceiver",
+                &quantities
+            ),
+            Some(PrimePart { prime: "Rubico Prime".to_string(), part: "Receiver".to_string() })
+        );
+    }
+
+    #[test]
+    fn owned_part_from_item_type_drops_a_non_prime_weapon_part() {
+        let quantities = PartQuantities::from_entries_for_test(vec![(
+            "Rubico Prime".to_string(),
+            "Receiver".to_string(),
+            1,
+        )]);
+        // Gorgon Wraith is not a Prime.
+        assert_eq!(
+            owned_part_from_item_type(
+                "/Lotus/Types/Recipes/Weapons/WeaponParts/GorgonWraithBarrel",
+                &quantities
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn owned_part_from_item_type_decodes_a_sentinel_part_under_the_weapon_prefix() {
+        // Sentinels use `Systems` under the weapon-parts namespace too (#79),
+        // distinct from the Warframe pattern's own `Systems`.
+        let quantities = PartQuantities::from_entries_for_test(vec![(
+            "Shade Prime".to_string(),
+            "Systems".to_string(),
+            1,
+        )]);
+        assert_eq!(
+            owned_part_from_item_type(
+                "/Lotus/Types/Recipes/Weapons/WeaponParts/ShadePrimeSystems",
+                &quantities
+            ),
+            Some(PrimePart { prime: "Shade Prime".to_string(), part: "Systems".to_string() })
+        );
+    }
+
+    #[test]
+    fn owned_part_from_item_type_rejects_an_item_type_matching_neither_naming_pattern() {
+        let quantities = PartQuantities::from_entries_for_test(vec![(
+            "Voruna Prime".to_string(),
+            "Systems".to_string(),
+            1,
+        )]);
+        assert_eq!(
+            owned_part_from_item_type("/Lotus/Types/Items/MiscItems/EnduringEndo", &quantities),
+            None
         );
     }
 

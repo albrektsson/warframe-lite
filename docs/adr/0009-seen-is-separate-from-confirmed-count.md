@@ -83,3 +83,27 @@ catalogue match — see [#66](https://github.com/albrektsson/warframe-lite/issue
 rare `(undecoded)` case) is skipped from the snapshot rather than written
 raw or guessed at; `mem-scan`'s own output logs a warning when this happens
 so it isn't silently lost from view.
+
+## Revision (2026-08-11): the same `Source` model also covers owned Prime Part components
+
+[#81](https://github.com/albrektsson/warframe-lite/issues/81) wires
+`wf-mem`'s mem-scan into `owned-prime-parts.json`
+(`wf-relic::owned_parts`, the built-component counterpart to
+`OwnedRelics`) the same way #67 wired it into `owned-relics.json` above.
+`owned_parts.rs` has no Seen/Confirmed split — its own module doc explains
+why: this screen's badge is always a single-frame passive read, so there's
+nothing for a Seen tier to distinguish — but the *provenance* question this
+revision's `Source` answers (was the current count read exactly from game
+memory, or estimated from OCR frames?) doesn't depend on a Seen tier
+existing. So `PartCount` gains the identical `source: Source` field
+(`crate::owned::Source`, reused verbatim rather than duplicated), OCR needs
+`INVENTORY_AGREEMENT_MEMSCAN_OVERRIDE` (`src/ocr_enabled.rs`, the same 4×
+multiplier as `RELIC_AGREEMENT_MEMSCAN_OVERRIDE`) to overwrite a
+`MemScan`-sourced part count, and `owned_parts::apply_exact_snapshot`
+mirrors `owned::apply_exact_snapshot`'s absence-is-zero authoritative reset.
+
+A raw owned-part entry that isn't a Prime component at all (most of a
+typical account's `MiscItems[]` built components are non-Prime gear) is
+silently dropped, not logged — unlike an undecoded relic above, this is the
+ordinary case here, not a name-index gap (see `wf-mem::write_owned_parts`'s
+doc).

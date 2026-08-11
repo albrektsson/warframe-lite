@@ -276,6 +276,15 @@ const INVENTORY_COUNT_CAP: u32 = 999;
 /// identity and count are trusted together, once frames agree.
 const INVENTORY_AGREEMENT: u32 = 2;
 
+/// The agreement bar OCR must clear to overwrite a Prime Part count that was
+/// last written by `wf-mem`'s mem-scan (ADR-0009's revision, applied to
+/// Prime Parts per issue #81) rather than OCR itself — same rationale and
+/// same 4× multiplier as [`RELIC_AGREEMENT_MEMSCAN_OVERRIDE`], reused here
+/// even though this screen has no separate Seen tier: the provenance
+/// question this bar answers (was the current count read exactly from game
+/// memory, or estimated from OCR frames?) doesn't depend on that.
+const INVENTORY_AGREEMENT_MEMSCAN_OVERRIDE: u32 = INVENTORY_AGREEMENT * 4;
+
 /// One Inventory/Sell card's resolved reading on a single frame.
 struct InventoryObservation {
     part: wf_relic::PrimePart,
@@ -1073,13 +1082,22 @@ impl wf_gridscan::ScanLoopBody for InventoryScanBody {
                 continue; // abstain — no vote (Unowned never occurs on this screen)
             };
             self.tally.record(obs.part.clone(), n);
+            // A count last written by mem-scan needs a much higher agreement
+            // bar to overwrite (ADR-0009's revision) — see
+            // INVENTORY_AGREEMENT_MEMSCAN_OVERRIDE.
+            let required_agreement =
+                if wf_relic::owned_parts::source(&self.owned, &obs.part) == Some(wf_relic::Source::MemScan) {
+                    INVENTORY_AGREEMENT_MEMSCAN_OVERRIDE
+                } else {
+                    INVENTORY_AGREEMENT
+                };
             let owned = &mut self.owned;
             if wf_gridscan::confirm_once(
                 &self.tally,
                 &mut self.session_applied,
                 &obs.part,
-                INVENTORY_AGREEMENT,
-                |confirmed| wf_relic::owned_parts::apply_count(owned, &obs.part, confirmed),
+                required_agreement,
+                |confirmed| wf_relic::owned_parts::apply_count(owned, &obs.part, confirmed, wf_relic::Source::Ocr),
             ) {
                 changed = true;
             }

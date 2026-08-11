@@ -218,6 +218,7 @@ mod tests {
             &mut owned_parts,
             &PrimePart { prime: "Afuris Prime".to_string(), part: "Barrel".to_string() },
             1,
+            crate::owned::Source::Ocr,
         );
 
         let plans = buy_or_farm_plan(
@@ -250,6 +251,7 @@ mod tests {
             &mut owned_parts,
             &PrimePart { prime: "Afuris Prime".to_string(), part: "Barrel".to_string() },
             1,
+            crate::owned::Source::Ocr,
         );
 
         let plans = buy_or_farm_plan(

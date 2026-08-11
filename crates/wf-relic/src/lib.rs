@@ -17,7 +17,7 @@ pub mod wishlist;
 
 pub use bom::{buy_or_farm_plan, unmastered_primes, BomGap, BomPlan};
 pub use index::ItemIndex;
-pub use mastery::{inventory_prime_part, MasterySet, PrimePart};
+pub use mastery::{inventory_prime_part, owned_part_from_item_type, MasterySet, PrimePart};
 pub use owned::{
     apply_confirmed_count, apply_exact_snapshot, clear_entry, count_source, intact_age,
     intact_age_range, intact_ages, mark_seen, owned_counts, owned_evidence, parse_refinement,

@@ -2270,19 +2270,26 @@ fn open_kde_shortcuts(status: &mut String) {
 /// [`BrowseApp::spawn_scan`]), factored out as a plain async fn so its
 /// error path is a single `?`-chain. Runs the same pipeline
 /// `wf-lite mem-scan` does — `wf_mem::scan_and_fetch` →
-/// `wf_mem::parse_owned_relics` → `wf_relic::RelicNameIndex::load_cached` →
-/// `wf_mem::write_owned_relics` (the shared decode+snapshot+apply+save
-/// logic, #72) — refreshing `owned-relics.json` so the Relics & Plan/Sell/
-/// Farm tabs' existing [`POLL_INTERVAL`] refresh picks it up without a
-/// restart.
+/// `wf_mem::parse_owned_relics`/`parse_owned_parts` →
+/// `wf_relic::RelicNameIndex::load_cached`/`wf_relic::PartQuantities::load_cached` →
+/// `wf_mem::write_owned_relics`/`write_owned_parts` (the shared
+/// decode+snapshot+apply+save logic, #72/#81) — refreshing
+/// `owned-relics.json`/`owned-prime-parts.json` so the Relics & Plan/Sell/
+/// Farm/Mastery tabs' existing [`POLL_INTERVAL`] refresh picks them up
+/// without a restart.
 ///
 /// Every `wf_mem`/`wf_relic` error propagates via its own `Display`
 /// verbatim (`{e:#}`, matching this crate's and `wf-lite`'s existing
 /// convention for inline error text) — never reworded — so a missing
 /// `cap_sys_ptrace` grant surfaces the exact same `sudo setcap
-/// cap_sys_ptrace=+ep <path>` guidance the CLI shows.
+/// cap_sys_ptrace=+ep <path>` guidance the CLI shows. A failed *parts* write
+/// specifically doesn't fail the whole scan (unlike relics') — see the
+/// second `?`-chain below builds its own status line instead of erroring,
+/// so a `owned-prime-parts.json` write hiccup doesn't discard an otherwise-
+/// successful relic write.
 async fn run_memory_scan(client: &reqwest::Client) -> Result<String, String> {
     let raw = wf_mem::scan_and_fetch(client).await.map_err(|e| format!("{e:#}"))?;
+
     let relics = wf_mem::parse_owned_relics(&raw).map_err(|e| format!("{e:#}"))?;
     let relic_names = wf_relic::RelicNameIndex::load_cached(client, CATALOGUE_TTL)
         .await
@@ -2290,16 +2297,35 @@ async fn run_memory_scan(client: &reqwest::Client) -> Result<String, String> {
             tracing::warn!("relic name index load failed ({e:#}); owned relics shown undecoded");
             wf_relic::RelicNameIndex::empty()
         });
-
-    let report = wf_mem::write_owned_relics(&relics, &relic_names);
-    if !report.saved {
+    let relics_report = wf_mem::write_owned_relics(&relics, &relic_names);
+    if !relics_report.saved {
         return Err(format!("scanned successfully but failed to write {}", wf_relic::OWNED_RELICS_FILE));
     }
+
+    let parts = wf_mem::parse_owned_parts(&raw).map_err(|e| format!("{e:#}"))?;
+    let quantities = wf_relic::PartQuantities::load_cached(client, CATALOGUE_TTL)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("part quantities load failed ({e:#}); owned parts shown undecoded");
+            wf_relic::PartQuantities::empty()
+        });
+    let parts_report = wf_mem::write_owned_parts(&parts, &quantities);
+    let parts_line = if parts_report.saved {
+        format!(
+            "; wrote {} part entries to {} ({} non-Prime/unrecognized, skipped)",
+            parts_report.written,
+            wf_relic::OWNED_PRIME_PARTS_FILE,
+            parts_report.skipped
+        )
+    } else {
+        format!("; failed to write {}", wf_relic::OWNED_PRIME_PARTS_FILE)
+    };
+
     Ok(format!(
-        "wrote {} entries to {} ({} undecoded, skipped)",
-        report.written,
+        "wrote {} relic entries to {} ({} undecoded, skipped){parts_line}",
+        relics_report.written,
         wf_relic::OWNED_RELICS_FILE,
-        report.undecoded
+        relics_report.undecoded
     ))
 }
 

@@ -56,7 +56,7 @@ pub fn ducat_picks(
                 };
                 DucatPick {
                     mastered: mastery.is_mastered(&label),
-                    owned: count.value,
+                    owned: count.count.value,
                     build_quantity: quantities.get(&pp),
                     ducats,
                     plat,
@@ -86,6 +86,7 @@ mod tests {
                 &mut owned,
                 &PrimePart { prime: prime.to_string(), part: part.to_string() },
                 count,
+                crate::owned::Source::Ocr,
             );
         }
         owned

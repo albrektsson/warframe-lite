@@ -1210,6 +1210,7 @@ mod tests {
             &mut owned_parts,
             &PrimePart { prime: "Afuris Prime".to_string(), part: "Barrel".to_string() },
             2,
+            crate::owned::Source::Ocr,
         );
 
         let picks = sell_picks(
@@ -1246,11 +1247,13 @@ mod tests {
             &mut owned_parts,
             &PrimePart { prime: "Afuris Prime".to_string(), part: "Barrel".to_string() },
             1,
+            crate::owned::Source::Ocr,
         );
         crate::owned_parts::apply_count(
             &mut owned_parts,
             &PrimePart { prime: "Afuris Prime".to_string(), part: "Link".to_string() },
             2,
+            crate::owned::Source::Ocr,
         );
 
         let picks = sell_picks(
@@ -1477,6 +1480,7 @@ mod tests {
             &mut owned_parts,
             &PrimePart { prime: "Afuris Prime".to_string(), part: "Barrel".to_string() },
             3,
+            crate::owned::Source::Ocr,
         );
 
         let plans = mastery_plan(
