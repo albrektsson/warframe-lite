@@ -1,5 +1,14 @@
 # warframe-lite
 
+> **Disclaimer:** built with AI assistance. Run it at your own risk — it
+> only reads `EE.log` and only reads game memory, never writes to either.
+> See [docs/research/memory-reading-ban-risk-and-prior-art.md](docs/research/memory-reading-ban-risk-and-prior-art.md)
+> for the detail. 
+>
+> **Network:** contacts `api.warframe.market`,
+> `api.warframestat.us`, `raw.githubusercontent.com`, and
+> `api.warframe.com`/`mobile.warframe.com` — nothing else.
+
 A standalone, **Linux-native** companion for [Warframe](https://www.warframe.com/) —
 a light alternative to [AlecaFrame](https://alecaframe.com/) that runs **without
 Overwolf**. Built for KDE Plasma (Wayland) with the game under Steam Proton, in Rust.
