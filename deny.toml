@@ -32,6 +32,11 @@ allow = [
     # webpki-roots bundles Mozilla's root certificate list under this
     # data-oriented (not code) license.
     "CDLA-Permissive-2.0",
+    # epaint_default_fonts (egui/eframe, via wf-browse) bundles its default
+    # UI fonts under these two permissive font licenses — OSI-approved/FSF-
+    # free, not copyleft, same posture as everything else in this list.
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
 ]
 confidence-threshold = 0.8
 
