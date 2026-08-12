@@ -28,21 +28,11 @@ credentials.
 
 ## Install & run
 
-warframe-lite is a single self-contained binary (`wf-lite`) — no runtime other
-than glibc and a `dlopen`'d `libwayland-client.so.0` (present on every Wayland
-desktop). It reaches every subsystem (tray, overlay, browse window, mem-scan)
-by re-execing itself, not by spawning separately-installed sibling binaries —
-one file to build and install. The relic OCR features (the automatic
-reward picker, the owned-relic scanner, and the `ocr`/`ocr-file`/`relic-file`/
-`relic-scan` commands) are part of `wf-lite`'s **default build**
-([ADR-0017](docs/adr/0017-ocr-is-default-compiled-not-opt-in.md)) — the
-automatic reward picker is the app's main point, so a plain `cargo build
---release` needs `tesseract-devel`/`leptonica-devel`/`clang` at build time;
-see [docs/ocr.md](docs/ocr.md) for the per-distro package names and runtime
-library requirements.
-
-**1. Build it.** No prebuilt releases are published pre-1.0 — clone and build
-from source (see [Build](#build)), then put the binary on your `PATH`:
+warframe-lite is a single self-contained binary (`wf-lite`) — clone and build
+from source (no prebuilt releases pre-1.0). The relic OCR reward picker is
+part of the default build, so building needs `tesseract-devel`/
+`leptonica-devel`/`clang`; see [docs/ocr.md](docs/ocr.md) for per-distro
+package names.
 
 ```
 git clone https://github.com/albrektsson/warframe-lite.git
@@ -51,42 +41,18 @@ cargo build --release
 install -Dm755 target/release/wf-lite ~/.local/bin/wf-lite
 ```
 
-**2. Run it — bare `wf-lite` is the easy way.** Launch it (from a menu shortcut
-or terminal) with no arguments. It sits in the KDE system tray, waits for
-Warframe to start, and **auto-starts the overlay when the game window
-appears** (and stops it when the game closes). The tray menu shows/hides the
-overlay, opens the browse window, detects your account id, runs a memory
-scan, and quits. Install the desktop shortcut so it appears in your launcher:
+Run it:
 
 ```
-install -Dm644 packaging/warframe-lite.desktop ~/.local/share/applications/warframe-lite.desktop
-install -Dm644 packaging/warframe-lite.svg ~/.local/share/icons/hicolor/scalable/apps/warframe-lite.svg
+wf-lite
 ```
 
-Prefer no tray? Start the overlay directly instead — either in a terminal
-(`wf-lite overlay`) or from Warframe's **Steam launch options**:
+It sits in the tray, waits for Warframe to start, and auto-starts the
+overlay when the game window appears (stopping it when the game closes).
 
-```
-wf-lite overlay & %command%
-```
-
-`wf-lite overlay` polls up to 30s for the game window, then anchors the panel to
-its top-right corner (correct in fullscreen *and* borderless-windowed).
-
-**3. (Optional) Enable mastery badges.** Detect your account id from the game log
-(scraped and verified against the public profile, so it can't pick a squadmate):
-
-```
-wf-lite detect-account
-```
-
-The id only appears in the log after some activity (a relic crack in a squad, a
-Duviri race); if detection can't find it, set it manually — find it at
-`warframe.com/api/user-data`:
-
-```
-wf-lite set-account <id>
-```
+For running without the tray, a desktop launcher, mastery badges, mem-scan,
+hotkey binding, and full configuration options, see
+[docs/advanced-setup.md](docs/advanced-setup.md).
 
 ## Commands
 
@@ -108,7 +74,7 @@ wf-lite toggle             # show/hide a running overlay (also: show / hide)
 wf-lite copy               # copy the current best-pick reward (name + plat) to the clipboard
 wf-lite capture [out.png]  # capture the Warframe window to a PNG
 wf-lite relic [names…]     # evaluate reward names → matched item + plat
-wf-lite relic-scan         # capture the reward screen, OCR the names, rank them
+wf-lite relic-scan         # capture the reward screen, OCR the names, rank them — see docs/ocr.md
 wf-lite detect-account     # auto-detect your account id from EE.log (verified)
 wf-lite set-account <id>   # save your account id for mastery lookup
 wf-lite mastery [id]       # report your mastered-item count
@@ -116,73 +82,6 @@ wf-lite logstats           # parse whole EE.log history, report coverage/events
 wf-lite logwatch           # follow EE.log live, print recognized events
 wf-lite mem-scan           # read live Foundry/relic/equipment state — see docs/mem-scan.md
 ```
-
-### OCR / relic-grid scanning
-
-The relic OCR features — `ocr`, `ocr-file`, `relic-file`, `relic-scan`,
-`relic-grid-file`, `inventory-grid-file`, and the live overlay's automatic
-reward-picker and owned-relic/Prime-Part scanners — are part of `wf-lite`'s
-default build ([ADR-0017](docs/adr/0017-ocr-is-default-compiled-not-opt-in.md)).
-Building with `--no-default-features` (or `--no-default-features --features
-mem-scan`) drops the `ocr` feature instead; those commands then print a
-short message pointing at a rebuild instead of failing to compile or
-erroring confusingly, and the overlay still runs normally otherwise —
-fissures and manual reward evaluation (`wf-lite relic`) keep working, just
-without automatic detection. See [docs/ocr.md](docs/ocr.md) for the
-required build packages and runtime library table.
-
-### mem-scan
-
-`wf-lite mem-scan` reads Foundry/relic/equipment state straight out of the
-running game's own memory (read-only, ADR-0001) — also reachable from
-`wf-lite browse`'s Home tab and `wf-tray`'s right-click menu. It's part of
-`wf-lite`'s default build; running it (from any of the three entry points)
-is itself the required consent, and it needs a one-time `CAP_SYS_PTRACE`
-grant. See [docs/mem-scan.md](docs/mem-scan.md) for the full permission
-setup and consent-model detail.
-
-## Configuration
-
-Config lives at `~/.config/warframe-lite/config.toml` (created on demand); the
-`EE.log` path is auto-detected from the Steam Proton prefix but can be overridden
-there. Network results (item catalogue, prices, mastered set) are cached under
-`~/.cache/warframe-lite/`.
-
-### Overlay placement
-
-Warframe uses every screen corner for HUD and menu elements, so the overlay's
-position and visibility are configurable under `[overlay]`:
-
-```toml
-[overlay]
-anchor = "top-right"   # top-left | top-right | bottom-left | bottom-right
-                       # | top | bottom | left | right | center
-margin_x = 24          # horizontal inset from the anchored edge(s), px
-margin_y = 24          # vertical inset
-fissures = true        # false = reward-only: invisible until a relic reward screen
-opacity = 1.0          # 1.0 = as-drawn, lower = more transparent (e.g. 0.7)
-```
-
-**Hide it on a hotkey.** The overlay is click-through and can't grab a global
-key itself, so bind a **KDE custom shortcut** (System Settings → Shortcuts →
-Add Custom → Command) to `wf-lite toggle` (or `wf-lite hide` / `wf-lite show`).
-The running overlay listens on a control socket and shows/hides instantly.
-
-**Copy a reward to the clipboard.** Bind another KDE custom shortcut to
-`wf-lite copy` to copy the currently-displayed best-pick reward's name and
-plat price (e.g. `Mirage Prime Systems 45p`) to the clipboard, ready to paste
-into Warframe's trade chat. Needs `wl-clipboard` ≥ 2.3.0 for
-`ext-data-control-v1` support on KWin ≥ 6.5 — older packaged versions (e.g.
-Fedora/Debian/Ubuntu's stock 2.2.1) may hit `wl-copy`'s own documented
-popup-surface hang fallback instead of copying instantly. Override the binary
-with `WF_WL_COPY` if yours is named or pathed differently.
-
-### Settings tab
-
-`wf-lite settings` (an alias for `wf-lite browse`) opens the browse window on
-its **Settings** tab, to edit placement, opacity, and the fissure-panel
-toggle, detect your account id, and help bind the KDE hotkey — all writing
-the same `config.toml`. Restart `wf-lite overlay` to apply placement changes.
 
 ## Build
 
@@ -195,10 +94,8 @@ Only `wf-lite` needs installing — this also happens to build a few other
 crates' own standalone `[[bin]]` targets (`wf-tray`, `wf-browse`,
 `wf-settings`) into `target/release/`, but those are dev/embedding-only, not
 part of the distributed product; see [docs/development.md](docs/development.md).
-The plain build above needs `tesseract-devel`/`leptonica-devel`/`clang` for
-the OCR feature, which is on by default — see [docs/ocr.md](docs/ocr.md) for
-per-distro package names, or build with `--no-default-features --features
-mem-scan` to skip OCR entirely.
+See [docs/ocr.md](docs/ocr.md) and [docs/mem-scan.md](docs/mem-scan.md) for
+the OCR/mem-scan feature details and build requirements.
 
 ## License
 
