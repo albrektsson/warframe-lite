@@ -34,10 +34,12 @@ desktop). It reaches every subsystem (tray, overlay, browse window, mem-scan)
 by re-execing itself, not by spawning separately-installed sibling binaries —
 one file to build and install. The relic OCR features (the automatic
 reward picker, the owned-relic scanner, and the `ocr`/`ocr-file`/`relic-file`/
-`relic-scan` commands) are an **opt-in build-time feature** — see
-[docs/ocr.md](docs/ocr.md) for building with it and its runtime library
-requirements; a binary built without it runs fine, those commands just print
-a message pointing at a rebuild.
+`relic-scan` commands) are part of `wf-lite`'s **default build**
+([ADR-0017](docs/adr/0017-ocr-is-default-compiled-not-opt-in.md)) — the
+automatic reward picker is the app's main point, so a plain `cargo build
+--release` needs `tesseract-devel`/`leptonica-devel`/`clang` at build time;
+see [docs/ocr.md](docs/ocr.md) for the per-distro package names and runtime
+library requirements.
 
 **1. Build it.** No prebuilt releases are published pre-1.0 — clone and build
 from source (see [Build](#build)), then put the binary on your `PATH`:
@@ -106,7 +108,7 @@ wf-lite toggle             # show/hide a running overlay (also: show / hide)
 wf-lite copy               # copy the current best-pick reward (name + plat) to the clipboard
 wf-lite capture [out.png]  # capture the Warframe window to a PNG
 wf-lite relic [names…]     # evaluate reward names → matched item + plat
-wf-lite relic-scan         # (feature-gated: ocr) capture the reward screen, OCR the names, rank them
+wf-lite relic-scan         # capture the reward screen, OCR the names, rank them
 wf-lite detect-account     # auto-detect your account id from EE.log (verified)
 wf-lite set-account <id>   # save your account id for mastery lookup
 wf-lite mastery [id]       # report your mastered-item count
@@ -115,16 +117,19 @@ wf-lite logwatch           # follow EE.log live, print recognized events
 wf-lite mem-scan           # read live Foundry/relic/equipment state — see docs/mem-scan.md
 ```
 
-### OCR / relic-grid scanning (opt-in feature)
+### OCR / relic-grid scanning
 
 The relic OCR features — `ocr`, `ocr-file`, `relic-file`, `relic-scan`,
 `relic-grid-file`, `inventory-grid-file`, and the live overlay's automatic
-reward-picker and owned-relic/Prime-Part scanners — need the `ocr` cargo
-feature at build time. Without it, those commands print a short message
-pointing at a rebuild instead of failing to compile or erroring confusingly,
-and the overlay still runs normally otherwise. See
-[docs/ocr.md](docs/ocr.md) for the build command, required packages, and
-runtime library table.
+reward-picker and owned-relic/Prime-Part scanners — are part of `wf-lite`'s
+default build ([ADR-0017](docs/adr/0017-ocr-is-default-compiled-not-opt-in.md)).
+Building with `--no-default-features` (or `--no-default-features --features
+mem-scan`) drops the `ocr` feature instead; those commands then print a
+short message pointing at a rebuild instead of failing to compile or
+erroring confusingly, and the overlay still runs normally otherwise —
+fissures and manual reward evaluation (`wf-lite relic`) keep working, just
+without automatic detection. See [docs/ocr.md](docs/ocr.md) for the
+required build packages and runtime library table.
 
 ### mem-scan
 
@@ -190,9 +195,10 @@ Only `wf-lite` needs installing — this also happens to build a few other
 crates' own standalone `[[bin]]` targets (`wf-tray`, `wf-browse`,
 `wf-settings`) into `target/release/`, but those are dev/embedding-only, not
 part of the distributed product; see [docs/development.md](docs/development.md).
-The plain build above needs none of `tesseract-devel`/`leptonica-devel`/
-`clang` — those are only needed for the OCR feature, see
-[docs/ocr.md](docs/ocr.md).
+The plain build above needs `tesseract-devel`/`leptonica-devel`/`clang` for
+the OCR feature, which is on by default — see [docs/ocr.md](docs/ocr.md) for
+per-distro package names, or build with `--no-default-features --features
+mem-scan` to skip OCR entirely.
 
 ## License
 

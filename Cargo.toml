@@ -28,12 +28,14 @@ members = [
 # (ADR-0013) remains the sole consent gate, and `--no-default-features`
 # still excludes `mem-scan` for testing (see #58/#67).
 #
-# `wf-ocr` and `wf-gridscan` are absent for the mirror-image reason:
-# `wf-gridscan`'s whole reason to exist is OCR-driven grid scanning (it's a
-# hard dependency of `wf-ocr`), so both sit behind `wf-lite`'s `ocr` feature
-# (#71) — a bare build needs neither `libtesseract-dev`, `libleptonica-dev`,
-# nor `clang`. Both remain workspace members so `cargo build --workspace`/
-# their own tests still work standalone.
+# `wf-ocr` and `wf-gridscan` were excluded here for the mirror-image reason
+# (#71: a bare build needing neither `libtesseract-dev`, `libleptonica-dev`,
+# nor `clang`), but the relic reward picker — auto-detecting the post-mission
+# reward screen and ranking the 2-4 choices — *is* the app's main point, and
+# it's entirely OCR-driven; everything else here is secondary. ADR-0017
+# reverses #71: both are default members again, matching `ocr` joining
+# `wf-lite`'s default feature set below (mirroring ADR-0016's `mem-scan`
+# reversal).
 default-members = [
     ".",
     "crates/wf-config",
@@ -41,6 +43,8 @@ default-members = [
     "crates/wf-log",
     "crates/wf-capture",
     "crates/wf-overlay",
+    "crates/wf-ocr",
+    "crates/wf-gridscan",
     "crates/wf-relic",
     "crates/wf-cache",
     "crates/wf-settings",
@@ -104,27 +108,35 @@ path = "src/main.rs"
 # still lets tests and CI exercise both configurations (see #58/#67) — and
 # so the consent model doesn't change: per ADR-0001/ADR-0013, only running
 # `wf-lite mem-scan` itself is consent, never the build-time default.
-default = ["mem-scan"]
+default = ["mem-scan", "ocr"]
 mem-scan = ["dep:wf-mem", "dep:time"]
 # Gates OCR (in-process libtesseract/libleptonica FFI, ADR-0008) and
-# relic-grid scanning out of the default build entirely (#71, mirroring
-# `mem-scan`'s old pattern) — not in the default feature set, so a bare
-# `cargo build`/`cargo build --release` never links against tesseract/
-# leptonica and needs none of `libtesseract-dev`/`libleptonica-dev`/`clang`
-# at build time. `wf-gridscan` is folded in here too rather than left
-# half-gated: it's a hard dependency of `wf-ocr` (relic-grid scanning *is*
-# OCR), so building it without this feature would still force those system
-# deps. `wf-relic/grid-scan` enables the OCR-only slice of `wf-relic` (its
-# `regions` module — grid coordinates/slot types for the relic-grid and
-# Inventory/Sell scanners) that transitively needs `wf-gridscan`; the rest
-# of `wf-relic` (catalogue, mastery, pricing, etc.) stays available either
-# way since `wf-relic` itself remains an unconditional dependency below.
-# Every OCR-dependent CLI command (`ocr`, `ocr-file`, `relic-file`,
-# `relic-scan`, `relic-grid-file`, `inventory-grid-file`) and the live
-# overlay's reward-picker auto-detection route through `src/ocr_enabled.rs`
-# when this feature is on, or `src/ocr_disabled.rs`'s friendly
-# "rebuild with `--features ocr`" stand-in otherwise (see `src/main.rs`'s
-# `mod ocr;`).
+# relic-grid scanning. #71 made this opt-in (mirroring `mem-scan`'s old
+# pattern), but the automatic relic reward picker — the app's main point,
+# per CONTEXT.md — is entirely OCR-driven: a bare build without this feature
+# silently ships an app that can't do the one thing it exists for. ADR-0017
+# reverses #71 and puts `ocr` back in the default feature set, so a bare
+# `cargo build`/`cargo build --release` links tesseract/leptonica and needs
+# `libtesseract-dev`/`libleptonica-dev`/`clang` at build time (see
+# `docs/ocr.md` for the per-distro package names) plus the shared libraries
+# at runtime. The flag itself is kept (not folded away) so
+# `--no-default-features`/`--no-default-features --features mem-scan` can
+# still build/test without it, same rationale as `mem-scan` above.
+# `wf-gridscan` is folded in here too rather than left half-gated: it's a
+# hard dependency of `wf-ocr` (relic-grid scanning *is* OCR), so building it
+# without this feature would still force those system deps. `wf-relic/grid-
+# scan` enables the OCR-only slice of `wf-relic` (its `regions` module —
+# grid coordinates/slot types for the relic-grid and Inventory/Sell
+# scanners) that transitively needs `wf-gridscan`; the rest of `wf-relic`
+# (catalogue, mastery, pricing, etc.) stays available either way since
+# `wf-relic` itself remains an unconditional dependency below. Every OCR-
+# dependent CLI command (`ocr`, `ocr-file`, `relic-file`, `relic-scan`,
+# `relic-grid-file`, `inventory-grid-file`) and the live overlay's reward-
+# picker auto-detection route through `src/ocr_enabled.rs` when this feature
+# is on, or `src/ocr_disabled.rs`'s friendly "rebuild without
+# `--no-default-features`" stand-in otherwise (see `src/main.rs`'s
+# `mod ocr;`) — that stand-in now only matters for `--no-default-features`
+# builds.
 ocr = ["dep:wf-ocr", "dep:wf-gridscan", "wf-relic/grid-scan"]
 
 [dependencies]

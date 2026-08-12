@@ -5,11 +5,10 @@
 //!
 //! It drives the real `wf-lite relic-grid-file` command rather than reaching
 //! into the binary's internals, and **self-skips** when the environment can't
-//! run OCR — the binary wasn't built with `--features ocr` (#71; a bare
-//! `cargo test`/`cargo test --workspace` doesn't enable it, mirroring
-//! `mem-scan`'s opt-in pattern), or there's no cached relic catalogue (a
-//! fresh CI box has neither) — so the suite stays green there. Run it
-//! locally with `cargo test --features ocr` and a populated
+//! run OCR — the binary was built with `--no-default-features` (dropping the
+//! `ocr` feature, on by default since ADR-0017), or there's no cached relic
+//! catalogue (a fresh CI box has neither) — so the suite stays green there.
+//! Run it locally with a default `cargo test` and a populated
 //! `~/.cache/warframe-lite/`.
 
 use std::path::PathBuf;
@@ -23,13 +22,14 @@ use std::process::Command;
 const EXPECTED_NATIVE: &[&str] =
     &["Meso P13", "Meso V12", "Meso V15", "Neo D5", "Axi C6", "Axi G5", "Axi L6", "Axi N10"];
 
-/// Whether this test binary was compiled with OCR (`--features ocr`) at all —
-/// without it, `relic-grid-file` is the `ocr_disabled.rs` stand-in (see
-/// `src/main.rs`'s `mod ocr;`) and can't produce a real scan result. Pre-#71
-/// this checked for a `tesseract` CLI binary on `PATH`; ADR-0008 switched
-/// `wf-ocr` to in-process FFI linking against `libtesseract`/`libleptonica`,
-/// so there's no CLI invocation (or `WF_TESSERACT` override) to probe
-/// anymore — whether OCR exists in this build is a compile-time fact.
+/// Whether this test binary was compiled with OCR (the `ocr` feature, on by
+/// default per ADR-0017) at all — without it, `relic-grid-file` is the
+/// `ocr_disabled.rs` stand-in (see `src/main.rs`'s `mod ocr;`) and can't
+/// produce a real scan result. Pre-#71 this checked for a `tesseract` CLI
+/// binary on `PATH`; ADR-0008 switched `wf-ocr` to in-process FFI linking
+/// against `libtesseract`/`libleptonica`, so there's no CLI invocation (or
+/// `WF_TESSERACT` override) to probe anymore — whether OCR exists in this
+/// build is a compile-time fact.
 fn ocr_available() -> bool {
     cfg!(feature = "ocr")
 }
@@ -47,7 +47,7 @@ fn fixture(name: &str) -> PathBuf {
 #[test]
 fn native_resolution_grid_resolves_most_known_relics() {
     if !ocr_available() || !catalogue_cached() {
-        eprintln!("skipping: OCR not compiled in (rebuild with --features ocr) or cached catalogue unavailable");
+        eprintln!("skipping: OCR not compiled in (built with --no-default-features) or cached catalogue unavailable");
         return;
     }
     let path = fixture("Screenshot_20260731_114749.png");

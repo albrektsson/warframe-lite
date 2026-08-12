@@ -168,9 +168,9 @@ game**. Summary of what shipped:
   launcher entry.
 - **Distribution.** The overlay is a single self-contained binary (no external
   link-time deps: libwayland is dlopen'd, x11rb is pure Rust, rustls uses `ring`);
-  OCR (opt-in) links `libtesseract`/`libleptonica` in-process rather than
-  shelling out to a CLI (ADR-0008). musl-static is unsuitable (the overlay
-  dlopens libwayland). No packaged/prebuilt releases (GitHub Releases,
+  OCR (default-compiled, ADR-0017) links `libtesseract`/`libleptonica`
+  in-process rather than shelling out to a CLI (ADR-0008). musl-static is
+  unsuitable (the overlay dlopens libwayland). No packaged/prebuilt releases (GitHub Releases,
   Fedora/COPR) are published pre-1.0 — build from source; packaging is
   deferred until after 1.0.
 

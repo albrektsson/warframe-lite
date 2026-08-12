@@ -1,17 +1,19 @@
 //! Stand-in for `ocr_enabled.rs` when the `ocr` cargo feature is **not**
-//! compiled in (see the root `Cargo.toml`'s `ocr` feature and README.md).
-//! `main.rs` picks between the two via `#[cfg]`/`#[path]` on the `mod ocr;`
-//! declaration, so every OCR-dependent CLI command and the live overlay's
-//! reward-picker auto-detection route through this same public surface
-//! either way — this variant just explains, clearly, why nothing happened,
-//! instead of failing to compile or silently doing nothing.
+//! compiled in — on by default since ADR-0017, so this only applies to a
+//! `--no-default-features` build (see the root `Cargo.toml`'s `ocr` feature
+//! and README.md). `main.rs` picks between the two via `#[cfg]`/`#[path]` on
+//! the `mod ocr;` declaration, so every OCR-dependent CLI command and the
+//! live overlay's reward-picker auto-detection route through this same
+//! public surface either way — this variant just explains, clearly, why
+//! nothing happened, instead of failing to compile or silently doing
+//! nothing.
 
 use anyhow::Result;
 use wf_config::Config;
 
 use crate::{RelicScanStatus, RewardState};
 
-const MSG: &str = "OCR isn't compiled into this build — rebuild with `--features ocr` (see README.md).";
+const MSG: &str = "OCR isn't compiled into this build — rebuild without `--no-default-features` (see README.md).";
 
 /// Stand-in for the real `PrewarmCtx` — never constructed, since
 /// [`start_relic_watch`] always returns `None` in this build.
