@@ -168,8 +168,10 @@ pub fn run() -> eframe::Result<()> {
     // to edit and save, same as the standalone `wf-settings` crate does —
     // cloned here *before* `config` is moved into `load_and_poll`, so a
     // change made on that tab doesn't retroactively affect the background
-    // loader/poller's own copy (consistent with `wf-settings`' existing
-    // "restart to apply placement changes" convention; not hot-propagated).
+    // loader/poller's own copy (that copy only drives fissure-refresh
+    // polling, so this doesn't affect the settings tab's own anchor/margin/
+    // opacity/fissures fields live-applying to a running overlay — see
+    // `settings_tab`'s docs).
     let settings_config = config.clone();
     rt.spawn(load_and_poll(loaded.clone(), config, relic_prices.clone(), set_prices.clone()));
 
@@ -2147,11 +2149,17 @@ impl BrowseApp {
     /// options to earn a dedicated destination, so this is now called from
     /// there rather than matched on directly. A change here doesn't
     /// retroactively affect the background loader/poller's own `Config`
-    /// snapshot (see `run`'s docs) — same "restart to apply placement
-    /// changes" convention `wf-settings` already documented.
+    /// snapshot (see `run`'s docs) — that copy only drives fissure polling,
+    /// unaffected by placement/opacity/fissure-panel settings either way.
+    /// The anchor/margin/opacity/fissures fields below live-apply to a
+    /// running `wf-lite overlay` on commit (drag-release/slider-release/
+    /// dropdown selection) via [`Self::commit_overlay_settings`] — see
+    /// wayfinder map #82.
     fn settings_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading("Settings");
         ui.add_space(8.0);
+
+        let mut commit = false;
 
         egui::Grid::new("browse_settings_placement")
             .num_columns(2)
@@ -2162,27 +2170,44 @@ impl BrowseApp {
                     .selected_text(&self.config.overlay.anchor)
                     .show_ui(ui, |ui| {
                         for a in ANCHORS {
-                            ui.selectable_value(&mut self.config.overlay.anchor, (*a).to_string(), *a);
+                            if ui
+                                .selectable_value(&mut self.config.overlay.anchor, (*a).to_string(), *a)
+                                .changed()
+                            {
+                                commit = true;
+                            }
                         }
                     });
                 ui.end_row();
 
                 ui.label("Margin X");
-                ui.add(egui::DragValue::new(&mut self.config.overlay.margin_x).range(0..=2000));
+                let r = ui.add(egui::DragValue::new(&mut self.config.overlay.margin_x).range(0..=2000));
+                commit |= r.drag_stopped() || r.lost_focus();
                 ui.end_row();
 
                 ui.label("Margin Y");
-                ui.add(egui::DragValue::new(&mut self.config.overlay.margin_y).range(0..=2000));
+                let r = ui.add(egui::DragValue::new(&mut self.config.overlay.margin_y).range(0..=2000));
+                commit |= r.drag_stopped() || r.lost_focus();
                 ui.end_row();
 
                 ui.label("Opacity");
-                ui.add(egui::Slider::new(&mut self.config.overlay.opacity, 0.1..=1.0));
+                let r = ui.add(egui::Slider::new(&mut self.config.overlay.opacity, 0.1..=1.0));
+                commit |= r.drag_stopped() || r.lost_focus();
                 ui.end_row();
 
                 ui.label("Fissure panel");
-                ui.checkbox(&mut self.config.overlay.fissures, "show (off = reward picker only)");
+                if ui
+                    .checkbox(&mut self.config.overlay.fissures, "show (off = reward picker only)")
+                    .changed()
+                {
+                    commit = true;
+                }
                 ui.end_row();
             });
+
+        if commit {
+            self.commit_overlay_settings();
+        }
 
         ui.add_space(10.0);
         ui.separator();
@@ -2226,24 +2251,38 @@ impl BrowseApp {
             }
             ui.label(egui::RichText::new(&self.settings_status).weak());
         });
-        ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new("Restart `wf-lite overlay` to apply placement changes.")
-                .small()
-                .weak(),
-        );
     }
 
-    /// Save `self.config` (including the account id text buffer) to
-    /// `self.config_path` — ported from `wf-settings`' `SettingsApp::save`.
+    /// Persist the account id text buffer into `self.config`, then delegate
+    /// to [`Self::commit_overlay_settings`] for the save + live-apply push —
+    /// so a bare "Save" click and a placement/opacity/fissures commit both
+    /// go through the same path.
     fn save_settings(&mut self) {
         self.config.account_id = if self.account_id.trim().is_empty() {
             None
         } else {
             Some(self.account_id.trim().to_string())
         };
+        self.commit_overlay_settings();
+    }
+
+    /// Persist `self.config` to `self.config_path`, then push its
+    /// anchor/margin/opacity/fissures fields to a running `wf-lite overlay`
+    /// over the control socket (see `wf_config::control`) — live-apply and
+    /// save are the same action here (wayfinder map #82), so every commit
+    /// that touches those fields does both. The push is best-effort: no
+    /// overlay running just leaves a status line saying so, it doesn't fail
+    /// the save.
+    fn commit_overlay_settings(&mut self) {
         match self.config.save(&self.config_path) {
-            Ok(()) => self.settings_status = format!("Saved to {}", self.config_path.display()),
+            Ok(()) => {
+                let live = wf_config::control::LiveOverlaySettings::from(&self.config.overlay);
+                let cmd = wf_config::control::format_apply_settings(&live);
+                match wf_config::control::send_command(&cmd) {
+                    Ok(()) => self.settings_status = "Saved & applied".to_string(),
+                    Err(e) => self.settings_status = format!("Saved (not applied: {e:#})"),
+                }
+            }
             Err(e) => self.settings_status = format!("Save failed: {e:#}"),
         }
     }

@@ -1346,10 +1346,13 @@ async fn run_overlay(config: Config) -> Result<()> {
     let relic_scan_status: RelicScanStatus = Arc::new(Mutex::new(None));
 
     // Appearance/visibility knobs. `visible` is flipped at runtime by the control
-    // socket (see `overlay_control`); `show_fissures` and `opacity` come from config.
+    // socket (see `overlay_control`); `live` holds the anchor/margin/opacity/
+    // fissures fields, also runtime-updatable via the control socket's
+    // `apply-settings` command (see `spawn_control_listener`) so a settings UI
+    // can push placement/appearance changes to a running overlay without a
+    // restart.
     let visible = Arc::new(AtomicBool::new(true));
-    let show_fissures = config.overlay.fissures;
-    let opacity = config.overlay.opacity;
+    let live = Arc::new(Mutex::new(wf_config::control::LiveOverlaySettings::from(&config.overlay)));
 
     // Build one overlay frame from the current state, honoring reward-only mode,
     // the visibility toggle, and opacity. A hidden or empty frame is a fully
@@ -1363,7 +1366,12 @@ async fn run_overlay(config: Config) -> Result<()> {
         let font = font.clone();
         let reward = reward.clone();
         let relic_scan_status = relic_scan_status.clone();
+        let live = live.clone();
         move |ws: &worldstate::WorldState, shown: bool| -> wf_overlay::Canvas {
+            let (show_fissures, opacity) = {
+                let live = live.lock().unwrap();
+                (live.fissures, live.opacity)
+            };
             let blank = || wf_overlay::Canvas::new(OVERLAY_W, OVERLAY_H);
             let mut c = if !shown {
                 blank()
@@ -1383,11 +1391,12 @@ async fn run_overlay(config: Config) -> Result<()> {
 
     println!("\n== Live overlay (Ctrl-C to stop) ==");
     println!(
-        "  placement: {} (margin {}x{}); fissure panel: {}; opacity: {opacity}",
+        "  placement: {} (margin {}x{}); fissure panel: {}; opacity: {}",
         config.overlay.anchor,
         config.overlay.margin_x,
         config.overlay.margin_y,
-        if show_fissures { "on" } else { "reward-only" },
+        if config.overlay.fissures { "on" } else { "reward-only" },
+        config.overlay.opacity,
     );
     // A failed initial fetch (warframestat.us down/erroring right at launch —
     // see issue #40) must never take the overlay down with it: start with an
@@ -1406,11 +1415,14 @@ async fn run_overlay(config: Config) -> Result<()> {
     let initial = make_frame(&ws, visible.load(Ordering::Relaxed));
 
     let (tx, rx) = mpsc::channel();
+    let (placement_tx, placement_rx) = mpsc::channel();
 
-    // Control socket: `wf-lite toggle|show|hide` flips `visible` at runtime, and
-    // `copy` copies the current best-pick reward, so a KDE global shortcut bound
-    // to those commands can act on a running overlay on demand.
-    spawn_control_listener(visible.clone(), reward.clone());
+    // Control socket: `wf-lite toggle|show|hide` flips `visible` at runtime,
+    // `copy` copies the current best-pick reward, and `apply-settings` (from a
+    // settings UI) updates `live` and re-anchors the layer surface via
+    // `placement_tx` — so a KDE global shortcut or a running settings tab can
+    // both act on a running overlay on demand, no restart needed.
+    spawn_control_listener(visible.clone(), reward.clone(), live.clone(), placement_tx);
 
     // Relic auto-detection: needs tesseract, an EE.log, and the item catalogue.
     // Delegates to the `ocr` module — the real implementation when the `ocr`
@@ -1492,28 +1504,28 @@ async fn run_overlay(config: Config) -> Result<()> {
 
     // The Wayland event loop is blocking and uses non-Send types; run it on a
     // dedicated blocking thread.
-    tokio::task::spawn_blocking(move || wf_overlay::layer::run(initial, rx, placement, window))
-        .await
-        .context("overlay thread panicked")?
+    tokio::task::spawn_blocking(move || {
+        wf_overlay::layer::run(initial, rx, placement, placement_rx, window)
+    })
+    .await
+    .context("overlay thread panicked")?
 }
 
-/// Filesystem path of the overlay's control socket. Placed in the per-user
-/// runtime dir when available, falling back to the temp dir.
-fn control_socket_path() -> std::path::PathBuf {
-    let dir = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    dir.join("warframe-lite-overlay.sock")
-}
-
-/// Listen on the control socket for `toggle` / `show` / `hide` / `copy` lines
-/// and act on the shared `visible` flag / `reward` state. A stale socket file
-/// from a previous run is removed first. Runs for the life of the overlay.
-fn spawn_control_listener(visible: std::sync::Arc<std::sync::atomic::AtomicBool>, reward: RewardState) {
+/// Listen on the control socket for `toggle` / `show` / `hide` / `copy` /
+/// `apply-settings ...` lines and act on the shared `visible` flag / `reward`
+/// state / `live` settings (re-anchoring the layer surface live via
+/// `placement_tx` for `apply-settings`). A stale socket file from a previous
+/// run is removed first. Runs for the life of the overlay.
+fn spawn_control_listener(
+    visible: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    reward: RewardState,
+    live: std::sync::Arc<std::sync::Mutex<wf_config::control::LiveOverlaySettings>>,
+    placement_tx: std::sync::mpsc::Sender<wf_overlay::layer::Placement>,
+) {
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncReadExt;
 
-    let path = control_socket_path();
+    let path = wf_config::control::socket_path();
     let _ = std::fs::remove_file(&path);
     let listener = match tokio::net::UnixListener::bind(&path) {
         Ok(l) => l,
@@ -1540,6 +1552,28 @@ fn spawn_control_listener(visible: std::sync::Arc<std::sync::atomic::AtomicBool>
                 "show" => visible.store(true, Ordering::Relaxed),
                 "hide" => visible.store(false, Ordering::Relaxed),
                 "copy" => copy_best_reward(&reward),
+                other if other.starts_with(wf_config::control::APPLY_SETTINGS_CMD) => {
+                    match wf_config::control::parse_apply_settings(other) {
+                        Some(p) => {
+                            {
+                                let mut live = live.lock().unwrap();
+                                live.anchor = p.anchor.clone();
+                                live.margin_x = p.margin_x;
+                                live.margin_y = p.margin_y;
+                                live.opacity = p.opacity;
+                                live.fissures = p.fissures;
+                            }
+                            let placement = wf_overlay::layer::Placement::parse(
+                                &p.anchor,
+                                p.margin_x,
+                                p.margin_y,
+                            );
+                            let _ = placement_tx.send(placement);
+                            tracing::info!("applied live overlay settings: {p:?}");
+                        }
+                        None => tracing::warn!("malformed apply-settings command: {other:?}"),
+                    }
+                }
                 other => tracing::warn!("unknown overlay control command {other:?}"),
             }
         }
@@ -1606,24 +1640,9 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
 
 /// Client side of the control socket: send a single command to a running overlay.
 fn overlay_control(cmd: &str) -> Result<()> {
-    use std::io::Write;
-
-    let path = control_socket_path();
-    match std::os::unix::net::UnixStream::connect(&path) {
-        Ok(mut stream) => {
-            stream
-                .write_all(cmd.as_bytes())
-                .with_context(|| format!("sending {cmd:?} to overlay"))?;
-            println!("sent '{cmd}' to the overlay");
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound
-            || e.kind() == std::io::ErrorKind::ConnectionRefused =>
-        {
-            anyhow::bail!("no overlay is running (control socket {} absent)", path.display())
-        }
-        Err(e) => Err(e).with_context(|| format!("connecting to overlay at {}", path.display())),
-    }
+    wf_config::control::send_command(cmd)?;
+    println!("sent '{cmd}' to the overlay");
+    Ok(())
 }
 
 /// Poll for the Warframe window up to `timeout`, returning its root-space

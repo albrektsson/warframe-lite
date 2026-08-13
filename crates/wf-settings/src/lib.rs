@@ -2,10 +2,14 @@
 //!
 //! Edits the same `~/.config/warframe-lite/config.toml` the overlay reads:
 //! placement (anchor + margins), opacity, and whether the world-state panel
-//! shows. It also helps bind the show/hide hotkey — on Wayland the click-through
-//! overlay can't grab a global key itself, so toggling goes through
-//! `wf-lite toggle`, which the user binds as a KDE custom shortcut; this window
-//! surfaces that command and can open KDE's shortcut settings.
+//! shows. Committing a change to any of those (drag-release/slider-release/
+//! dropdown selection, or "Save") both writes the file and pushes it to a
+//! running `wf-lite overlay` over its control socket (`wf_config::control`),
+//! so no restart is needed — see wayfinder map #82. It also helps bind the
+//! show/hide hotkey — on Wayland the click-through overlay can't grab a
+//! global key itself, so toggling goes through `wf-lite toggle`, which the
+//! user binds as a KDE custom shortcut; this window surfaces that command
+//! and can open KDE's shortcut settings.
 //!
 //! [`run`] is the entry point both the standalone `wf-settings` binary (kept
 //! for dev/embedding) and the merged `wf-lite` binary call — `wf-lite`'s
@@ -76,9 +80,24 @@ impl SettingsApp {
         } else {
             Some(self.account_id.trim().to_string())
         };
+        self.commit_overlay_settings();
+    }
+
+    /// Persist `self.config` to `self.config_path`, then push its
+    /// anchor/margin/opacity/fissures fields to a running `wf-lite overlay`
+    /// over the control socket (see `wf_config::control`) — live-apply and
+    /// save are the same action here (wayfinder map #82). Best-effort on the
+    /// push: no overlay running just leaves a status line saying so, it
+    /// doesn't fail the save.
+    fn commit_overlay_settings(&mut self) {
         match self.config.save(&self.config_path) {
             Ok(()) => {
-                self.status = format!("Saved to {}", self.config_path.display());
+                let live = wf_config::control::LiveOverlaySettings::from(&self.config.overlay);
+                let cmd = wf_config::control::format_apply_settings(&live);
+                match wf_config::control::send_command(&cmd) {
+                    Ok(()) => self.status = "Saved & applied".to_string(),
+                    Err(e) => self.status = format!("Saved (not applied: {e:#})"),
+                }
             }
             Err(e) => self.status = format!("Save failed: {e:#}"),
         }
@@ -119,6 +138,8 @@ impl eframe::App for SettingsApp {
             ui.heading("warframe-lite settings");
             ui.add_space(8.0);
 
+            let mut commit = false;
+
             egui::Grid::new("placement")
                 .num_columns(2)
                 .spacing([12.0, 8.0])
@@ -128,34 +149,51 @@ impl eframe::App for SettingsApp {
                         .selected_text(&self.config.overlay.anchor)
                         .show_ui(ui, |ui| {
                             for a in ANCHORS {
-                                ui.selectable_value(
-                                    &mut self.config.overlay.anchor,
-                                    (*a).to_string(),
-                                    *a,
-                                );
+                                if ui
+                                    .selectable_value(
+                                        &mut self.config.overlay.anchor,
+                                        (*a).to_string(),
+                                        *a,
+                                    )
+                                    .changed()
+                                {
+                                    commit = true;
+                                }
                             }
                         });
                     ui.end_row();
 
                     ui.label("Margin X");
-                    ui.add(egui::DragValue::new(&mut self.config.overlay.margin_x).range(0..=2000));
+                    let r = ui.add(egui::DragValue::new(&mut self.config.overlay.margin_x).range(0..=2000));
+                    commit |= r.drag_stopped() || r.lost_focus();
                     ui.end_row();
 
                     ui.label("Margin Y");
-                    ui.add(egui::DragValue::new(&mut self.config.overlay.margin_y).range(0..=2000));
+                    let r = ui.add(egui::DragValue::new(&mut self.config.overlay.margin_y).range(0..=2000));
+                    commit |= r.drag_stopped() || r.lost_focus();
                     ui.end_row();
 
                     ui.label("Opacity");
-                    ui.add(egui::Slider::new(&mut self.config.overlay.opacity, 0.1..=1.0));
+                    let r = ui.add(egui::Slider::new(&mut self.config.overlay.opacity, 0.1..=1.0));
+                    commit |= r.drag_stopped() || r.lost_focus();
                     ui.end_row();
 
                     ui.label("Fissure panel");
-                    ui.checkbox(
-                        &mut self.config.overlay.fissures,
-                        "show (off = reward picker only)",
-                    );
+                    if ui
+                        .checkbox(
+                            &mut self.config.overlay.fissures,
+                            "show (off = reward picker only)",
+                        )
+                        .changed()
+                    {
+                        commit = true;
+                    }
                     ui.end_row();
                 });
+
+            if commit {
+                self.commit_overlay_settings();
+            }
 
             ui.add_space(10.0);
             ui.separator();
@@ -199,12 +237,6 @@ impl eframe::App for SettingsApp {
                 }
                 ui.label(egui::RichText::new(&self.status).weak());
             });
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("Restart `wf-lite overlay` to apply placement changes.")
-                    .small()
-                    .weak(),
-            );
         });
     }
 }

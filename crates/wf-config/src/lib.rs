@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+pub mod control;
+
 /// Warframe's Steam app id. The Proton compatibility prefix lives under
 /// `steamapps/compatdata/<APPID>/`.
 pub const WARFRAME_APPID: &str = "230410";

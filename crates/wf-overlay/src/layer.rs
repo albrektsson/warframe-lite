@@ -89,10 +89,17 @@ impl Placement {
 /// and its edges are folded into the anchor margins so the panel hugs the game
 /// window's corner even when the game is borderless-windowed rather than
 /// fullscreen. `None` lets the compositor choose the output and uses plain insets.
+///
+/// Every [`Placement`] received on `placement_rx` thereafter re-anchors the
+/// already-committed layer surface in place — `set_anchor`/`set_margin`/
+/// `set_size` again, then another `commit()` — with no teardown or
+/// reconnection, so a settings UI can drive placement live (see
+/// [`State::apply_placement`]).
 pub fn run(
     initial: Canvas,
     rx: Receiver<Canvas>,
     placement: Placement,
+    placement_rx: Receiver<Placement>,
     window: Option<(i32, i32, u32, u32)>,
 ) -> Result<()> {
     let conn = Connection::connect_to_env().context("connecting to Wayland ($WAYLAND_DISPLAY)")?;
@@ -117,6 +124,9 @@ pub fn run(
         height,
         canvas: initial,
         rx,
+        placement_rx,
+        window,
+        chosen_geom: None,
         configured: false,
         closed: false,
     };
@@ -135,6 +145,7 @@ pub fn run(
     if chosen.is_some() {
         tracing::info!("overlay placed on the monitor containing {centre:?}");
     }
+    state.chosen_geom = chosen_geom;
 
     let (top, right, bottom, left) = edge_margins(placement, window, chosen_geom);
 
@@ -166,7 +177,7 @@ pub fn run(
         .insert(event_loop.handle())
         .map_err(|e| anyhow::anyhow!("inserting Wayland source: {e}"))?;
 
-    // Redraw timer: drain pending frames and repaint.
+    // Redraw timer: drain pending frames/placement updates and repaint/reposition.
     event_loop
         .handle()
         .insert_source(Timer::from_duration(Duration::from_millis(250)), |_, _, state| {
@@ -179,6 +190,13 @@ pub fn run(
                 if state.configured {
                     state.draw();
                 }
+            }
+            let mut latest_placement = None;
+            while let Ok(p) = state.placement_rx.try_recv() {
+                latest_placement = Some(p);
+            }
+            if let Some(p) = latest_placement {
+                state.apply_placement(p);
             }
             TimeoutAction::ToDuration(Duration::from_millis(250))
         })
@@ -207,6 +225,15 @@ struct State {
     height: u32,
     canvas: Canvas,
     rx: Receiver<Canvas>,
+    /// New [`Placement`]s pushed live by a settings UI (see [`run`]'s docs).
+    placement_rx: Receiver<Placement>,
+    /// The game window's rectangle, captured once at startup — reused by
+    /// [`Self::apply_placement`] to recompute margins the same way [`run`]'s
+    /// initial setup does.
+    window: Option<(i32, i32, u32, u32)>,
+    /// The chosen output's logical geometry, captured once at startup — see
+    /// `window`'s docs.
+    chosen_geom: Option<((i32, i32), (i32, i32))>,
     configured: bool,
     closed: bool,
 }
@@ -242,6 +269,22 @@ impl State {
         }
         surface.damage_buffer(0, 0, self.width as i32, self.height as i32);
         surface.commit();
+    }
+
+    /// Re-anchor the already-committed layer surface to a new [`Placement`]
+    /// pushed live over the control socket — no teardown, just
+    /// `set_anchor`/`set_margin`/`set_size` again and a fresh `commit()`
+    /// (see [`run`]'s docs).
+    fn apply_placement(&mut self, placement: Placement) {
+        let Some(layer) = &self.layer else {
+            return;
+        };
+        let (top, right, bottom, left) = edge_margins(placement, self.window, self.chosen_geom);
+        layer.set_anchor(placement.anchor);
+        layer.set_size(self.width, self.height);
+        layer.set_margin(top, right, bottom, left);
+        layer.commit();
+        tracing::info!("overlay placement updated live");
     }
 }
 
