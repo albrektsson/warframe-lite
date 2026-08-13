@@ -79,21 +79,127 @@ const NO_OWNED_PARTS_MSG: &str = "no owned Prime Part data yet. Run `wf-lite ove
      and open the in-game Inventory/Sell screen once — it scans automatically as you scroll.";
 /// Relic tiers offered by the tier-filter checkboxes, in drop order.
 const TIERS: [&str; 5] = ["Lith", "Meso", "Neo", "Axi", "Requiem"];
-/// Placement anchors offered by the Settings section's anchor combobox — ported
-/// from the standalone `wf-settings` crate (#72: its UI folded into this
-/// crate's tab bar; `wf-settings` keeps its own copy for its own standalone
-/// dev/embedding build).
-const ANCHORS: &[&str] = &[
-    "top-left",
-    "top-right",
-    "bottom-left",
-    "bottom-right",
-    "top",
-    "bottom",
-    "left",
-    "right",
-    "center",
-];
+/// Below this distance from an axis's center, the drag-to-place box is
+/// locked exactly centered on that axis — see [`BrowseApp::drag_to_place`].
+/// Widened from the `/prototype`-validated 10px after live-testing the real
+/// widget: the anchor *label* (and thus which anchor the box will commit
+/// to) flips as soon as a drag crosses this radius, well before the
+/// rendered box has visually moved far from center — a 10px radius made
+/// that flip feel like an immediate jump to a corner anchor even though the
+/// pixel position itself stayed continuous. 20px gives a comfort zone that
+/// actually matches normal mouse precision.
+const PLACE_LOCK_RADIUS: f32 = 20.0;
+/// Beyond this distance, the box tracks the cursor exactly on that axis.
+/// Between [`PLACE_LOCK_RADIUS`] and this, it blends linearly between the
+/// two, with endpoints chosen to exactly match both neighbors — giving
+/// zero-jump continuity across the whole drag (settled via `/prototype` on
+/// issue #85; see `crates/wf-browse/examples/drag_to_place_prototype.rs`
+/// on the `prototype/drag-to-place-85` branch for the rejected
+/// alternatives and why). Widened alongside `PLACE_LOCK_RADIUS` — see its
+/// docs.
+const PLACE_CAPTURE_RADIUS: f32 = 90.0;
+/// Size of the mock overlay-panel rectangle in [`BrowseApp::drag_to_place`].
+const PLACE_BOX_SIZE: egui::Vec2 = egui::Vec2::new(110.0, 66.0);
+
+/// Which screen edge(s) an anchor string pins to: `(left, right, top,
+/// bottom)`. An axis with neither flag set centers on that axis — the only
+/// state [`magnetic_axis`] can't just track the cursor for.
+fn edges_for(anchor: &str) -> (bool, bool, bool, bool) {
+    match anchor {
+        "top-left" => (true, false, true, false),
+        "top-right" => (false, true, true, false),
+        "bottom-left" => (true, false, false, true),
+        "bottom-right" => (false, true, false, true),
+        "top" => (false, false, true, false),
+        "bottom" => (false, false, false, true),
+        "left" => (true, false, false, false),
+        "right" => (false, true, false, false),
+        _ => (false, false, false, false), // center
+    }
+}
+
+/// One axis's pin state: which screen edge (if any) the drag-to-place box
+/// is currently flush against on that axis.
+#[derive(Clone, Copy, PartialEq)]
+enum AxisPin {
+    Neg, // left/top edge
+    Pos, // right/bottom edge
+    Centered,
+}
+
+/// Where the drag-to-place box's top-left corner sits on one axis, and
+/// which state that implies, purely as a function of the raw dragged
+/// corner position on that axis. A pinned edge's margin is an exact
+/// inverse of the drag position, so it always renders at literally the raw
+/// cursor position — nothing to correct, ever. The only state that can't
+/// just track the cursor is "centered" (the real overlay's un-pinned axis
+/// forces to a fixed value, independent of where it was dragged), so a
+/// magnetic well around each axis's center blends linearly between raw
+/// tracking and the locked-center value, with matching endpoints — this is
+/// what removes the jump earlier drag-to-place rounds had.
+fn magnetic_axis(raw: f32, screen_lo: f32, screen_hi: f32, box_dim: f32) -> (f32, AxisPin) {
+    let raw = raw.clamp(screen_lo, screen_hi - box_dim);
+    let center = screen_lo + (screen_hi - screen_lo - box_dim) / 2.0;
+    let d = raw - center;
+    let ad = d.abs();
+
+    let value = if ad <= PLACE_LOCK_RADIUS {
+        center
+    } else if ad < PLACE_CAPTURE_RADIUS {
+        let t = (ad - PLACE_LOCK_RADIUS) / (PLACE_CAPTURE_RADIUS - PLACE_LOCK_RADIUS);
+        center + d * t
+    } else {
+        raw
+    };
+
+    let pin = if ad <= PLACE_LOCK_RADIUS {
+        AxisPin::Centered
+    } else if d < 0.0 {
+        AxisPin::Neg
+    } else {
+        AxisPin::Pos
+    };
+
+    (value, pin)
+}
+
+/// Combine independent x/y pin states into one of the 9 anchor strings
+/// `wf_overlay::layer::Placement::parse` understands.
+fn anchor_for(x_pin: AxisPin, y_pin: AxisPin) -> &'static str {
+    use AxisPin::*;
+    match (x_pin, y_pin) {
+        (Neg, Neg) => "top-left",
+        (Pos, Neg) => "top-right",
+        (Neg, Pos) => "bottom-left",
+        (Pos, Pos) => "bottom-right",
+        (Centered, Neg) => "top",
+        (Centered, Pos) => "bottom",
+        (Neg, Centered) => "left",
+        (Pos, Centered) => "right",
+        (Centered, Centered) => "center",
+    }
+}
+
+/// Top-left corner of a `size`-sized box anchored+margined on `screen`,
+/// matching `wf_overlay::layer`'s own anchor semantics.
+fn place_box(screen: egui::Rect, size: egui::Vec2, anchor: &str, margin_x: f32, margin_y: f32) -> egui::Pos2 {
+    let (left, right, top, bottom) = edges_for(anchor);
+    let x = if left {
+        screen.left() + margin_x
+    } else if right {
+        screen.right() - margin_x - size.x
+    } else {
+        screen.left() + (screen.width() - size.x) / 2.0
+    };
+    let y = if top {
+        screen.top() + margin_y
+    } else if bottom {
+        screen.bottom() - margin_y - size.y
+    } else {
+        screen.top() + (screen.height() - size.y) / 2.0
+    };
+    egui::pos2(x, y)
+}
 
 /// Accent color for selection/hover/active widget state — a muted teal,
 /// distinct from both egui's default blue and Warframe's own UI palette.
@@ -1057,6 +1163,21 @@ struct BrowseApp {
     /// error propagates via its own `Display` verbatim (e.g. the exact
     /// `sudo setcap cap_sys_ptrace=+ep <path>` hint), never reworded here.
     scan_status: Arc<Mutex<Option<Result<String, String>>>>,
+    /// Whether the last `demo-on` we sent actually landed (see
+    /// [`Self::sync_demo_mode`]) — drives the Home tab's drag-to-place
+    /// preview into showing curated content on a running overlay.
+    demo_active: bool,
+    /// Set once we've fired an auto-launch attempt for the current "trying
+    /// to reach demo mode" stretch, so a still-starting overlay's control
+    /// socket not existing yet doesn't spawn a second overlay process on
+    /// every retry — see [`Self::sync_demo_mode`].
+    overlay_launch_tried: bool,
+    /// Whether [`Self::drag_to_place`]'s mock overlay box is currently
+    /// being dragged.
+    dragging_placement: bool,
+    /// Cursor position minus the dragged box's top-left corner, captured on
+    /// drag start — see [`Self::drag_to_place`].
+    drag_offset: egui::Vec2,
 }
 
 impl BrowseApp {
@@ -1103,6 +1224,10 @@ impl BrowseApp {
             settings_status: String::new(),
             scanning: false,
             scan_status: Arc::new(Mutex::new(None)),
+            demo_active: false,
+            overlay_launch_tried: false,
+            dragging_placement: false,
+            drag_offset: egui::Vec2::ZERO,
         }
     }
 
@@ -2161,35 +2286,16 @@ impl BrowseApp {
 
         let mut commit = false;
 
+        ui.label("Overlay placement — drag the panel; it tracks the cursor except near the \
+                   middle of each axis, where it eases into being centered.");
+        ui.add_space(4.0);
+        commit |= self.drag_to_place(ui);
+        ui.add_space(10.0);
+
         egui::Grid::new("browse_settings_placement")
             .num_columns(2)
             .spacing([12.0, 8.0])
             .show(ui, |ui| {
-                ui.label("Anchor");
-                egui::ComboBox::from_id_salt("browse_settings_anchor")
-                    .selected_text(&self.config.overlay.anchor)
-                    .show_ui(ui, |ui| {
-                        for a in ANCHORS {
-                            if ui
-                                .selectable_value(&mut self.config.overlay.anchor, (*a).to_string(), *a)
-                                .changed()
-                            {
-                                commit = true;
-                            }
-                        }
-                    });
-                ui.end_row();
-
-                ui.label("Margin X");
-                let r = ui.add(egui::DragValue::new(&mut self.config.overlay.margin_x).range(0..=2000));
-                commit |= r.drag_stopped() || r.lost_focus();
-                ui.end_row();
-
-                ui.label("Margin Y");
-                let r = ui.add(egui::DragValue::new(&mut self.config.overlay.margin_y).range(0..=2000));
-                commit |= r.drag_stopped() || r.lost_focus();
-                ui.end_row();
-
                 ui.label("Opacity");
                 let r = ui.add(egui::Slider::new(&mut self.config.overlay.opacity, 0.1..=1.0));
                 commit |= r.drag_stopped() || r.lost_focus();
@@ -2251,6 +2357,132 @@ impl BrowseApp {
             }
             ui.label(egui::RichText::new(&self.settings_status).weak());
         });
+    }
+
+    /// Draw the mock screen + draggable overlay-panel box, updating
+    /// `self.config.overlay.{anchor,margin_x,margin_y}` live every frame
+    /// while dragging (local UI state only — no control-socket push here;
+    /// see `commit_overlay_settings` for the on-release/commit push, matching
+    /// the map's already-settled "commit, not per-frame" wire behavior).
+    /// Returns whether a drag just ended, so callers can fold it into their
+    /// own `commit` flag the same way the Opacity slider's `drag_stopped`
+    /// already does.
+    fn drag_to_place(&mut self, ui: &mut egui::Ui) -> bool {
+        let (screen, _) = ui.allocate_exact_size(egui::vec2(420.0, 260.0), egui::Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(screen, 4, egui::Color32::from_gray(28));
+        painter.rect_stroke(screen, 4, egui::Stroke::new(1.0, egui::Color32::from_gray(70)), egui::StrokeKind::Inside);
+
+        let idle_min = place_box(screen, PLACE_BOX_SIZE, &self.config.overlay.anchor, self.config.overlay.margin_x as f32, self.config.overlay.margin_y as f32);
+        let idle_rect = egui::Rect::from_min_size(idle_min, PLACE_BOX_SIZE);
+
+        let rect = if let Some(pointer) = ui.ctx().pointer_latest_pos().filter(|_| self.dragging_placement) {
+            let corner = pointer - self.drag_offset;
+            let (rx, x_pin) = magnetic_axis(corner.x, screen.left(), screen.right(), PLACE_BOX_SIZE.x);
+            let (ry, y_pin) = magnetic_axis(corner.y, screen.top(), screen.bottom(), PLACE_BOX_SIZE.y);
+            let anchor = anchor_for(x_pin, y_pin);
+            self.config.overlay.anchor = anchor.to_string();
+            self.config.overlay.margin_x = match x_pin {
+                AxisPin::Neg => rx - screen.left(),
+                AxisPin::Pos => screen.right() - (rx + PLACE_BOX_SIZE.x),
+                AxisPin::Centered => 0.0,
+            } as i32;
+            self.config.overlay.margin_y = match y_pin {
+                AxisPin::Neg => ry - screen.top(),
+                AxisPin::Pos => screen.bottom() - (ry + PLACE_BOX_SIZE.y),
+                AxisPin::Centered => 0.0,
+            } as i32;
+            egui::Rect::from_min_size(egui::pos2(rx, ry), PLACE_BOX_SIZE)
+        } else {
+            idle_rect
+        };
+
+        let (fill, stroke) = if self.dragging_placement {
+            (egui::Color32::from_rgba_unmultiplied(60, 130, 125, 190), egui::Color32::from_rgb(140, 230, 220))
+        } else {
+            (egui::Color32::from_rgb(45, 95, 92), egui::Color32::from_gray(200))
+        };
+        let painter = ui.painter();
+        painter.rect_filled(rect, 6, fill);
+        painter.rect_stroke(rect, 6, egui::Stroke::new(1.5, stroke), egui::StrokeKind::Outside);
+        painter.text(rect.center(), egui::Align2::CENTER_CENTER, "Overlay", egui::FontId::proportional(12.0), egui::Color32::WHITE);
+
+        let response = ui.interact(rect, ui.id().with("browse_settings_drag_box"), egui::Sense::click_and_drag());
+        if response.drag_started() {
+            self.dragging_placement = true;
+            let pointer = response.interact_pointer_pos().unwrap_or(rect.center());
+            self.drag_offset = pointer - rect.min;
+        }
+        let stopped = response.drag_stopped();
+        if stopped {
+            self.dragging_placement = false;
+        }
+
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(format!(
+                "anchor = {}   margin_x = {}   margin_y = {}",
+                self.config.overlay.anchor, self.config.overlay.margin_x, self.config.overlay.margin_y
+            ))
+            .weak()
+            .monospace(),
+        );
+
+        if self.dragging_placement {
+            ui.ctx().request_repaint();
+        }
+        stopped
+    }
+
+    /// Keep the running overlay's demo mode in sync with whether the Home
+    /// tab (where the drag-to-place preview lives — this app folded its
+    /// old standalone Settings destination into Home, #77) is focused:
+    /// entering shows real curated content for a true WYSIWYG preview,
+    /// leaving resumes live data. Best-effort and idempotent: called every
+    /// frame, it only actually sends a command when the desired state
+    /// changes from what we've last confirmed. If a `demo-on` fails because
+    /// no overlay is running yet, auto-launches one detached instance (once
+    /// per "trying to reach demo mode" stretch, not once per failed frame)
+    /// and keeps retrying — covers both "no overlay at all" and "overlay
+    /// still starting, control socket not bound yet".
+    fn sync_demo_mode(&mut self) {
+        let want_active = self.tab == Tab::Home;
+        if want_active == self.demo_active {
+            return;
+        }
+        if want_active {
+            match wf_config::control::send_command(wf_config::control::DEMO_ON_CMD) {
+                Ok(()) => {
+                    self.demo_active = true;
+                    self.overlay_launch_tried = false;
+                }
+                Err(_) if !self.overlay_launch_tried => {
+                    self.overlay_launch_tried = true;
+                    self.launch_overlay_detached();
+                }
+                Err(_) => {}
+            }
+        } else {
+            let _ = wf_config::control::send_command(wf_config::control::DEMO_OFF_CMD);
+            self.demo_active = false;
+            self.overlay_launch_tried = false;
+        }
+    }
+
+    /// Fire-and-forget `<self> overlay`, left running after this process
+    /// exits — the same re-exec mechanism `wf-tray`'s `spawn_self`/
+    /// `run_detached` use to auto-start the overlay, duplicated here since
+    /// those are private to that crate and this is a two-line spawn.
+    fn launch_overlay_detached(&self) {
+        let bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("wf-lite"));
+        match std::process::Command::new(&bin).arg("overlay").spawn() {
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+            Err(e) => tracing::error!("could not launch overlay: {e}"),
+        }
     }
 
     /// Persist the account id text buffer into `self.config`, then delegate
@@ -2594,6 +2826,8 @@ impl eframe::App for BrowseApp {
         // a full POLL_INTERVAL.
         let still_loading = lock_loaded(&self.loaded).is_none();
         ui.ctx().request_repaint_after(if still_loading { LOADING_REPAINT } else { POLL_INTERVAL });
+
+        self.sync_demo_mode();
 
         egui::CentralPanel::default().show(ui, |ui| {
             let current_group = Group::of(self.tab);
