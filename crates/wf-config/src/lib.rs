@@ -36,6 +36,8 @@ pub struct Config {
     pub account_id: Option<String>,
     /// Overlay placement and appearance.
     pub overlay: OverlayConfig,
+    /// `wf-browse` window appearance (font size).
+    pub ui: UiConfig,
 }
 
 /// Where the overlay sits and how visible it is. Warframe uses every screen
@@ -93,7 +95,24 @@ impl Default for Config {
             fissure_refresh_secs: 60,
             account_id: None,
             overlay: OverlayConfig::default(),
+            ui: UiConfig::default(),
         }
+    }
+}
+
+/// `wf-browse` window appearance, independent of [`OverlayConfig`] (the
+/// in-game overlay renders its own fixed text, unaffected by this).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    /// Multiplier applied to every egui text style's font size. `1.0` is
+    /// egui's own default sizing.
+    pub font_scale: f32,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self { font_scale: 1.0 }
     }
 }
 

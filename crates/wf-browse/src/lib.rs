@@ -381,7 +381,7 @@ pub fn run() -> eframe::Result<()> {
         "warframe-lite browse",
         options,
         Box::new(move |cc| {
-            apply_theme(&cc.egui_ctx);
+            apply_theme(&cc.egui_ctx, settings_config.ui.font_scale);
             Ok(Box::new(BrowseApp::new(
                 loaded,
                 wishlist,
@@ -397,16 +397,38 @@ pub fn run() -> eframe::Result<()> {
     )
 }
 
-/// Apply a clean, dark, teal-accented theme. Scoped to `wf-browse` only — the
-/// default egui look is serviceable but visually flat, so this tightens
-/// spacing, rounds panels/widgets, and gives interactive/selected elements a
-/// consistent accent color instead of egui's default blue. Keeps egui's
-/// default fonts.
-fn apply_theme(ctx: &egui::Context) {
+/// Apply a clean, dark, teal-accented theme, then `font_scale` on top of it.
+/// Scoped to `wf-browse` only — the default egui look is serviceable but
+/// visually flat, so this tightens spacing, rounds panels/widgets, and gives
+/// interactive/selected elements a consistent accent color instead of egui's
+/// default blue. Keeps egui's default fonts (see [`apply_font_scale`] for
+/// why only their size, not the family, is user-configurable).
+fn apply_theme(ctx: &egui::Context, font_scale: f32) {
     // Always dark, regardless of the system preference — this is a deliberate
     // app-wide look, not a system-theme follow.
     ctx.set_theme(egui::ThemePreference::Dark);
     ctx.style_mut_of(egui::Theme::Dark, style_theme);
+    apply_font_scale(ctx, font_scale);
+}
+
+/// Scale every egui text style's font size by `font_scale` off of egui's own
+/// defaults (`1.0` = unscaled) — called once at launch and again live on
+/// every `Self::home_overview_tab` UI-text-size slider frame, so dragging it
+/// previews immediately instead of waiting for a restart. Only size is
+/// user-configurable, not family: egui only bundles one proportional face
+/// (Ubuntu-Light) and one monospace face (Hack) itself, and offering a real
+/// typeface picker would mean sourcing, licensing, and bundling additional
+/// font files as new repo assets — out of scope for now.
+fn apply_font_scale(ctx: &egui::Context, font_scale: f32) {
+    ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.text_styles = egui::style::default_text_styles()
+            .into_iter()
+            .map(|(text_style, mut font_id)| {
+                font_id.size *= font_scale;
+                (text_style, font_id)
+            })
+            .collect();
+    });
 }
 
 fn style_theme(style: &mut egui::Style) {
@@ -437,6 +459,12 @@ fn style_theme(style: &mut egui::Style) {
 
     style.spacing.item_spacing = egui::vec2(8.0, 8.0);
     style.spacing.button_padding = egui::vec2(8.0, 4.0);
+
+    // egui's default scroll style floats the scrollbar over the content
+    // (zero allocated width), so a scrolled tab's rightmost text sits right
+    // under the bar and gets visually clipped by it. Solid reserves real
+    // space for the bar instead, at the cost of a few px of content width.
+    style.spacing.scroll = egui::style::ScrollStyle::solid();
 }
 
 /// The era prefix of a relic display label matches one of these checkboxes.
@@ -1118,6 +1146,18 @@ impl Group {
 
 const GROUPS: [Group; 4] = [Group::Home, Group::Progress, Group::Relics, Group::Ducats];
 
+/// The Home tab's own sub-nav: general app settings/actions vs. the
+/// drag-to-place overlay mock. Split out so Placement's mock screen (260px
+/// tall on its own) doesn't force Overview's shorter content to scroll past
+/// it too, and so Placement's fields (which already live-apply and save
+/// themselves on release) don't need to share a page with the one field that
+/// still needs an explicit Save (the account id text box).
+#[derive(Clone, Copy, PartialEq)]
+enum HomeSubTab {
+    Overview,
+    Placement,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum MasteryFilter {
     All,
@@ -1163,6 +1203,8 @@ enum FarmSort {
 
 struct BrowseApp {
     tab: Tab,
+    /// The Home tab's own sub-nav (see [`HomeSubTab`]).
+    home_sub_tab: HomeSubTab,
     /// Editable text buffer for the Mastery tab's search box.
     filter: String,
     mastery_filter: MasteryFilter,
@@ -1274,6 +1316,7 @@ impl BrowseApp {
         let account_id = config.account_id.clone().unwrap_or_default();
         Self {
             tab: Tab::Home,
+            home_sub_tab: HomeSubTab::Overview,
             filter: String::new(),
             mastery_filter: MasteryFilter::All,
             mastery_sort: MasterySort::Alphabetical,
@@ -1410,73 +1453,179 @@ impl BrowseApp {
     }
 
     /// The Home tab (#72): the default tab on open, replacing the old
-    /// Mastery default. A brief status readout — whether a Mastery account
-    /// id is configured (mirrors the Settings section's own field, not a
-    /// separate read) — plus the Scan Memory button, and (#77) the Settings
-    /// section itself at the bottom (see [`Self::settings_tab`]).
+    /// Mastery default. Its own two-way sub-nav (see [`HomeSubTab`]) —
+    /// Overview (Scan Memory, account id, hotkey help, Save) and Placement
+    /// (the drag-to-place overlay mock) — replaces the single
+    /// scroll-everything page the Settings section folded into at #77: that
+    /// page's drag-to-place mock alone is 260px tall, easily pushing Overview's
+    /// shorter content past the window's min height (760x560) even though the
+    /// two sections have nothing to do with each other.
+    fn home_tab(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Home");
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.home_sub_tab, HomeSubTab::Overview, "Overview");
+            ui.selectable_value(&mut self.home_sub_tab, HomeSubTab::Placement, "Placement");
+        });
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        egui::ScrollArea::vertical().id_salt("home_scroll").show(ui, |ui| match self.home_sub_tab {
+            HomeSubTab::Overview => self.home_overview_tab(ui),
+            HomeSubTab::Placement => self.home_placement_tab(ui),
+        });
+    }
+
+    /// The Home tab's Overview page (see [`HomeSubTab`]): account-id status,
+    /// the Scan Memory action, Mastery account id (with "Detect from log"),
+    /// hotkey-bind help, UI text size, and Save.
     ///
-    /// A deliberate click is the map's required consent (see this module's
-    /// docs and CONTEXT.md's Notes) — no confirmation dialog, and
+    /// A deliberate Scan Memory click is the map's required consent (see this
+    /// module's docs and CONTEXT.md's Notes) — no confirmation dialog, and
     /// deliberately no preflight "is the game running" / "do we have the
     /// capability" check before it: the real scan's own error already
-    /// surfaces the right guidance reactively once it lands, exactly like
-    /// the CLI (`wf-lite mem-scan`).
-    fn home_tab(&mut self, ui: &mut egui::Ui) {
-        // Home folded the whole Settings section in below the scan status
-        // (#77), which easily runs past the window's min height (760x560) —
-        // the drag-to-place mock screen alone is 260px tall. Unlike every
-        // other tab, nothing here needs to stay pinned above a filter/search
-        // row, so the whole body scrolls rather than just a lower section.
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.heading("Home");
-            ui.add_space(8.0);
+    /// surfaces the right guidance reactively once it lands, exactly like the
+    /// CLI (`wf-lite mem-scan`).
+    ///
+    /// Save here only ever needed to persist the account id text field — every
+    /// other field this app can save (placement/opacity/fissures on
+    /// [`Self::home_placement_tab`], UI text size below) already commits
+    /// itself on change, so a bare click with nothing else pending just
+    /// re-saves the same account id and re-pushes the unchanged overlay
+    /// settings (harmless, see [`Self::commit_overlay_settings`]).
+    fn home_overview_tab(&mut self, ui: &mut egui::Ui) {
+        if self.account_id.trim().is_empty() {
+            ui.label("Mastery account id: not set — set it below");
+        } else {
+            ui.label(format!("Mastery account id: {}", self.account_id.trim()));
+        }
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(10.0);
 
-            if self.account_id.trim().is_empty() {
-                ui.label("Mastery account id: not set — set it below");
-            } else {
-                ui.label(format!("Mastery account id: {}", self.account_id.trim()));
+        // A landed result clears the in-flight flag the first frame it's
+        // observed; `spawn_scan` clears `scan_status` back to `None` the
+        // moment it fires a new scan, so this never flashes a stale result
+        // while a fresh scan is running.
+        let current = self.scan_status.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if self.scanning && current.is_some() {
+            self.scanning = false;
+        }
+
+        if ui.add_enabled(!self.scanning, egui::Button::new("Scan Memory")).clicked() {
+            self.spawn_scan();
+        }
+        ui.add_space(6.0);
+
+        let line = if self.scanning {
+            "scanning…".to_string()
+        } else {
+            match &current {
+                None => "idle — click Scan Memory to read Foundry/Rivens/owned relics from the \
+                          running game"
+                    .to_string(),
+                Some(Ok(summary)) => format!("done: {summary}"),
+                Some(Err(e)) => format!("failed: {e}"),
             }
-            ui.add_space(14.0);
-            ui.separator();
-            ui.add_space(10.0);
+        };
+        ui.label(line);
 
-            // A landed result clears the in-flight flag the first frame it's
-            // observed; `spawn_scan` clears `scan_status` back to `None` the
-            // moment it fires a new scan, so this never flashes a stale result
-            // while a fresh scan is running.
-            let current = self.scan_status.lock().unwrap_or_else(|p| p.into_inner()).clone();
-            if self.scanning && current.is_some() {
-                self.scanning = false;
+        ui.add_space(14.0);
+        ui.separator();
+        ui.label("Mastery account id");
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.account_id)
+                    .hint_text("24-hex account id")
+                    .desired_width(240.0),
+            );
+            if ui.button("Detect from log").clicked() {
+                self.detect_account();
             }
-
-            if ui.add_enabled(!self.scanning, egui::Button::new("Scan Memory")).clicked() {
-                self.spawn_scan();
-            }
-            ui.add_space(6.0);
-
-            let line = if self.scanning {
-                "scanning…".to_string()
-            } else {
-                match &current {
-                    None => "idle — click Scan Memory to read Foundry/Rivens/owned relics from the \
-                              running game"
-                        .to_string(),
-                    Some(Ok(summary)) => format!("done: {summary}"),
-                    Some(Err(e)) => format!("failed: {e}"),
-                }
-            };
-            ui.label(line);
-
-            // Settings folded in here rather than kept as its own destination
-            // (#77) — this app doesn't have (and isn't expected to grow) enough
-            // options to earn a dedicated tab. `settings_tab` is otherwise
-            // unchanged; its own `ui.heading("Settings")` now reads as a
-            // sub-section of Home.
-            ui.add_space(18.0);
-            ui.separator();
-            ui.add_space(8.0);
-            self.settings_tab(ui);
         });
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.label("Show/hide hotkey");
+        ui.label(
+            egui::RichText::new(
+                "Wayland can't let the overlay grab a global key. Bind this command \
+                 as a KDE custom shortcut:",
+            )
+            .weak(),
+        );
+        ui.horizontal(|ui| {
+            ui.code("wf-lite toggle");
+            if ui.button("Copy").clicked() {
+                ui.ctx().copy_text("wf-lite toggle".to_string());
+                self.settings_status = "Copied command".to_string();
+            }
+            if ui.button("Open KDE shortcuts").clicked() {
+                open_kde_shortcuts(&mut self.settings_status);
+            }
+        });
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.label("UI text size");
+        let r = ui.add(egui::Slider::new(&mut self.config.ui.font_scale, 0.8..=1.6).text("×"));
+        if r.changed() {
+            apply_font_scale(ui.ctx(), self.config.ui.font_scale);
+        }
+        if r.drag_stopped() || r.lost_focus() {
+            self.save_config_only();
+        }
+
+        ui.add_space(14.0);
+        ui.horizontal(|ui| {
+            if ui.button("Save").clicked() {
+                self.save_settings();
+            }
+            ui.label(egui::RichText::new(&self.settings_status).weak());
+        });
+    }
+
+    /// The Home tab's Placement page (see [`HomeSubTab`]): the drag-to-place
+    /// overlay mock, Opacity, and the Fissure panel toggle — every field here
+    /// already live-applies to a running `wf-lite overlay` and saves itself on
+    /// commit (drag-release/slider-release/checkbox toggle), so unlike
+    /// [`Self::home_overview_tab`] there's no Save button on this page; the
+    /// status line below shows the same feedback a button would.
+    fn home_placement_tab(&mut self, ui: &mut egui::Ui) {
+        let mut commit = false;
+
+        ui.label("Overlay placement — drag the panel; it tracks the cursor except near the \
+                   middle of each axis, where it eases into being centered.");
+        ui.add_space(4.0);
+        commit |= self.drag_to_place(ui);
+        ui.add_space(10.0);
+
+        egui::Grid::new("browse_settings_placement")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("Opacity");
+                let r = ui.add(egui::Slider::new(&mut self.config.overlay.opacity, 0.1..=1.0));
+                commit |= r.drag_stopped() || r.lost_focus();
+                ui.end_row();
+
+                ui.label("Fissure panel");
+                if ui
+                    .checkbox(&mut self.config.overlay.fissures, "show (off = reward picker only)")
+                    .changed()
+                {
+                    commit = true;
+                }
+                ui.end_row();
+            });
+
+        if commit {
+            self.commit_overlay_settings();
+        }
+
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new(&self.settings_status).weak());
     }
 
     /// Fire the Home tab's Scan Memory action (#72) on `rt_handle` — never on
@@ -2350,100 +2499,6 @@ impl BrowseApp {
         }
     }
 
-    /// Settings: placement/opacity/fissure-panel toggle, Mastery account id
-    /// (with "Detect from log"), hotkey-bind help, and Save — ported from
-    /// the standalone `wf-settings` crate's `SettingsApp` UI body, now
-    /// editing `self.config`/`self.config_path` instead of a dedicated app
-    /// struct. Originally its own tab (#72); folded into the bottom of
-    /// [`Self::home_tab`] instead (#77) — this app doesn't have enough
-    /// options to earn a dedicated destination, so this is now called from
-    /// there rather than matched on directly. A change here doesn't
-    /// retroactively affect the background loader/poller's own `Config`
-    /// snapshot (see `run`'s docs) — that copy only drives fissure polling,
-    /// unaffected by placement/opacity/fissure-panel settings either way.
-    /// The anchor/margin/opacity/fissures fields below live-apply to a
-    /// running `wf-lite overlay` on commit (drag-release/slider-release/
-    /// dropdown selection) via [`Self::commit_overlay_settings`] — see
-    /// wayfinder map #82.
-    fn settings_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Settings");
-        ui.add_space(8.0);
-
-        let mut commit = false;
-
-        ui.label("Overlay placement — drag the panel; it tracks the cursor except near the \
-                   middle of each axis, where it eases into being centered.");
-        ui.add_space(4.0);
-        commit |= self.drag_to_place(ui);
-        ui.add_space(10.0);
-
-        egui::Grid::new("browse_settings_placement")
-            .num_columns(2)
-            .spacing([12.0, 8.0])
-            .show(ui, |ui| {
-                ui.label("Opacity");
-                let r = ui.add(egui::Slider::new(&mut self.config.overlay.opacity, 0.1..=1.0));
-                commit |= r.drag_stopped() || r.lost_focus();
-                ui.end_row();
-
-                ui.label("Fissure panel");
-                if ui
-                    .checkbox(&mut self.config.overlay.fissures, "show (off = reward picker only)")
-                    .changed()
-                {
-                    commit = true;
-                }
-                ui.end_row();
-            });
-
-        if commit {
-            self.commit_overlay_settings();
-        }
-
-        ui.add_space(10.0);
-        ui.separator();
-        ui.label("Mastery account id");
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.account_id)
-                    .hint_text("24-hex account id")
-                    .desired_width(240.0),
-            );
-            if ui.button("Detect from log").clicked() {
-                self.detect_account();
-            }
-        });
-
-        ui.add_space(10.0);
-        ui.separator();
-        ui.label("Show/hide hotkey");
-        ui.label(
-            egui::RichText::new(
-                "Wayland can't let the overlay grab a global key. Bind this command \
-                 as a KDE custom shortcut:",
-            )
-            .weak(),
-        );
-        ui.horizontal(|ui| {
-            ui.code("wf-lite toggle");
-            if ui.button("Copy").clicked() {
-                ui.ctx().copy_text("wf-lite toggle".to_string());
-                self.settings_status = "Copied command".to_string();
-            }
-            if ui.button("Open KDE shortcuts").clicked() {
-                open_kde_shortcuts(&mut self.settings_status);
-            }
-        });
-
-        ui.add_space(14.0);
-        ui.horizontal(|ui| {
-            if ui.button("Save").clicked() {
-                self.save_settings();
-            }
-            ui.label(egui::RichText::new(&self.settings_status).weak());
-        });
-    }
-
     /// Draw the mock screen + draggable overlay-panel box, updating
     /// `self.config.overlay.{anchor,margin_x,margin_y}` live every frame
     /// while dragging (local UI state only — no control-socket push here;
@@ -2604,6 +2659,17 @@ impl BrowseApp {
             Some(self.account_id.trim().to_string())
         };
         self.commit_overlay_settings();
+    }
+
+    /// Persist `self.config` to `self.config_path` only — no control-socket
+    /// push, unlike [`Self::commit_overlay_settings`]. For fields the overlay
+    /// doesn't care about (currently just UI text size): a running overlay
+    /// draws its own fixed text, so there's nothing there to live-apply.
+    fn save_config_only(&mut self) {
+        match self.config.save(&self.config_path) {
+            Ok(()) => self.settings_status = "Saved".to_string(),
+            Err(e) => self.settings_status = format!("Save failed: {e:#}"),
+        }
     }
 
     /// Persist `self.config` to `self.config_path`, then push its
