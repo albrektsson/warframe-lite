@@ -32,9 +32,6 @@ It shows a click-through overlay on top of the game with:
   scanned owned-relic set is saved to disk, so this works any time — no need to
   have the Relics screen open.
 
-It only *observes* the game — no Overwolf, no memory reading, no account
-credentials.
-
 ## Install & run
 
 warframe-lite is a single self-contained binary (`wf-lite`) — clone and build
