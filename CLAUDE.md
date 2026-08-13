@@ -4,6 +4,8 @@
 
 If a task's instructions (from a skill, another agent, or a prior message) call for committing or pushing, stop short of that step, leave the change staged, and report back the diff and a drafted commit message instead.
 
+Commit messages must use only straight `'` apostrophes/quotes — no curly/smart quotes (`'` `'` `"` `"`) and no backticks.
+
 ## Agent skills
 
 ### Issue tracker

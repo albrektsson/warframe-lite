@@ -90,13 +90,15 @@ const TIERS: [&str; 5] = ["Lith", "Meso", "Neo", "Axi", "Requiem"];
 /// actually matches normal mouse precision.
 const PLACE_LOCK_RADIUS: f32 = 20.0;
 /// Beyond this distance, the box tracks the cursor exactly on that axis.
-/// Between [`PLACE_LOCK_RADIUS`] and this, it blends linearly between the
-/// two, with endpoints chosen to exactly match both neighbors — giving
-/// zero-jump continuity across the whole drag (settled via `/prototype` on
-/// issue #85; see `crates/wf-browse/examples/drag_to_place_prototype.rs`
-/// on the `prototype/drag-to-place-85` branch for the rejected
-/// alternatives and why). Widened alongside `PLACE_LOCK_RADIUS` — see its
-/// docs.
+/// Between [`PLACE_LOCK_RADIUS`] and this, it eases between the two (see
+/// [`magnetic_axis`]) — the *position* never jumps (settled via
+/// `/prototype` on issue #85), but a live-tested build revealed a second,
+/// subtler issue a plain linear blend leaves: it matches position at both
+/// boundaries but not velocity, so the box visibly goes from moving to
+/// completely frozen right at the lock radius — which reads as "it just
+/// snapped to center" even though no pixel ever jumped. A smoothstep ease
+/// fixes that by matching slope (not just position) at both ends. Widened
+/// alongside `PLACE_LOCK_RADIUS` — see its docs.
 const PLACE_CAPTURE_RADIUS: f32 = 90.0;
 /// Size of the mock overlay-panel rectangle in [`BrowseApp::drag_to_place`].
 const PLACE_BOX_SIZE: egui::Vec2 = egui::Vec2::new(110.0, 66.0);
@@ -134,9 +136,12 @@ enum AxisPin {
 /// cursor position — nothing to correct, ever. The only state that can't
 /// just track the cursor is "centered" (the real overlay's un-pinned axis
 /// forces to a fixed value, independent of where it was dragged), so a
-/// magnetic well around each axis's center blends linearly between raw
-/// tracking and the locked-center value, with matching endpoints — this is
-/// what removes the jump earlier drag-to-place rounds had.
+/// magnetic well around each axis's center eases between raw tracking and
+/// the locked-center value. The ease matches both position *and slope* at
+/// its two boundaries (a smoothstep, not a linear blend) — matching only
+/// position leaves a velocity kink at the lock radius where the box goes
+/// from moving to instantly frozen, which reads as a snap even though the
+/// position itself never jumps.
 fn magnetic_axis(raw: f32, screen_lo: f32, screen_hi: f32, box_dim: f32) -> (f32, AxisPin) {
     let raw = raw.clamp(screen_lo, screen_hi - box_dim);
     let center = screen_lo + (screen_hi - screen_lo - box_dim) / 2.0;
@@ -147,7 +152,13 @@ fn magnetic_axis(raw: f32, screen_lo: f32, screen_hi: f32, box_dim: f32) -> (f32
         center
     } else if ad < PLACE_CAPTURE_RADIUS {
         let t = (ad - PLACE_LOCK_RADIUS) / (PLACE_CAPTURE_RADIUS - PLACE_LOCK_RADIUS);
-        center + d * t
+        // Smoothstep, not a plain lerp: its derivative is 0 at t=0 and t=1,
+        // matching the flat "locked" region's zero slope and the outer
+        // "raw tracking" region's unit slope respectively — a linear `t`
+        // matches position at both boundaries but not velocity, which is
+        // what read as a snap (see this constant's docs).
+        let eased = t * t * (3.0 - 2.0 * t);
+        center + d * eased
     } else {
         raw
     };
@@ -177,6 +188,49 @@ fn anchor_for(x_pin: AxisPin, y_pin: AxisPin) -> &'static str {
         (Neg, Centered) => "left",
         (Pos, Centered) => "right",
         (Centered, Centered) => "center",
+    }
+}
+
+/// `wf-overlay`'s actual rendered panel size — duplicated from
+/// `wf_overlay::render::WIDTH` (460) and `src/main.rs`'s `OVERLAY_H` (340)
+/// rather than pulling the `wf-overlay` crate (and its Wayland/
+/// smithay-client-toolkit dependency tree) into `wf-browse` just for two
+/// integers, matching this crate's existing small-constant-duplication
+/// convention (see `ANCHORS`'s docs).
+const REAL_OVERLAY_SIZE: egui::Vec2 = egui::Vec2::new(460.0, 340.0);
+
+/// Ratio between how far a margin can meaningfully go on the real screen
+/// `wf-overlay` renders to, vs. on [`BrowseApp::drag_to_place`]'s small
+/// mock screen — i.e. a *percentage-of-max-margin* conversion, not a flat
+/// pixel-count scale. "Max margin" on either screen is the value at which
+/// a pinned edge's position coincides with being centered — a drag that's
+/// N% of the way from flush-against-an-edge to centered in the mock should
+/// store a margin that's the same N% of the way to centered on the real
+/// screen, for *any* real resolution.
+///
+/// A flat `real_screen_width / mock_screen_width` multiplier (tried first,
+/// rejected after live-testing on a 3440px-wide monitor) gets this wrong
+/// because it ignores that the real overlay is a fixed 460×340px — a much
+/// smaller fraction of a wide real screen than the mock's own box is of
+/// its few-hundred-px mock screen, so "max margin" doesn't grow in
+/// proportion to raw screen width alone.
+///
+/// Best-effort: falls back to no scaling (1.0) if the monitor size isn't
+/// known yet (egui reports `None` for the first frame or two on Wayland
+/// before winit resolves it) or is too small to fit the real overlay.
+/// Uses whichever monitor `wf-browse`'s own window happens to be on as the
+/// reference — deliberately not exact per-output geometry for the
+/// overlay's actual target output, matching the map's "single generic
+/// mockup" scope; this is a proportional approximation, not real
+/// geometry-awareness.
+fn mock_to_real_scale(ctx: &egui::Context, mock_screen: egui::Vec2, mock_box: egui::Vec2) -> egui::Vec2 {
+    let mock_max = (mock_screen - mock_box) / 2.0;
+    match ctx.input(|i| i.viewport().monitor_size) {
+        Some(real) if real.x > REAL_OVERLAY_SIZE.x && real.y > REAL_OVERLAY_SIZE.y => {
+            let real_max = (real - REAL_OVERLAY_SIZE) / 2.0;
+            egui::vec2(real_max.x / mock_max.x, real_max.y / mock_max.y)
+        }
+        _ => egui::Vec2::splat(1.0),
     }
 }
 
@@ -238,12 +292,36 @@ pub fn run() -> eframe::Result<()> {
     let config_path = Config::default_path().unwrap_or_else(|_| PathBuf::from("config.toml"));
     let config = Config::load(&config_path).unwrap_or_default();
 
-    // `rt` is never dropped before `run_native` returns, so the background
-    // loader/poller spawned on it below — and any on-demand price fetch the
-    // Relics EV tab spawns via `rt_handle` — keep running for as long as the
-    // window stays open.
-    let rt = tokio::runtime::Runtime::new().expect("failed to start tokio runtime");
-    let rt_handle = rt.handle().clone();
+    // Reuse the caller's tokio runtime when there already is one — the
+    // shipped `wf-lite browse`/`settings` path: `main`'s `#[tokio::main]`
+    // runtime is already driving this call via `block_on` (see
+    // `run_browse`'s docs in `src/main.rs`) — rather than nesting a second
+    // owned `Runtime` inside it. A nested `Runtime` dropped while still
+    // inside an outer runtime's async context panics ("Cannot drop a
+    // runtime in a context where blocking is not allowed") the instant this
+    // function returns and a local `Runtime` would go out of scope — which
+    // used to happen on every window close. The standalone `wf-browse`
+    // binary (a plain, non-async `fn main`, kept for `cargo run -p
+    // wf-browse`) has no outer runtime to borrow, so it falls back to
+    // owning one here. `_owned_rt` is never dropped before `run_native`
+    // returns, so the background loader/poller spawned below — and any
+    // on-demand price fetch the Relics EV tab spawns via `rt_handle` — keep
+    // running for as long as the window stays open; its later drop is safe
+    // in that fallback case since that path is never itself inside an
+    // async context.
+    let _owned_rt;
+    let rt_handle = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            _owned_rt = None;
+            handle
+        }
+        Err(_) => {
+            let rt = tokio::runtime::Runtime::new().expect("failed to start tokio runtime");
+            let handle = rt.handle().clone();
+            _owned_rt = Some(rt);
+            handle
+        }
+    };
     let loaded: Arc<Mutex<Option<Loaded>>> = Arc::new(Mutex::new(None));
     // Hand-curated, so loaded once synchronously here (a local disk read, no
     // network) rather than through the background `load_data`/`poll` path —
@@ -279,7 +357,7 @@ pub fn run() -> eframe::Result<()> {
     // opacity/fissures fields live-applying to a running overlay — see
     // `settings_tab`'s docs).
     let settings_config = config.clone();
-    rt.spawn(load_and_poll(loaded.clone(), config, relic_prices.clone(), set_prices.clone()));
+    rt_handle.spawn(load_and_poll(loaded.clone(), config, relic_prices.clone(), set_prices.clone()));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -1344,54 +1422,61 @@ impl BrowseApp {
     /// surfaces the right guidance reactively once it lands, exactly like
     /// the CLI (`wf-lite mem-scan`).
     fn home_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Home");
-        ui.add_space(8.0);
+        // Home folded the whole Settings section in below the scan status
+        // (#77), which easily runs past the window's min height (760x560) —
+        // the drag-to-place mock screen alone is 260px tall. Unlike every
+        // other tab, nothing here needs to stay pinned above a filter/search
+        // row, so the whole body scrolls rather than just a lower section.
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.heading("Home");
+            ui.add_space(8.0);
 
-        if self.account_id.trim().is_empty() {
-            ui.label("Mastery account id: not set — set it below");
-        } else {
-            ui.label(format!("Mastery account id: {}", self.account_id.trim()));
-        }
-        ui.add_space(14.0);
-        ui.separator();
-        ui.add_space(10.0);
-
-        // A landed result clears the in-flight flag the first frame it's
-        // observed; `spawn_scan` clears `scan_status` back to `None` the
-        // moment it fires a new scan, so this never flashes a stale result
-        // while a fresh scan is running.
-        let current = self.scan_status.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        if self.scanning && current.is_some() {
-            self.scanning = false;
-        }
-
-        if ui.add_enabled(!self.scanning, egui::Button::new("Scan Memory")).clicked() {
-            self.spawn_scan();
-        }
-        ui.add_space(6.0);
-
-        let line = if self.scanning {
-            "scanning…".to_string()
-        } else {
-            match &current {
-                None => "idle — click Scan Memory to read Foundry/Rivens/owned relics from the \
-                          running game"
-                    .to_string(),
-                Some(Ok(summary)) => format!("done: {summary}"),
-                Some(Err(e)) => format!("failed: {e}"),
+            if self.account_id.trim().is_empty() {
+                ui.label("Mastery account id: not set — set it below");
+            } else {
+                ui.label(format!("Mastery account id: {}", self.account_id.trim()));
             }
-        };
-        ui.label(line);
+            ui.add_space(14.0);
+            ui.separator();
+            ui.add_space(10.0);
 
-        // Settings folded in here rather than kept as its own destination
-        // (#77) — this app doesn't have (and isn't expected to grow) enough
-        // options to earn a dedicated tab. `settings_tab` is otherwise
-        // unchanged; its own `ui.heading("Settings")` now reads as a
-        // sub-section of Home.
-        ui.add_space(18.0);
-        ui.separator();
-        ui.add_space(8.0);
-        self.settings_tab(ui);
+            // A landed result clears the in-flight flag the first frame it's
+            // observed; `spawn_scan` clears `scan_status` back to `None` the
+            // moment it fires a new scan, so this never flashes a stale result
+            // while a fresh scan is running.
+            let current = self.scan_status.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            if self.scanning && current.is_some() {
+                self.scanning = false;
+            }
+
+            if ui.add_enabled(!self.scanning, egui::Button::new("Scan Memory")).clicked() {
+                self.spawn_scan();
+            }
+            ui.add_space(6.0);
+
+            let line = if self.scanning {
+                "scanning…".to_string()
+            } else {
+                match &current {
+                    None => "idle — click Scan Memory to read Foundry/Rivens/owned relics from the \
+                              running game"
+                        .to_string(),
+                    Some(Ok(summary)) => format!("done: {summary}"),
+                    Some(Err(e)) => format!("failed: {e}"),
+                }
+            };
+            ui.label(line);
+
+            // Settings folded in here rather than kept as its own destination
+            // (#77) — this app doesn't have (and isn't expected to grow) enough
+            // options to earn a dedicated tab. `settings_tab` is otherwise
+            // unchanged; its own `ui.heading("Settings")` now reads as a
+            // sub-section of Home.
+            ui.add_space(18.0);
+            ui.separator();
+            ui.add_space(8.0);
+            self.settings_tab(ui);
+        });
     }
 
     /// Fire the Home tab's Scan Memory action (#72) on `rt_handle` — never on
@@ -2368,12 +2453,24 @@ impl BrowseApp {
     /// own `commit` flag the same way the Opacity slider's `drag_stopped`
     /// already does.
     fn drag_to_place(&mut self, ui: &mut egui::Ui) -> bool {
-        let (screen, _) = ui.allocate_exact_size(egui::vec2(420.0, 260.0), egui::Sense::hover());
+        let mock_screen_size = egui::vec2(420.0, 260.0);
+        let (screen, _) = ui.allocate_exact_size(mock_screen_size, egui::Sense::hover());
         let painter = ui.painter();
         painter.rect_filled(screen, 4, egui::Color32::from_gray(28));
         painter.rect_stroke(screen, 4, egui::Stroke::new(1.0, egui::Color32::from_gray(70)), egui::StrokeKind::Inside);
 
-        let idle_min = place_box(screen, PLACE_BOX_SIZE, &self.config.overlay.anchor, self.config.overlay.margin_x as f32, self.config.overlay.margin_y as f32);
+        // Stored margins are in real-screen pixels (see `mock_to_real_scale`
+        // docs); shrink back into the mock's own pixel space to place the
+        // idle box, and grow a mock-space drag's derived margin back up
+        // before storing it.
+        let scale = mock_to_real_scale(ui.ctx(), mock_screen_size, PLACE_BOX_SIZE);
+        let idle_min = place_box(
+            screen,
+            PLACE_BOX_SIZE,
+            &self.config.overlay.anchor,
+            self.config.overlay.margin_x as f32 / scale.x,
+            self.config.overlay.margin_y as f32 / scale.y,
+        );
         let idle_rect = egui::Rect::from_min_size(idle_min, PLACE_BOX_SIZE);
 
         let rect = if let Some(pointer) = ui.ctx().pointer_latest_pos().filter(|_| self.dragging_placement) {
@@ -2382,16 +2479,16 @@ impl BrowseApp {
             let (ry, y_pin) = magnetic_axis(corner.y, screen.top(), screen.bottom(), PLACE_BOX_SIZE.y);
             let anchor = anchor_for(x_pin, y_pin);
             self.config.overlay.anchor = anchor.to_string();
-            self.config.overlay.margin_x = match x_pin {
+            self.config.overlay.margin_x = (match x_pin {
                 AxisPin::Neg => rx - screen.left(),
                 AxisPin::Pos => screen.right() - (rx + PLACE_BOX_SIZE.x),
                 AxisPin::Centered => 0.0,
-            } as i32;
-            self.config.overlay.margin_y = match y_pin {
+            } * scale.x) as i32;
+            self.config.overlay.margin_y = (match y_pin {
                 AxisPin::Neg => ry - screen.top(),
                 AxisPin::Pos => screen.bottom() - (ry + PLACE_BOX_SIZE.y),
                 AxisPin::Centered => 0.0,
-            } as i32;
+            } * scale.y) as i32;
             egui::Rect::from_min_size(egui::pos2(rx, ry), PLACE_BOX_SIZE)
         } else {
             idle_rect
@@ -2436,17 +2533,28 @@ impl BrowseApp {
 
     /// Keep the running overlay's demo mode in sync with whether the Home
     /// tab (where the drag-to-place preview lives — this app folded its
-    /// old standalone Settings destination into Home, #77) is focused:
-    /// entering shows real curated content for a true WYSIWYG preview,
-    /// leaving resumes live data. Best-effort and idempotent: called every
-    /// frame, it only actually sends a command when the desired state
-    /// changes from what we've last confirmed. If a `demo-on` fails because
-    /// no overlay is running yet, auto-launches one detached instance (once
+    /// old standalone Settings destination into Home, #77) is *actually*
+    /// focused: the Home tab being selected *and* the `wf-browse` window
+    /// having real OS-level input focus, not just being the last-selected
+    /// tab. Tab selection alone isn't enough — leaving `wf-browse` sitting
+    /// in the background on the Home tab while playing (the common case:
+    /// adjust placement, then alt-tab into the game) would otherwise never
+    /// register as "left", leaving demo mode stuck on and burying the real
+    /// fissure/reward panels under curated content indefinitely. Entering
+    /// shows real curated content for a true WYSIWYG preview, leaving
+    /// resumes live data. Best-effort and idempotent: called every frame,
+    /// it only actually sends a command when the desired state changes
+    /// from what we've last confirmed. If a `demo-on` fails because no
+    /// overlay is running yet, auto-launches one detached instance (once
     /// per "trying to reach demo mode" stretch, not once per failed frame)
     /// and keeps retrying — covers both "no overlay at all" and "overlay
     /// still starting, control socket not bound yet".
-    fn sync_demo_mode(&mut self) {
-        let want_active = self.tab == Tab::Home;
+    fn sync_demo_mode(&mut self, ctx: &egui::Context) {
+        // `None` (focus unknown on this backend) defaults to "not focused"
+        // rather than "focused" — if we can't tell, err toward not
+        // clobbering live gameplay with demo content over a false positive.
+        let focused = ctx.input(|i| i.viewport().focused).unwrap_or(false);
+        let want_active = self.tab == Tab::Home && focused;
         if want_active == self.demo_active {
             return;
         }
@@ -2827,7 +2935,7 @@ impl eframe::App for BrowseApp {
         let still_loading = lock_loaded(&self.loaded).is_none();
         ui.ctx().request_repaint_after(if still_loading { LOADING_REPAINT } else { POLL_INTERVAL });
 
-        self.sync_demo_mode();
+        self.sync_demo_mode(ui.ctx());
 
         egui::CentralPanel::default().show(ui, |ui| {
             let current_group = Group::of(self.tab);
@@ -2880,6 +2988,19 @@ impl eframe::App for BrowseApp {
                 Tab::Owned => self.owned_tab(ui),
             }
         });
+    }
+
+    /// `sync_demo_mode` only turns demo mode back off from inside `ui`
+    /// (called every frame while the window is open) when focus/tab state
+    /// changes — closing the window stops those frames from ever running
+    /// again, so without this, a demo-on left active right before close
+    /// (the common case: the Home tab is still focused when you click the
+    /// close button) would strand the overlay showing curated content
+    /// forever, with nothing left running that could ever send `demo-off`.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.demo_active {
+            let _ = wf_config::control::send_command(wf_config::control::DEMO_OFF_CMD);
+        }
     }
 }
 
