@@ -1466,9 +1466,9 @@ async fn run_overlay(config: Config) -> Result<()> {
         let demo = demo.clone();
         let live = live.clone();
         move |ws: &worldstate::WorldState, shown: bool| -> wf_overlay::Canvas {
-            let (show_fissures, opacity) = {
+            let (show_fissures, opacity, fissure_filter) = {
                 let live = live.lock().unwrap();
-                (live.fissures, live.opacity)
+                (live.fissures, live.opacity, live.fissure_filter.clone())
             };
             let blank = || wf_overlay::Canvas::new(OVERLAY_W, OVERLAY_H);
             let mut c = if !shown {
@@ -1481,14 +1481,18 @@ async fn run_overlay(config: Config) -> Result<()> {
                 if cycle.is_multiple_of(2) {
                     wf_overlay::render_reward_panel(&frames.reward_rows, &font).embed(OVERLAY_W, OVERLAY_H)
                 } else {
-                    wf_overlay::render_panel(&frames.fissures, &font).embed(OVERLAY_W, OVERLAY_H)
+                    // Demo mode previews the panel's full visual states
+                    // regardless of the user's real filter, so its synthetic
+                    // fissures always show unfiltered.
+                    wf_overlay::render_panel(&frames.fissures, &font, &Default::default())
+                        .embed(OVERLAY_W, OVERLAY_H)
                 }
             } else if let Some(rows) = current_reward_rows(&reward) {
                 wf_overlay::render_reward_panel(&rows, &font).embed(OVERLAY_W, OVERLAY_H)
             } else if let Some(progress) = *relic_scan_status.lock().unwrap() {
                 wf_overlay::render_relic_scanning_panel(progress, &font).embed(OVERLAY_W, OVERLAY_H)
             } else if show_fissures {
-                wf_overlay::render_panel(ws, &font).embed(OVERLAY_W, OVERLAY_H)
+                wf_overlay::render_panel(ws, &font, &fissure_filter).embed(OVERLAY_W, OVERLAY_H)
             } else {
                 blank()
             };
@@ -1704,6 +1708,7 @@ fn spawn_control_listener(
                                 live.margin_y = p.margin_y;
                                 live.opacity = p.opacity;
                                 live.fissures = p.fissures;
+                                live.fissure_filter = p.fissure_filter.clone();
                             }
                             let placement = wf_overlay::layer::Placement::parse(
                                 &p.anchor,
@@ -1809,7 +1814,7 @@ async fn overlay_png(config: &Config, out: Option<String>) -> Result<()> {
     println!("\n== Rendering overlay panel ==");
     let ws = worldstate::fetch(&http_client(), &config.platform).await?;
     let font = wf_overlay::load_font()?;
-    let canvas = wf_overlay::render_panel(&ws, &font);
+    let canvas = wf_overlay::render_panel(&ws, &font, &config.overlay.fissure_filter);
     let img = image::RgbaImage::from_raw(canvas.width, canvas.height, canvas.buf)
         .context("canvas buffer -> image")?;
     img.save(&out).map_err(|e| anyhow::anyhow!("saving {out}: {e}"))?;

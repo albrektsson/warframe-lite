@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use fontdue::Font;
-use wf_data::worldstate::WorldState;
+use wf_data::worldstate::{FissureFilter, WorldState};
 
 use crate::canvas::{Canvas, Color};
 
@@ -58,9 +58,12 @@ fn tier_color(tier: &str) -> Color {
     }
 }
 
-/// Render the panel for `ws` and return the finished canvas.
-pub fn render_panel(ws: &WorldState, font: &Font) -> Canvas {
-    let mut fissures: Vec<_> = ws.fissures.iter().filter(|f| f.active()).collect();
+/// Render the panel for `ws` and return the finished canvas. `filter`
+/// narrows which active fissures show (e.g. only Axi Capture); an inactive
+/// (default) filter shows every active fissure, matching prior behavior.
+pub fn render_panel(ws: &WorldState, font: &Font, filter: &FissureFilter) -> Canvas {
+    let mut fissures: Vec<_> =
+        ws.fissures.iter().filter(|f| f.active() && filter.matches(f)).collect();
     // Prioritise normal fissures (best for relic running) over Steel Path, then
     // Void Storms; within a group keep the API order.
     fissures.sort_by_key(|f| (f.is_hard, f.is_storm));
@@ -106,6 +109,10 @@ pub fn render_panel(ws: &WorldState, font: &Font) -> Canvas {
     if fissures.len() > MAX_FISSURES {
         let more = format!("+{} more fissures", fissures.len() - MAX_FISSURES);
         canvas.draw_text(font, &more, PAD as f32, y as f32, FONT_PX, DIM);
+    } else if fissures.is_empty() && filter.is_active() {
+        // Distinguish "the filter matched nothing" from "nothing is active
+        // right now" (the latter keeps today's blank body).
+        canvas.draw_text(font, "No fissures match filter", PAD as f32, y as f32, FONT_PX, DIM);
     }
 
     canvas
@@ -352,12 +359,40 @@ mod tests {
     fn renders_nonempty_panel() {
         let font = load_font().expect("a system monospace font");
         let ws = WorldState::default();
-        let canvas = render_panel(&ws, &font);
+        let canvas = render_panel(&ws, &font, &FissureFilter::default());
         assert_eq!(canvas.width, WIDTH);
         assert!(canvas.height > 0);
         // The background alone should make many pixels non-transparent.
         let opaque = canvas.buf.chunks_exact(4).filter(|p| p[3] > 0).count();
         assert!(opaque > 100, "expected a visible panel background");
+    }
+
+    #[test]
+    fn shows_placeholder_when_active_filter_matches_nothing() {
+        let font = load_font().expect("a system monospace font");
+        let mut ws = WorldState::default();
+        ws.fissures.push(wf_data::worldstate::Fissure {
+            node: "Hepit (Void)".to_string(),
+            mission_type: "Capture".to_string(),
+            tier: "Axi".to_string(),
+            is_hard: false,
+            is_storm: false,
+            expiry: String::new(),
+        });
+
+        let no_filter = render_panel(&ws, &font, &FissureFilter::default());
+        let non_matching_filter = render_panel(
+            &ws,
+            &font,
+            &FissureFilter {
+                tiers: ["Neo".to_string()].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+        assert_ne!(
+            no_filter.buf, non_matching_filter.buf,
+            "an active, non-matching filter should render a placeholder message"
+        );
     }
 
     #[test]

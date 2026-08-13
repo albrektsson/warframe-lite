@@ -79,6 +79,24 @@ const NO_OWNED_PARTS_MSG: &str = "no owned Prime Part data yet. Run `wf-lite ove
      and open the in-game Inventory/Sell screen once — it scans automatically as you scroll.";
 /// Relic tiers offered by the tier-filter checkboxes, in drop order.
 const TIERS: [&str; 5] = ["Lith", "Meso", "Neo", "Axi", "Requiem"];
+/// Standard Warframe mission types, offered by the fissure-filter's
+/// mission-type checkboxes. The live API's `mission_type` field is
+/// free-form text, so this is a curated (not authoritative) list.
+const MISSION_TYPES: [&str; 13] = [
+    "Assassination",
+    "Capture",
+    "Defense",
+    "Disruption",
+    "Excavation",
+    "Exterminate",
+    "Hijack",
+    "Interception",
+    "Mobile Defense",
+    "Rescue",
+    "Sabotage",
+    "Spy",
+    "Survival",
+];
 /// Below this distance from an axis's center, the drag-to-place box is
 /// locked exactly centered on that axis — see [`BrowseApp::drag_to_place`].
 /// Widened from the `/prototype`-validated 10px after live-testing the real
@@ -487,6 +505,45 @@ fn tier_filter_ui(ui: &mut egui::Ui, selected: &mut HashSet<String>) {
 /// An empty filter set means "no filter" — every tier passes.
 fn tier_matches(selected: &HashSet<String>, tier: &str) -> bool {
     selected.is_empty() || selected.contains(tier)
+}
+
+/// Mission-type checkboxes for the fissure filter, wrapped across lines since
+/// [`MISSION_TYPES`] is too long for one row at this panel's width.
+fn mission_type_filter_ui(ui: &mut egui::Ui, selected: &mut HashSet<String>) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Mission:");
+        for mission_type in MISSION_TYPES {
+            let mut checked = selected.contains(mission_type);
+            if ui.checkbox(&mut checked, mission_type).changed() {
+                if checked {
+                    selected.insert(mission_type.to_string());
+                } else {
+                    selected.remove(mission_type);
+                }
+            }
+        }
+    });
+}
+
+/// Kind checkboxes (Normal / Steel Path / Void Storm) for the fissure
+/// filter. Stored as the no-space tokens `FissureFilter::kinds` expects
+/// ("Normal"/"SteelPath"/"VoidStorm"), labeled with their display names.
+fn fissure_kind_filter_ui(ui: &mut egui::Ui, selected: &mut HashSet<String>) {
+    const KINDS: [(&str, &str); 3] =
+        [("Normal", "Normal"), ("SteelPath", "Steel Path"), ("VoidStorm", "Void Storm")];
+    ui.horizontal(|ui| {
+        ui.label("Kind:");
+        for (token, label) in KINDS {
+            let mut checked = selected.contains(token);
+            if ui.checkbox(&mut checked, label).changed() {
+                if checked {
+                    selected.insert(token.to_string());
+                } else {
+                    selected.remove(token);
+                }
+            }
+        }
+    });
 }
 
 /// Insert or remove a wishlist `key` (see [`wf_relic::wishlist::key`]) from
@@ -1146,16 +1203,21 @@ impl Group {
 
 const GROUPS: [Group; 4] = [Group::Home, Group::Progress, Group::Relics, Group::Ducats];
 
-/// The Home tab's own sub-nav: general app settings/actions vs. the
-/// drag-to-place overlay mock. Split out so Placement's mock screen (260px
-/// tall on its own) doesn't force Overview's shorter content to scroll past
-/// it too, and so Placement's fields (which already live-apply and save
-/// themselves on release) don't need to share a page with the one field that
-/// still needs an explicit Save (the account id text box).
+/// The Home tab's own sub-nav: general app settings/actions, the
+/// drag-to-place overlay mock, and the fissure filter. Split out so
+/// Placement's mock screen (260px tall on its own) doesn't force Overview's
+/// shorter content to scroll past it too, and so Placement's fields (which
+/// already live-apply and save themselves on release) don't need to share a
+/// page with the one field that still needs an explicit Save (the account id
+/// text box). Fissures gets its own page rather than sharing Placement's
+/// since the filter's three checkbox rows are a distinct, growing concern
+/// (mission types alone are 13 checkboxes) with nothing placement-related
+/// about it beyond both living under [`OverlayConfig`].
 #[derive(Clone, Copy, PartialEq)]
 enum HomeSubTab {
     Overview,
     Placement,
+    Fissures,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1453,19 +1515,21 @@ impl BrowseApp {
     }
 
     /// The Home tab (#72): the default tab on open, replacing the old
-    /// Mastery default. Its own two-way sub-nav (see [`HomeSubTab`]) —
-    /// Overview (Scan Memory, account id, hotkey help, Save) and Placement
-    /// (the drag-to-place overlay mock) — replaces the single
-    /// scroll-everything page the Settings section folded into at #77: that
-    /// page's drag-to-place mock alone is 260px tall, easily pushing Overview's
-    /// shorter content past the window's min height (760x560) even though the
-    /// two sections have nothing to do with each other.
+    /// Mastery default. Its own sub-nav (see [`HomeSubTab`]) — Overview (Scan
+    /// Memory, account id, hotkey help, Save), Placement (the drag-to-place
+    /// overlay mock), and Fissures (the fissure-panel filter) — replaces the
+    /// single scroll-everything page the Settings section folded into at
+    /// #77: that page's drag-to-place mock alone is 260px tall, easily
+    /// pushing Overview's shorter content past the window's min height
+    /// (760x560) even though the sections have nothing to do with each
+    /// other.
     fn home_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading("Home");
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.home_sub_tab, HomeSubTab::Overview, "Overview");
             ui.selectable_value(&mut self.home_sub_tab, HomeSubTab::Placement, "Placement");
+            ui.selectable_value(&mut self.home_sub_tab, HomeSubTab::Fissures, "Fissures");
         });
         ui.add_space(10.0);
         ui.separator();
@@ -1474,6 +1538,7 @@ impl BrowseApp {
         egui::ScrollArea::vertical().id_salt("home_scroll").show(ui, |ui| match self.home_sub_tab {
             HomeSubTab::Overview => self.home_overview_tab(ui),
             HomeSubTab::Placement => self.home_placement_tab(ui),
+            HomeSubTab::Fissures => self.home_fissures_tab(ui),
         });
     }
 
@@ -1621,6 +1686,28 @@ impl BrowseApp {
             });
 
         if commit {
+            self.commit_overlay_settings();
+        }
+
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new(&self.settings_status).weak());
+    }
+
+    /// The Home tab's Fissures page (see [`HomeSubTab`]): which active
+    /// fissures the panel shows (e.g. only Axi Capture). Same live-apply/
+    /// save-on-change behavior as [`Self::home_placement_tab`] — no Save
+    /// button, the status line gives the same feedback.
+    fn home_fissures_tab(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Fissure filter — leave a row blank to show every fissure.").weak());
+        ui.add_space(8.0);
+
+        let filter = &mut self.config.overlay.fissure_filter;
+        let before = filter.clone();
+        tier_filter_ui(ui, &mut filter.tiers);
+        mission_type_filter_ui(ui, &mut filter.mission_types);
+        fissure_kind_filter_ui(ui, &mut filter.kinds);
+
+        if *filter != before {
             self.commit_overlay_settings();
         }
 

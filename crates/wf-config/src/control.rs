@@ -52,6 +52,7 @@ pub struct LiveOverlaySettings {
     pub margin_y: i32,
     pub opacity: f32,
     pub fissures: bool,
+    pub fissure_filter: wf_data::worldstate::FissureFilter,
 }
 
 impl From<&OverlayConfig> for LiveOverlaySettings {
@@ -62,18 +63,46 @@ impl From<&OverlayConfig> for LiveOverlaySettings {
             margin_y: o.margin_y,
             opacity: o.opacity,
             fissures: o.fissures,
+            fissure_filter: o.fissure_filter.clone(),
         }
     }
+}
+
+/// Encode a `HashSet<String>` as a comma-joined, sorted list for a single
+/// `apply-settings` token — spaces become underscores (no known mission-type
+/// name uses one) so the list survives the wire format's whitespace-based
+/// tokenizing untouched.
+fn encode_list(items: &std::collections::HashSet<String>) -> String {
+    let mut v: Vec<String> = items.iter().map(|s| s.replace(' ', "_")).collect();
+    v.sort();
+    v.join(",")
+}
+
+/// Inverse of [`encode_list`].
+fn decode_list(s: &str) -> std::collections::HashSet<String> {
+    if s.is_empty() {
+        return std::collections::HashSet::new();
+    }
+    s.split(',').map(|t| t.replace('_', " ")).collect()
 }
 
 /// Encode an `apply-settings` control-socket message. Wire format is one
 /// line of space-separated `key=value` tokens, matching the existing
 /// single-word `toggle`/`show`/`hide`/`copy` commands' plain-text style
 /// rather than introducing a new dependency (JSON etc) for five scalars.
+/// The fissure filter's three sets ride the same scheme via [`encode_list`].
 pub fn format_apply_settings(s: &LiveOverlaySettings) -> String {
     format!(
-        "{APPLY_SETTINGS_CMD} anchor={} margin_x={} margin_y={} opacity={} fissures={}",
-        s.anchor, s.margin_x, s.margin_y, s.opacity, s.fissures
+        "{APPLY_SETTINGS_CMD} anchor={} margin_x={} margin_y={} opacity={} fissures={} \
+         fissure_tiers={} fissure_types={} fissure_kinds={}",
+        s.anchor,
+        s.margin_x,
+        s.margin_y,
+        s.opacity,
+        s.fissures,
+        encode_list(&s.fissure_filter.tiers),
+        encode_list(&s.fissure_filter.mission_types),
+        encode_list(&s.fissure_filter.kinds),
     )
 }
 
@@ -84,6 +113,7 @@ pub fn parse_apply_settings(line: &str) -> Option<LiveOverlaySettings> {
     let rest = line.trim().strip_prefix(APPLY_SETTINGS_CMD)?.trim();
     let (mut anchor, mut margin_x, mut margin_y, mut opacity, mut fissures) =
         (None, None, None, None, None);
+    let (mut fissure_tiers, mut fissure_types, mut fissure_kinds) = (None, None, None);
     for token in rest.split_whitespace() {
         let (key, value) = token.split_once('=')?;
         match key {
@@ -92,6 +122,9 @@ pub fn parse_apply_settings(line: &str) -> Option<LiveOverlaySettings> {
             "margin_y" => margin_y = value.parse().ok(),
             "opacity" => opacity = value.parse().ok(),
             "fissures" => fissures = value.parse().ok(),
+            "fissure_tiers" => fissure_tiers = Some(decode_list(value)),
+            "fissure_types" => fissure_types = Some(decode_list(value)),
+            "fissure_kinds" => fissure_kinds = Some(decode_list(value)),
             _ => {}
         }
     }
@@ -101,6 +134,11 @@ pub fn parse_apply_settings(line: &str) -> Option<LiveOverlaySettings> {
         margin_y: margin_y?,
         opacity: opacity?,
         fissures: fissures?,
+        fissure_filter: wf_data::worldstate::FissureFilter {
+            tiers: fissure_tiers?,
+            mission_types: fissure_types?,
+            kinds: fissure_kinds?,
+        },
     })
 }
 
@@ -139,6 +177,27 @@ mod tests {
             margin_y: 34,
             opacity: 0.75,
             fissures: false,
+            fissure_filter: wf_data::worldstate::FissureFilter {
+                tiers: ["Axi".to_string(), "Neo".to_string()].into_iter().collect(),
+                mission_types: ["Capture".to_string(), "Mobile Defense".to_string()]
+                    .into_iter()
+                    .collect(),
+                kinds: ["SteelPath".to_string()].into_iter().collect(),
+            },
+        };
+        let line = format_apply_settings(&s);
+        assert_eq!(parse_apply_settings(&line), Some(s));
+    }
+
+    #[test]
+    fn apply_settings_roundtrips_with_empty_fissure_filter() {
+        let s = LiveOverlaySettings {
+            anchor: "top-right".to_string(),
+            margin_x: 24,
+            margin_y: 24,
+            opacity: 1.0,
+            fissures: true,
+            fissure_filter: wf_data::worldstate::FissureFilter::default(),
         };
         let line = format_apply_settings(&s);
         assert_eq!(parse_apply_settings(&line), Some(s));

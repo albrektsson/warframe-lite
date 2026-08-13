@@ -10,3 +10,4 @@ serde.workspace = true
 toml.workspace = true
 directories.workspace = true
 tracing.workspace = true
+wf-data.workspace = true

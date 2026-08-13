@@ -12,7 +12,7 @@
 //! objects — only an `expiry` timestamp — so we compute remaining time
 //! ourselves from `expiry`.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 const BASE: &str = "https://api.warframestat.us";
@@ -44,6 +44,39 @@ impl Fissure {
     /// Whether the fissure has not yet expired.
     pub fn active(&self) -> bool {
         !is_expired(&self.expiry)
+    }
+}
+
+/// A fissure-panel filter: OR within each field, AND across fields. An empty
+/// set on any field means "no filter on that field" (matches the convention
+/// wf-browse's `tier_matches()` already uses for relic filters).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FissureFilter {
+    pub tiers: std::collections::HashSet<String>,
+    pub mission_types: std::collections::HashSet<String>,
+    /// "Normal" | "SteelPath" | "VoidStorm" — no spaces, so these tokens
+    /// round-trip safely through the control-socket wire format unchanged.
+    pub kinds: std::collections::HashSet<String>,
+}
+
+impl FissureFilter {
+    /// Whether any field constrains the filter at all.
+    pub fn is_active(&self) -> bool {
+        !self.tiers.is_empty() || !self.mission_types.is_empty() || !self.kinds.is_empty()
+    }
+
+    pub fn matches(&self, f: &Fissure) -> bool {
+        let kind = if f.is_storm {
+            "VoidStorm"
+        } else if f.is_hard {
+            "SteelPath"
+        } else {
+            "Normal"
+        };
+        (self.tiers.is_empty() || self.tiers.contains(&f.tier))
+            && (self.mission_types.is_empty() || self.mission_types.contains(&f.mission_type))
+            && (self.kinds.is_empty() || self.kinds.contains(kind))
     }
 }
 
@@ -141,5 +174,83 @@ mod tests {
     fn empty_timestamp_is_not_expired_and_has_blank_eta() {
         assert!(!is_expired(""));
         assert_eq!(format_eta(""), "");
+    }
+
+    fn fissure(tier: &str, mission_type: &str, is_hard: bool, is_storm: bool) -> Fissure {
+        Fissure {
+            node: "Hepit (Void)".to_string(),
+            mission_type: mission_type.to_string(),
+            tier: tier.to_string(),
+            is_hard,
+            is_storm,
+            expiry: String::new(),
+        }
+    }
+
+    #[test]
+    fn empty_filter_matches_everything() {
+        let filter = FissureFilter::default();
+        assert!(!filter.is_active());
+        assert!(filter.matches(&fissure("Axi", "Capture", false, false)));
+        assert!(filter.matches(&fissure("Lith", "Survival", true, false)));
+    }
+
+    #[test]
+    fn tier_only_filter() {
+        let filter = FissureFilter {
+            tiers: ["Axi".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        assert!(filter.is_active());
+        assert!(filter.matches(&fissure("Axi", "Capture", false, false)));
+        assert!(!filter.matches(&fissure("Neo", "Capture", false, false)));
+    }
+
+    #[test]
+    fn mission_type_only_filter() {
+        let filter = FissureFilter {
+            mission_types: ["Capture".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        assert!(filter.matches(&fissure("Axi", "Capture", false, false)));
+        assert!(!filter.matches(&fissure("Axi", "Survival", false, false)));
+    }
+
+    #[test]
+    fn kind_only_filter() {
+        let steel_path = FissureFilter {
+            kinds: ["SteelPath".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        assert!(steel_path.matches(&fissure("Axi", "Capture", true, false)));
+        assert!(!steel_path.matches(&fissure("Axi", "Capture", false, false)));
+        assert!(!steel_path.matches(&fissure("Axi", "Capture", false, true)));
+
+        let normal = FissureFilter {
+            kinds: ["Normal".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        assert!(normal.matches(&fissure("Axi", "Capture", false, false)));
+        assert!(!normal.matches(&fissure("Axi", "Capture", true, false)));
+
+        let void_storm = FissureFilter {
+            kinds: ["VoidStorm".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        assert!(void_storm.matches(&fissure("Axi", "Capture", false, true)));
+        assert!(!void_storm.matches(&fissure("Axi", "Capture", false, false)));
+    }
+
+    #[test]
+    fn combined_filter_ors_within_field_and_ands_across_fields() {
+        let filter = FissureFilter {
+            tiers: ["Axi".to_string(), "Neo".to_string()].into_iter().collect(),
+            mission_types: ["Capture".to_string()].into_iter().collect(),
+            kinds: std::collections::HashSet::new(),
+        };
+        assert!(filter.matches(&fissure("Axi", "Capture", false, false)));
+        assert!(filter.matches(&fissure("Neo", "Capture", false, false)));
+        assert!(!filter.matches(&fissure("Axi", "Survival", false, false)));
+        assert!(!filter.matches(&fissure("Lith", "Capture", false, false)));
     }
 }

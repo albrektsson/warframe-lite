@@ -56,6 +56,9 @@ pub struct OverlayConfig {
     /// Show the persistent live-Fissure panel. When `false`, the overlay is
     /// invisible until a relic reward screen is detected (reward-only mode).
     pub fissures: bool,
+    /// Which fissures the panel shows when `fissures` is on — e.g. only Axi
+    /// Capture. An empty/default filter shows every active fissure.
+    pub fissure_filter: wf_data::worldstate::FissureFilter,
     /// Panel opacity, `0.0` (invisible) to `1.0` (as-drawn). Scales the whole
     /// panel's alpha so it obscures less of the game behind it.
     pub opacity: f32,
@@ -79,6 +82,7 @@ impl Default for OverlayConfig {
             margin_x: 24,
             margin_y: 24,
             fissures: true,
+            fissure_filter: wf_data::worldstate::FissureFilter::default(),
             opacity: 1.0,
             reward_pitch: None,
             reward_center_x: None,
