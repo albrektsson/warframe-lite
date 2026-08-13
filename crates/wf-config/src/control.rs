@@ -1,8 +1,8 @@
 //! The overlay's Unix control socket protocol: bare `toggle`/`show`/`hide`/
-//! `copy` commands (unstructured single words, parsed directly by the
-//! overlay's own listener) plus a structured `apply-settings ...` command
-//! carrying the anchor/margin/opacity/fissures fields a settings UI can push
-//! to a running overlay without a restart.
+//! `copy`/`demo-on`/`demo-off` commands (unstructured single words, parsed
+//! directly by the overlay's own listener) plus a structured
+//! `apply-settings ...` command carrying the anchor/margin/opacity/fissures
+//! fields a settings UI can push to a running overlay without a restart.
 //!
 //! Live-apply is possible because reconfiguring an already-committed
 //! `zwlr_layer_shell_v1` surface in place — `set_anchor`/`set_margin`/
@@ -11,7 +11,7 @@
 //!
 //! Shared between the overlay process (the listener) and anyone driving it:
 //! the CLI's `toggle`/`show`/`hide`/`copy` subcommands, and the settings UIs
-//! pushing `apply-settings` on commit.
+//! pushing `apply-settings` on commit and `demo-on`/`demo-off` around focus.
 
 use std::path::PathBuf;
 
@@ -22,6 +22,16 @@ use crate::OverlayConfig;
 /// Command name for the apply-settings message (see
 /// [`format_apply_settings`]/[`parse_apply_settings`]).
 pub const APPLY_SETTINGS_CMD: &str = "apply-settings";
+
+/// Swap a running overlay to curated, hardcoded content — a fixed reward
+/// panel and a fixed fissures panel, cycled — so a settings UI can preview
+/// placement/opacity against every visually-distinct panel state without
+/// waiting on a live reward drop or live fissures. `demo-off` resumes
+/// showing whatever the overlay's background eval/poll loop has been
+/// computing the whole time (that loop keeps running underneath demo mode).
+/// Bare words, no payload, matching `toggle`/`show`/`hide`/`copy`'s style.
+pub const DEMO_ON_CMD: &str = "demo-on";
+pub const DEMO_OFF_CMD: &str = "demo-off";
 
 /// Filesystem path of the overlay's control socket. Placed in the per-user
 /// runtime dir when available, falling back to the temp dir.

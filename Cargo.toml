@@ -109,7 +109,7 @@ path = "src/main.rs"
 # so the consent model doesn't change: per ADR-0001/ADR-0013, only running
 # `wf-lite mem-scan` itself is consent, never the build-time default.
 default = ["mem-scan", "ocr"]
-mem-scan = ["dep:wf-mem", "dep:time"]
+mem-scan = ["dep:wf-mem"]
 # Gates OCR (in-process libtesseract/libleptonica FFI, ADR-0008) and
 # relic-grid scanning. #71 made this opt-in (mirroring `mem-scan`'s old
 # pattern), but the automatic relic reward picker — the app's main point,
@@ -170,6 +170,8 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 image.workspace = true
-# Only used to format `mem-scan`'s Foundry completion ETAs; kept optional so
-# it doesn't join the default build's dependency set.
-time = { workspace = true, optional = true }
+# Formats `mem-scan`'s Foundry completion ETAs and builds the overlay's
+# demo-mode synthetic Fissure timestamps (see `spawn_control_listener`'s
+# `demo-on`/`demo-off` handling) — both unconditional now, so this is no
+# longer feature-gated.
+time.workspace = true

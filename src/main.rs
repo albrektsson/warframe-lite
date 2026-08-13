@@ -1171,6 +1171,92 @@ async fn reward_png(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Curated item names run through the real eval/mastery/owned-parts/wishlist
+/// pipeline for the overlay's demo mode — same pattern as [`reward_png`], but
+/// using clean names (not deliberately-garbled OCR text) since these render
+/// straight into a live preview rather than exercising fuzzy matching.
+/// Whether a given row actually lands on "vaulted"/"wishlisted"/"no price"
+/// depends on the current player's live mastery/wishlist/vaulted state, so
+/// coverage of those categories is pipeline-driven, not guaranteed.
+const DEMO_REWARD_NAMES: &[&str] = &[
+    "Volt Prime Systems",
+    "Nyx Prime Chassis",
+    "Loki Prime Neuroptics",
+    "Ash Prime Blueprint",
+];
+
+/// How long each demo-mode state (reward panel, then fissures panel) stays
+/// up before [`run_overlay`]'s frame builder cycles to the next one.
+const DEMO_CYCLE: Duration = Duration::from_secs(4);
+
+/// Curated overlay content for demo mode (see [`spawn_control_listener`]'s
+/// `demo-on`/`demo-off` handling): a fixed reward panel and a fixed fissures
+/// panel, computed once when `demo-on` arrives and then cycled by
+/// `run_overlay`'s frame builder — so a settings UI can preview
+/// placement/opacity against every visually-distinct panel state without
+/// needing a live reward drop or live fissures to wait for.
+struct DemoFrames {
+    reward_rows: Vec<wf_overlay::RewardRow>,
+    fissures: worldstate::WorldState,
+    /// When these frames were computed — cycling is timed off this rather
+    /// than a frame counter, so it stays correct regardless of render cadence.
+    started: std::time::Instant,
+}
+
+/// Build [`DemoFrames`]: [`DEMO_REWARD_NAMES`] run through the real eval
+/// pipeline (mirrors [`reward_png`]) for the reward panel, plus a small fixed
+/// spread of synthetic Fissures for the fissures panel.
+async fn build_demo_frames(config: &Config, client: &reqwest::Client) -> Result<DemoFrames> {
+    let names: Vec<String> = DEMO_REWARD_NAMES.iter().map(|s| s.to_string()).collect();
+    let index = wf_relic::ItemIndex::load_cached(client, CATALOGUE_TTL).await?;
+    let market = MarketClient::new(client.clone(), config.market_platform.clone());
+    let cache = wf_relic::price_cache();
+    let vaulted = load_vaulted(client, &index).await;
+    let evals =
+        wf_relic::evaluate_cached(&names, &index, &market, &cache, wf_relic::PriceOpts::default(), &vaulted)
+            .await;
+    let mastery = load_mastery(config, client).await;
+    let owned_parts = wf_cache::load_blob::<wf_relic::OwnedPrimeParts>(wf_relic::OWNED_PRIME_PARTS_FILE)
+        .map(|s| s.value)
+        .unwrap_or_default();
+    let wishlist = wf_cache::load_blob::<wf_relic::Wishlist>(wf_relic::WISHLIST_FILE)
+        .map(|s| s.value)
+        .unwrap_or_default();
+    Ok(DemoFrames {
+        reward_rows: reward_rows(&evals, &mastery, &owned_parts, &wishlist),
+        fissures: demo_fissures(),
+        started: std::time::Instant::now(),
+    })
+}
+
+/// Synthetic active Fissures for demo mode's fissures-panel state: a small
+/// fixed spread of tiers/mission types — including a Steel Path and a Void
+/// Storm fissure — so the panel's badge colors and layout are all visible at
+/// once. Expiry is far enough out to outlast any demo session.
+fn demo_fissures() -> worldstate::WorldState {
+    let expiry = (time::OffsetDateTime::now_utc() + time::Duration::hours(6))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+    let fissure = |node: &str, mission_type: &str, tier: &str, is_hard: bool, is_storm: bool| {
+        worldstate::Fissure {
+            node: node.to_string(),
+            mission_type: mission_type.to_string(),
+            tier: tier.to_string(),
+            is_hard,
+            is_storm,
+            expiry: expiry.clone(),
+        }
+    };
+    worldstate::WorldState {
+        fissures: vec![
+            fissure("Hepit (Void)", "Capture", "Axi", false, false),
+            fissure("Ukko (Void)", "Exterminate", "Neo", true, false),
+            fissure("Override (Void)", "Void Storm", "Requiem", false, true),
+            fissure("Cambria (Void)", "Survival", "Lith", false, false),
+        ],
+    }
+}
+
 /// Print a ranked reward table: plat, best-pick marker, and mastery status.
 fn print_reward_table(evals: &[wf_relic::RewardEval], mastery: &wf_relic::MasterySet) {
     let best_pick = wf_relic::best_pick(evals, mastery);
@@ -1331,6 +1417,12 @@ fn current_reward_rows(reward: &RewardState) -> Option<Vec<wf_overlay::RewardRow
 /// nothing (see [`crate::run_overlay`]'s panel priority).
 type RelicScanStatus = std::sync::Arc<std::sync::Mutex<Option<wf_overlay::ScanProgress>>>;
 
+/// The current [`DemoFrames`], if demo mode is on — set by `demo-on` (once
+/// [`build_demo_frames`] finishes fetching) and cleared by `demo-off` (see
+/// [`spawn_control_listener`]). Takes top priority in `make_frame` over
+/// [`crate::run_overlay`]'s normal reward/relic-scan/fissures panels.
+type DemoState = std::sync::Arc<std::sync::Mutex<Option<DemoFrames>>>;
+
 /// Show the live overlay as a `wlr-layer-shell` surface: live Fissures normally,
 /// automatically swapping to the relic reward result for a few seconds when a
 /// fissure reward is detected in the log.
@@ -1344,6 +1436,7 @@ async fn run_overlay(config: Config) -> Result<()> {
     let refresh = Duration::from_secs(config.fissure_refresh_secs.max(15));
     let reward: RewardState = Arc::new(Mutex::new(None));
     let relic_scan_status: RelicScanStatus = Arc::new(Mutex::new(None));
+    let demo: DemoState = Arc::new(Mutex::new(None));
 
     // Appearance/visibility knobs. `visible` is flipped at runtime by the control
     // socket (see `overlay_control`); `live` holds the anchor/margin/opacity/
@@ -1357,15 +1450,20 @@ async fn run_overlay(config: Config) -> Result<()> {
     // Build one overlay frame from the current state, honoring reward-only mode,
     // the visibility toggle, and opacity. A hidden or empty frame is a fully
     // transparent (click-through) canvas.
-    // Panel priority when shown: reward screen (time-critical, ~20s) → an
-    // in-progress relic scan's live status → live fissures → blank. The ranked
-    // owned-relic guide (`wf-lite relic-guide-png`'s `render_relic_panel`) isn't
-    // shown live here — that view lives in `wf-lite browse` instead, which reads
-    // the same `owned-relics.json` without the live overlay's latency budget.
+    // Panel priority when shown: demo mode (a settings UI is previewing
+    // placement/opacity — see `spawn_control_listener`'s `demo-on`/`demo-off`)
+    // → reward screen (time-critical, ~20s) → an in-progress relic scan's live
+    // status → live fissures → blank. The ranked owned-relic guide (`wf-lite
+    // relic-guide-png`'s `render_relic_panel`) isn't shown live here — that
+    // view lives in `wf-lite browse` instead, which reads the same
+    // `owned-relics.json` without the live overlay's latency budget, and
+    // demo mode doesn't preview it either (it only cycles panels the live
+    // overlay actually renders).
     let make_frame = {
         let font = font.clone();
         let reward = reward.clone();
         let relic_scan_status = relic_scan_status.clone();
+        let demo = demo.clone();
         let live = live.clone();
         move |ws: &worldstate::WorldState, shown: bool| -> wf_overlay::Canvas {
             let (show_fissures, opacity) = {
@@ -1375,6 +1473,16 @@ async fn run_overlay(config: Config) -> Result<()> {
             let blank = || wf_overlay::Canvas::new(OVERLAY_W, OVERLAY_H);
             let mut c = if !shown {
                 blank()
+            } else if let Some(frames) = demo.lock().unwrap().as_ref() {
+                // Alternate between the reward panel and the fissures panel
+                // every `DEMO_CYCLE`, timed off when the frames were built
+                // rather than a render-frame counter.
+                let cycle = frames.started.elapsed().as_secs() / DEMO_CYCLE.as_secs().max(1);
+                if cycle.is_multiple_of(2) {
+                    wf_overlay::render_reward_panel(&frames.reward_rows, &font).embed(OVERLAY_W, OVERLAY_H)
+                } else {
+                    wf_overlay::render_panel(&frames.fissures, &font).embed(OVERLAY_W, OVERLAY_H)
+                }
             } else if let Some(rows) = current_reward_rows(&reward) {
                 wf_overlay::render_reward_panel(&rows, &font).embed(OVERLAY_W, OVERLAY_H)
             } else if let Some(progress) = *relic_scan_status.lock().unwrap() {
@@ -1418,11 +1526,20 @@ async fn run_overlay(config: Config) -> Result<()> {
     let (placement_tx, placement_rx) = mpsc::channel();
 
     // Control socket: `wf-lite toggle|show|hide` flips `visible` at runtime,
-    // `copy` copies the current best-pick reward, and `apply-settings` (from a
+    // `copy` copies the current best-pick reward, `apply-settings` (from a
     // settings UI) updates `live` and re-anchors the layer surface via
-    // `placement_tx` — so a KDE global shortcut or a running settings tab can
-    // both act on a running overlay on demand, no restart needed.
-    spawn_control_listener(visible.clone(), reward.clone(), live.clone(), placement_tx);
+    // `placement_tx`, and `demo-on`/`demo-off` swap `demo` in and out — so a
+    // KDE global shortcut or a running settings tab can both act on a running
+    // overlay on demand, no restart needed.
+    spawn_control_listener(
+        visible.clone(),
+        reward.clone(),
+        live.clone(),
+        demo.clone(),
+        placement_tx,
+        config.clone(),
+        client.clone(),
+    );
 
     // Relic auto-detection: needs tesseract, an EE.log, and the item catalogue.
     // Delegates to the `ocr` module — the real implementation when the `ocr`
@@ -1512,15 +1629,22 @@ async fn run_overlay(config: Config) -> Result<()> {
 }
 
 /// Listen on the control socket for `toggle` / `show` / `hide` / `copy` /
-/// `apply-settings ...` lines and act on the shared `visible` flag / `reward`
-/// state / `live` settings (re-anchoring the layer surface live via
-/// `placement_tx` for `apply-settings`). A stale socket file from a previous
-/// run is removed first. Runs for the life of the overlay.
+/// `apply-settings ...` / `demo-on` / `demo-off` lines and act on the shared
+/// `visible` flag / `reward` state / `live` settings (re-anchoring the layer
+/// surface live via `placement_tx` for `apply-settings`) / `demo` state.
+/// `demo-on` fetches [`build_demo_frames`] on its own task rather than
+/// blocking this accept loop — it hits the network (item catalogue, market,
+/// mastery) — so `demo` only flips once the fetch completes; `demo-off` clears
+/// it immediately. A stale socket file from a previous run is removed first.
+/// Runs for the life of the overlay.
 fn spawn_control_listener(
     visible: std::sync::Arc<std::sync::atomic::AtomicBool>,
     reward: RewardState,
     live: std::sync::Arc<std::sync::Mutex<wf_config::control::LiveOverlaySettings>>,
+    demo: DemoState,
     placement_tx: std::sync::mpsc::Sender<wf_overlay::layer::Placement>,
+    config: Config,
+    client: reqwest::Client,
 ) {
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncReadExt;
@@ -1552,6 +1676,24 @@ fn spawn_control_listener(
                 "show" => visible.store(true, Ordering::Relaxed),
                 "hide" => visible.store(false, Ordering::Relaxed),
                 "copy" => copy_best_reward(&reward),
+                wf_config::control::DEMO_ON_CMD => {
+                    let demo = demo.clone();
+                    let config = config.clone();
+                    let client = client.clone();
+                    tokio::spawn(async move {
+                        match build_demo_frames(&config, &client).await {
+                            Ok(frames) => {
+                                *demo.lock().unwrap() = Some(frames);
+                                tracing::info!("demo mode on");
+                            }
+                            Err(e) => tracing::warn!("demo mode: building demo frames failed: {e:#}"),
+                        }
+                    });
+                }
+                wf_config::control::DEMO_OFF_CMD => {
+                    *demo.lock().unwrap() = None;
+                    tracing::info!("demo mode off");
+                }
                 other if other.starts_with(wf_config::control::APPLY_SETTINGS_CMD) => {
                     match wf_config::control::parse_apply_settings(other) {
                         Some(p) => {
@@ -1752,5 +1894,24 @@ mod worldstate_retry_tests {
         let base = Duration::from_secs(60);
         assert_eq!(worldstate_retry_interval(base, 4), Duration::from_secs(600));
         assert_eq!(worldstate_retry_interval(base, 30), Duration::from_secs(600));
+    }
+}
+
+#[cfg(test)]
+mod demo_fissures_tests {
+    use super::demo_fissures;
+
+    #[test]
+    fn every_synthetic_fissure_is_active() {
+        let ws = demo_fissures();
+        assert!(!ws.fissures.is_empty());
+        assert!(ws.fissures.iter().all(|f| f.active()));
+    }
+
+    #[test]
+    fn covers_a_steel_path_and_a_void_storm_fissure() {
+        let ws = demo_fissures();
+        assert!(ws.fissures.iter().any(|f| f.is_hard), "expected a Steel Path fissure");
+        assert!(ws.fissures.iter().any(|f| f.is_storm), "expected a Void Storm fissure");
     }
 }
