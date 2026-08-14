@@ -916,6 +916,8 @@ async fn mastery_plan_cmd(config: &Config) -> Result<()> {
     let owned_parts = wf_cache::load_blob::<wf_relic::OwnedPrimeParts>(wf_relic::OWNED_PRIME_PARTS_FILE)
         .map(|s| s.value)
         .unwrap_or_default();
+    let mem_scanned_parts =
+        wf_cache::load_blob::<bool>(wf_relic::owned_parts::OWNED_PARTS_MEM_SCANNED_MARKER_FILE).is_some();
 
     // Price every owned relic (not the whole catalogue) so the breakdown can
     // list cheapest first — the mastery_plan_cmd equivalent of relics_cmd's
@@ -933,7 +935,13 @@ async fn mastery_plan_cmd(config: &Config) -> Result<()> {
     }
     cache.save();
 
-    let ctx = wf_relic::RelicContext { index: &index, mastery: &mastery, quantities: &quantities, owned_parts: &owned_parts };
+    let ctx = wf_relic::RelicContext {
+        index: &index,
+        mastery: &mastery,
+        quantities: &quantities,
+        owned_parts: &owned_parts,
+        mem_scanned_parts,
+    };
     let plans = wf_relic::mastery_plan(&evidence, &relic_prices, &std::collections::HashMap::new(), &ctx);
 
     if plans.is_empty() {
@@ -1618,10 +1626,10 @@ async fn run_overlay(config: Config) -> Result<()> {
 
     println!("\n== Live overlay (Ctrl-C to stop) ==");
     println!(
-        "  placement: {} (margin {}x{}); fissure panel: {}; opacity: {}",
+        "  placement: {} (margin {:.0}%x{:.0}%); fissure panel: {}; opacity: {}",
         config.overlay.anchor,
-        config.overlay.margin_x,
-        config.overlay.margin_y,
+        config.overlay.margin_x.clamp(0.0, 1.0) * 100.0,
+        config.overlay.margin_y.clamp(0.0, 1.0) * 100.0,
         if config.overlay.fissures { "on" } else { "reward-only" },
         config.overlay.opacity,
     );

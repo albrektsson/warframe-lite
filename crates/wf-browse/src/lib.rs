@@ -60,6 +60,15 @@ const PRICE_FETCH_CONCURRENCY: usize = 8;
 /// a slug with nothing cached yet whose fetch times out gets stuck on `None`
 /// forever) clears up within the same session instead of needing a relaunch.
 const LAZY_PRICE_RETRY_COOLDOWN: Duration = Duration::from_secs(45);
+/// How many relic badges the Relics & Plan tab's "relics you own that can
+/// still drop it" cell shows before collapsing the rest into a "+N more"
+/// label (mirroring [`worst_off_part_cell`]'s "+N more" pattern). A part
+/// with many owned sourcing relics would otherwise force that column — and,
+/// via `egui::Grid`'s shared column widths, every row in the whole table —
+/// wide enough to overflow the window horizontally. `g.relics` is already
+/// sorted cheapest-first (see [`wf_relic::PrimePartGroup::relics`]), so the
+/// shown relics are also the most actionable ones.
+const RELIC_LIST_MAX_VISIBLE: usize = 3;
 /// How often the Relics & Plan, Sell, and Farm tabs' Owned relic counts and
 /// active-Fissure flag refresh while the window stays open. Only these two (a
 /// local file and a lightweight world-state fetch) are cheap enough to poll;
@@ -214,47 +223,19 @@ fn anchor_for(x_pin: AxisPin, y_pin: AxisPin) -> &'static str {
     }
 }
 
-/// `wf-overlay`'s actual rendered panel size — duplicated from
-/// `wf_overlay::render::WIDTH` (460) and `src/main.rs`'s `OVERLAY_H` (340)
-/// rather than pulling the `wf-overlay` crate (and its Wayland/
-/// smithay-client-toolkit dependency tree) into `wf-browse` just for two
-/// integers, matching this crate's existing small-constant-duplication
-/// convention (see `ANCHORS`'s docs).
-const REAL_OVERLAY_SIZE: egui::Vec2 = egui::Vec2::new(460.0, 340.0);
-
-/// Ratio between how far a margin can meaningfully go on the real screen
-/// `wf-overlay` renders to, vs. on [`BrowseApp::drag_to_place`]'s small
-/// mock screen — i.e. a *percentage-of-max-margin* conversion, not a flat
-/// pixel-count scale. "Max margin" on either screen is the value at which
-/// a pinned edge's position coincides with being centered — a drag that's
-/// N% of the way from flush-against-an-edge to centered in the mock should
-/// store a margin that's the same N% of the way to centered on the real
-/// screen, for *any* real resolution.
-///
-/// A flat `real_screen_width / mock_screen_width` multiplier (tried first,
-/// rejected after live-testing on a 3440px-wide monitor) gets this wrong
-/// because it ignores that the real overlay is a fixed 460×340px — a much
-/// smaller fraction of a wide real screen than the mock's own box is of
-/// its few-hundred-px mock screen, so "max margin" doesn't grow in
-/// proportion to raw screen width alone.
-///
-/// Best-effort: falls back to no scaling (1.0) if the monitor size isn't
-/// known yet (egui reports `None` for the first frame or two on Wayland
-/// before winit resolves it) or is too small to fit the real overlay.
-/// Uses whichever monitor `wf-browse`'s own window happens to be on as the
-/// reference — deliberately not exact per-output geometry for the
-/// overlay's actual target output, matching the map's "single generic
-/// mockup" scope; this is a proportional approximation, not real
-/// geometry-awareness.
-fn mock_to_real_scale(ctx: &egui::Context, mock_screen: egui::Vec2, mock_box: egui::Vec2) -> egui::Vec2 {
-    let mock_max = (mock_screen - mock_box) / 2.0;
-    match ctx.input(|i| i.viewport().monitor_size) {
-        Some(real) if real.x > REAL_OVERLAY_SIZE.x && real.y > REAL_OVERLAY_SIZE.y => {
-            let real_max = (real - REAL_OVERLAY_SIZE) / 2.0;
-            egui::vec2(real_max.x / mock_max.x, real_max.y / mock_max.y)
-        }
-        _ => egui::Vec2::splat(1.0),
-    }
+/// Half the room left over once the mock box is subtracted from the mock
+/// screen on each axis — the mock-space distance at which a pinned edge's
+/// position coincides with being centered. Stored margins are *fractions* of
+/// this (see [`wf_config::OverlayConfig::margin_x`]), not raw pixels: a drag
+/// that's N% of the way from flush-against-an-edge to centered in the mock
+/// stores exactly N%, and `wf_overlay::layer::edge_margins` re-derives the
+/// same N% against whatever real screen the overlay actually lands on — no
+/// cross-monitor scale factor needed, and thus nothing that can be thrown
+/// off by the settings window sitting on a different monitor than the game
+/// (see issue where a drag near the mock's edge landed the real overlay
+/// near center on a much wider monitor).
+fn mock_max_margin(mock_screen: egui::Vec2, mock_box: egui::Vec2) -> egui::Vec2 {
+    (mock_screen - mock_box) / 2.0
 }
 
 /// Top-left corner of a `size`-sized box anchored+margined on `screen`,
@@ -682,6 +663,18 @@ struct RelicEvContext<'a> {
     item_index: &'a Arc<ItemIndex>,
     quantities: &'a PartQuantities,
     owned_parts: &'a wf_relic::OwnedPrimeParts,
+    mem_scanned_parts: bool,
+}
+
+/// The Mastery tab's per-row read-only lookups, bundled (mirroring
+/// [`RelicEvContext`]) so [`BrowseApp::mastery_prime_row`] doesn't carry them
+/// as separate parameters (clippy's `too_many_arguments`).
+#[derive(Clone, Copy)]
+struct MasteryRowContext<'a> {
+    quantities: &'a PartQuantities,
+    part_market: &'a HashMap<PrimePart, PartMarketInfo>,
+    owned_parts: &'a wf_relic::OwnedPrimeParts,
+    mem_scanned_parts: bool,
 }
 
 /// The Relics & Plan tab's per-frame snapshot from [`Loaded`], bundled
@@ -724,6 +717,13 @@ struct Live {
     /// owned/need cell — refreshed on the same poll cadence as every other
     /// scan-derived field here, unlike the launch-time-only [`Loaded::quantities`].
     owned_parts: wf_relic::OwnedPrimeParts,
+    /// Whether `owned_parts` reflects at least one completed `wf-mem`
+    /// mem-scan (see [`wf_relic::owned_parts::OWNED_PARTS_MEM_SCANNED_MARKER_FILE`]).
+    /// Lets every owned/need cell fed by `owned_parts` show a part absent
+    /// from the scan as confirmed-zero rather than unknown, since a mem-scan
+    /// snapshot already treats absence that way (see
+    /// [`wf_relic::owned_parts::get_or_confirmed_zero`]).
+    mem_scanned_parts: bool,
     /// The Ducats tab's ducat-efficiency ranking of every owned Prime Part —
     /// recomputed each poll tick against the same launch-time `Prices::ducats`
     /// (a newly-scanned part's ducat value shows immediately since
@@ -798,6 +798,7 @@ impl Live {
     fn compute(
         owned: Option<&wf_cache::Stamped<wf_relic::OwnedRelics>>,
         owned_parts: &wf_relic::OwnedPrimeParts,
+        mem_scanned_parts: bool,
         static_data: &StaticData,
         prices: &Prices,
         active_tiers: HashSet<String>,
@@ -808,7 +809,7 @@ impl Live {
         // the richer evidence map (see wf_relic::owned_evidence).
         let counts = owned.map(|o| wf_relic::owned_counts(&o.value));
         let evidence = owned.map(|o| wf_relic::owned_evidence(&o.value));
-        let ctx = wf_relic::RelicContext { index, mastery, quantities, owned_parts };
+        let ctx = wf_relic::RelicContext { index, mastery, quantities, owned_parts, mem_scanned_parts };
         // mastery_plan/sell_picks/farm_picks already rank their output.
         let plans = evidence
             .as_ref()
@@ -822,6 +823,7 @@ impl Live {
             mastery,
             quantities,
             owned_parts,
+            mem_scanned_parts,
         );
         let owned_age_range = owned.and_then(|o| wf_relic::intact_age_range(&o.value));
         let ages = owned.map(|o| wf_relic::intact_ages(&o.value)).unwrap_or_default();
@@ -841,6 +843,7 @@ impl Live {
             ages,
             active_tiers,
             owned_parts: owned_parts.clone(),
+            mem_scanned_parts,
             ducat_picks,
             priceable_relic_slugs,
             unmastered_primes,
@@ -864,6 +867,7 @@ async fn load_and_poll(
         quantities,
         owned,
         owned_parts,
+        mem_scanned_parts,
         active_tiers,
         mut prices,
         part_market,
@@ -881,7 +885,8 @@ async fn load_and_poll(
     // anything, which `poll`'s own snapshot below picks up on its next tick.
     prices.sell = snapshot_prices(&relic_prices);
     prices.set = snapshot_prices(&set_prices);
-    let live = Live::compute(owned.as_ref(), &owned_parts, &static_data, &prices, active_tiers);
+    let live =
+        Live::compute(owned.as_ref(), &owned_parts, mem_scanned_parts, &static_data, &prices, active_tiers);
     *lock_loaded(&loaded) = Some(Loaded {
         mastery_rows,
         live,
@@ -940,6 +945,9 @@ async fn poll(args: PollArgs) {
             wf_cache::load_blob::<wf_relic::OwnedPrimeParts>(wf_relic::OWNED_PRIME_PARTS_FILE)
                 .map(|s| s.value)
                 .unwrap_or_default();
+        let mem_scanned_parts =
+            wf_cache::load_blob::<bool>(wf_relic::owned_parts::OWNED_PARTS_MEM_SCANNED_MARKER_FILE)
+                .is_some();
         let active_tiers = wf_data::worldstate::fetch(&client, &platform)
             .await
             .map(|ws| ws.active_fissure_tiers())
@@ -952,7 +960,14 @@ async fn poll(args: PollArgs) {
         };
         prices.sell = snapshot_prices(&relic_prices);
         prices.set = snapshot_prices(&set_prices);
-        let fresh = Live::compute(owned.as_ref(), &owned_parts, &static_data, &prices, active_tiers);
+        let fresh = Live::compute(
+            owned.as_ref(),
+            &owned_parts,
+            mem_scanned_parts,
+            &static_data,
+            &prices,
+            active_tiers,
+        );
         if let Some(l) = lock_loaded(&loaded).as_mut() {
             l.live = fresh;
         }
@@ -972,6 +987,7 @@ struct LoadedData {
     quantities: PartQuantities,
     owned: Option<wf_cache::Stamped<wf_relic::OwnedRelics>>,
     owned_parts: wf_relic::OwnedPrimeParts,
+    mem_scanned_parts: bool,
     active_tiers: HashSet<String>,
     prices: Prices,
     /// Vaulted status + ducat value per Prime Part, resolved once against the
@@ -1037,6 +1053,9 @@ async fn load_data(config: &Config) -> LoadedData {
         wf_cache::load_blob::<wf_relic::OwnedPrimeParts>(wf_relic::OWNED_PRIME_PARTS_FILE)
             .map(|s| s.value)
             .unwrap_or_default();
+    let mem_scanned_parts =
+        wf_cache::load_blob::<bool>(wf_relic::owned_parts::OWNED_PARTS_MEM_SCANNED_MARKER_FILE)
+            .is_some();
     let active_tiers = wf_data::worldstate::fetch(&client, &config.platform)
         .await
         .map(|ws| ws.active_fissure_tiers())
@@ -1098,6 +1117,7 @@ async fn load_data(config: &Config) -> LoadedData {
         quantities,
         owned,
         owned_parts,
+        mem_scanned_parts,
         active_tiers,
         prices: Prices {
             sell: HashMap::new(),
@@ -1743,9 +1763,15 @@ impl BrowseApp {
     /// Show/Sort controls apply *within* each category, not across them, so
     /// the category order itself never moves.
     fn mastery_tab(&mut self, ui: &mut egui::Ui) {
-        let Some((mastery_rows, quantities, part_market, owned_parts)) =
+        let Some((mastery_rows, quantities, part_market, owned_parts, mem_scanned_parts)) =
             self.loaded_or_placeholder(ui, |l| {
-                (l.mastery_rows.clone(), l.quantities.clone(), l.part_market.clone(), l.live.owned_parts.clone())
+                (
+                    l.mastery_rows.clone(),
+                    l.quantities.clone(),
+                    l.part_market.clone(),
+                    l.live.owned_parts.clone(),
+                    l.live.mem_scanned_parts,
+                )
             })
         else {
             return;
@@ -1803,6 +1829,12 @@ impl BrowseApp {
         // filtering did before — an empty category (every Prime filtered out)
         // is simply skipped rather than shown collapsed-and-empty.
         let force_open = (!filter.is_empty()).then_some(true);
+        let row_ctx = MasteryRowContext {
+            quantities: &quantities,
+            part_market: &part_market,
+            owned_parts: &owned_parts,
+            mem_scanned_parts,
+        };
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             for category in CATEGORY_ORDER {
@@ -1822,7 +1854,7 @@ impl BrowseApp {
                 .open(force_open)
                 .show(ui, |ui| {
                     for entry in entries {
-                        self.mastery_prime_row(ui, entry, &quantities, &part_market, &owned_parts, force_open);
+                        self.mastery_prime_row(ui, entry, &row_ctx, force_open);
                     }
                 });
             }
@@ -1839,11 +1871,10 @@ impl BrowseApp {
         &mut self,
         ui: &mut egui::Ui,
         entry: &MasteryEntry,
-        quantities: &PartQuantities,
-        part_market: &HashMap<PrimePart, PartMarketInfo>,
-        owned_parts: &wf_relic::OwnedPrimeParts,
+        ctx: &MasteryRowContext,
         force_open: Option<bool>,
     ) {
+        let MasteryRowContext { quantities, part_market, owned_parts, mem_scanned_parts } = *ctx;
         let (status_text, status_color) = if entry.mastered {
             ("✓ mastered", MASTERED_COLOR)
         } else {
@@ -1875,7 +1906,8 @@ impl BrowseApp {
                             let pp = PrimePart { prime: entry.prime.clone(), part: part.clone() };
                             ui.label(part);
 
-                            let owned = wf_relic::owned_parts::get(owned_parts, &pp);
+                            let owned =
+                                wf_relic::owned_parts::get_or_confirmed_zero(owned_parts, &pp, mem_scanned_parts);
                             ui.label(owned_count_cell(owned));
                             ui.label(need_count_cell(Some(*quantity)));
 
@@ -2012,7 +2044,7 @@ impl BrowseApp {
                             ui.label(owned_count_cell(g.owned));
                             ui.label(need_count_cell(g.build_quantity));
                             ui.horizontal_wrapped(|ui| {
-                                for (i, r) in g.relics.iter().enumerate() {
+                                for (i, r) in g.relics.iter().take(RELIC_LIST_MAX_VISIBLE).enumerate() {
                                     if i > 0 {
                                         ui.label(",");
                                     }
@@ -2034,6 +2066,10 @@ impl BrowseApp {
                                         wf_relic::RelicEvidence::SeenOnly => "seen".to_string(),
                                     };
                                     ui.label(format!("{}{flag} {qty}{price}{stale}", r.relic_display));
+                                }
+                                let hidden = g.relics.len().saturating_sub(RELIC_LIST_MAX_VISIBLE);
+                                if hidden > 0 {
+                                    ui.weak(format!("(+{hidden} more)"));
                                 }
                             });
                             ui.end_row();
@@ -2060,12 +2096,25 @@ impl BrowseApp {
     /// point [`Self::relic_ev_row`] fires [`Self::spawn_relic_price_fetch`]
     /// for just that relic's rewards.
     fn relics_ev_tab(&mut self, ui: &mut egui::Ui) {
-        let Some((index, item_index, quantities, owned_parts)) = self.loaded_or_placeholder(ui, |l| {
-            (l.index.clone(), l.item_index.clone(), l.quantities.clone(), l.live.owned_parts.clone())
-        }) else {
+        let Some((index, item_index, quantities, owned_parts, mem_scanned_parts)) =
+            self.loaded_or_placeholder(ui, |l| {
+                (
+                    l.index.clone(),
+                    l.item_index.clone(),
+                    l.quantities.clone(),
+                    l.live.owned_parts.clone(),
+                    l.live.mem_scanned_parts,
+                )
+            })
+        else {
             return;
         };
-        let ctx = RelicEvContext { item_index: &item_index, quantities: &quantities, owned_parts: &owned_parts };
+        let ctx = RelicEvContext {
+            item_index: &item_index,
+            quantities: &quantities,
+            owned_parts: &owned_parts,
+            mem_scanned_parts,
+        };
 
         ui.horizontal(|ui| {
             ui.label("Search:");
@@ -2123,7 +2172,7 @@ impl BrowseApp {
         owned: u32,
         force_open: Option<bool>,
     ) {
-        let RelicEvContext { item_index, quantities, owned_parts } = *ctx;
+        let RelicEvContext { item_index, quantities, owned_parts, mem_scanned_parts } = *ctx;
         let pricing =
             self.relic_ev_prices.lock().unwrap_or_else(|p| p.into_inner()).get(&relic.display).cloned();
 
@@ -2188,7 +2237,8 @@ impl BrowseApp {
                             // same owned/need vocabulary the Equipment tree
                             // and Relics & Plan tab already speak.
                             let pp = wf_relic::mastery::prime_part(&reward.item_name);
-                            let part_owned = wf_relic::owned_parts::get(owned_parts, &pp);
+                            let part_owned =
+                                wf_relic::owned_parts::get_or_confirmed_zero(owned_parts, &pp, mem_scanned_parts);
                             let need = quantities.get(&pp);
                             let short = need.is_some_and(|n| part_owned.unwrap_or(0) < n);
                             let owned_cell = owned_count_cell(part_owned);
@@ -2606,17 +2656,18 @@ impl BrowseApp {
         painter.rect_filled(screen, 4, egui::Color32::from_gray(28));
         painter.rect_stroke(screen, 4, egui::Stroke::new(1.0, egui::Color32::from_gray(70)), egui::StrokeKind::Inside);
 
-        // Stored margins are in real-screen pixels (see `mock_to_real_scale`
-        // docs); shrink back into the mock's own pixel space to place the
-        // idle box, and grow a mock-space drag's derived margin back up
+        // Stored margins are fractions of the max meaningful inset (see
+        // `mock_max_margin`'s docs), not pixels — grow them back into the
+        // mock's own pixel space to place the idle box, and shrink a
+        // mock-space drag's derived pixel offset back down to a fraction
         // before storing it.
-        let scale = mock_to_real_scale(ui.ctx(), mock_screen_size, PLACE_BOX_SIZE);
+        let max = mock_max_margin(mock_screen_size, PLACE_BOX_SIZE);
         let idle_min = place_box(
             screen,
             PLACE_BOX_SIZE,
             &self.config.overlay.anchor,
-            self.config.overlay.margin_x as f32 / scale.x,
-            self.config.overlay.margin_y as f32 / scale.y,
+            self.config.overlay.margin_x.clamp(0.0, 1.0) * max.x,
+            self.config.overlay.margin_y.clamp(0.0, 1.0) * max.y,
         );
         let idle_rect = egui::Rect::from_min_size(idle_min, PLACE_BOX_SIZE);
 
@@ -2630,12 +2681,14 @@ impl BrowseApp {
                 AxisPin::Neg => rx - screen.left(),
                 AxisPin::Pos => screen.right() - (rx + PLACE_BOX_SIZE.x),
                 AxisPin::Centered => 0.0,
-            } * scale.x) as i32;
+            } / max.x)
+                .clamp(0.0, 1.0);
             self.config.overlay.margin_y = (match y_pin {
                 AxisPin::Neg => ry - screen.top(),
                 AxisPin::Pos => screen.bottom() - (ry + PLACE_BOX_SIZE.y),
                 AxisPin::Centered => 0.0,
-            } * scale.y) as i32;
+            } / max.y)
+                .clamp(0.0, 1.0);
             egui::Rect::from_min_size(egui::pos2(rx, ry), PLACE_BOX_SIZE)
         } else {
             idle_rect
@@ -2665,8 +2718,10 @@ impl BrowseApp {
         ui.add_space(4.0);
         ui.label(
             egui::RichText::new(format!(
-                "anchor = {}   margin_x = {}   margin_y = {}",
-                self.config.overlay.anchor, self.config.overlay.margin_x, self.config.overlay.margin_y
+                "anchor = {}   margin_x = {:.0}%   margin_y = {:.0}%",
+                self.config.overlay.anchor,
+                self.config.overlay.margin_x.clamp(0.0, 1.0) * 100.0,
+                self.config.overlay.margin_y.clamp(0.0, 1.0) * 100.0
             ))
             .weak()
             .monospace(),

@@ -164,12 +164,12 @@ impl eframe::App for SettingsApp {
                     ui.end_row();
 
                     ui.label("Margin X");
-                    let r = ui.add(egui::DragValue::new(&mut self.config.overlay.margin_x).range(0..=2000));
+                    let r = ui.add(egui::Slider::new(&mut self.config.overlay.margin_x, 0.0..=1.0));
                     commit |= r.drag_stopped() || r.lost_focus();
                     ui.end_row();
 
                     ui.label("Margin Y");
-                    let r = ui.add(egui::DragValue::new(&mut self.config.overlay.margin_y).range(0..=2000));
+                    let r = ui.add(egui::Slider::new(&mut self.config.overlay.margin_y, 0.0..=1.0));
                     commit |= r.drag_stopped() || r.lost_focus();
                     ui.end_row();
 

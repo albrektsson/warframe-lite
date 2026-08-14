@@ -49,10 +49,16 @@ pub struct OverlayConfig {
     /// Which corner/edge to anchor to: `top-left`, `top-right`, `bottom-left`,
     /// `bottom-right`, `top`, `bottom`, `left`, `right`, or `center`.
     pub anchor: String,
-    /// Horizontal inset from the anchored edge(s), in pixels.
-    pub margin_x: i32,
-    /// Vertical inset from the anchored edge(s), in pixels.
-    pub margin_y: i32,
+    /// Horizontal inset from the anchored edge(s), as a fraction of the
+    /// maximum meaningful inset on that axis (`0.0` flush against the edge,
+    /// `1.0` centered) — resolution-independent, unlike a raw pixel count,
+    /// so the same value places the panel the same relative distance from
+    /// the edge on any monitor. See `wf_overlay::layer::edge_margins` for
+    /// the real-pixel conversion.
+    pub margin_x: f32,
+    /// Vertical inset from the anchored edge(s), as a fraction — see
+    /// `margin_x`.
+    pub margin_y: f32,
     /// Show the persistent live-Fissure panel. When `false`, the overlay is
     /// invisible until a relic reward screen is detected (reward-only mode).
     pub fissures: bool,
@@ -79,8 +85,8 @@ impl Default for OverlayConfig {
     fn default() -> Self {
         Self {
             anchor: "top-right".to_string(),
-            margin_x: 24,
-            margin_y: 24,
+            margin_x: 0.05,
+            margin_y: 0.05,
             fissures: true,
             fissure_filter: wf_data::worldstate::FissureFilter::default(),
             opacity: 1.0,
@@ -309,11 +315,11 @@ mod tests {
         let path = dir.join("config.toml");
 
         let mut cfg = Config::default();
-        cfg.overlay.margin_x = 42;
+        cfg.overlay.margin_x = 0.42;
         cfg.save(&path).unwrap();
 
         let loaded = Config::load(&path).unwrap();
-        assert_eq!(loaded.overlay.margin_x, 42);
+        assert_eq!(loaded.overlay.margin_x, 0.42);
 
         // save() must land exactly one file (the final rename target), not a
         // leftover `.config.toml.tmp-<pid>` alongside it — a leftover would

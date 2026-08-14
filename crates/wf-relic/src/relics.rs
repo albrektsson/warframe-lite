@@ -300,6 +300,12 @@ pub struct RelicContext<'a> {
     pub mastery: &'a MasterySet,
     pub quantities: &'a PartQuantities,
     pub owned_parts: &'a crate::OwnedPrimeParts,
+    /// Whether `owned_parts` reflects at least one completed `wf-mem`
+    /// mem-scan (see [`crate::owned_parts::OWNED_PARTS_MEM_SCANNED_MARKER_FILE`]).
+    /// Passed to [`crate::owned_parts::get_or_confirmed_zero`] so a part
+    /// absent from `owned_parts` renders as confirmed-zero rather than
+    /// unknown once a mem-scan has actually run.
+    pub mem_scanned_parts: bool,
 }
 
 /// Every owned relic — mastered or not — as a priced, ranked [`RelicPick`],
@@ -558,6 +564,10 @@ pub struct PrimePartGroup {
     /// part shows a concrete number only once a scan has actually observed
     /// its card at least once — see issue #37's downstream-wiring decision,
     /// following ADR-0011's "never guess an unknown quantity" precedent).
+    /// Exception: once a mem-scan has completed at least once, an absent
+    /// part is confirmed-zero rather than unknown (see
+    /// [`crate::owned_parts::get_or_confirmed_zero`]) — that scan's own
+    /// snapshot semantics already treat absence as proof, not silence.
     pub owned: Option<u32>,
     /// Owned relics that can drop this part, cheapest first (unresolved prices
     /// last) so a plentiful cheap relic is never overlooked in favor of a
@@ -716,7 +726,8 @@ pub fn mastery_plan(
                             .then_with(|| a.relic_display.cmp(&b.relic_display))
                     });
                     let build_quantity = ctx.quantities.get(&pp);
-                    let owned = crate::owned_parts::get(ctx.owned_parts, &pp);
+                    let owned =
+                        crate::owned_parts::get_or_confirmed_zero(ctx.owned_parts, &pp, ctx.mem_scanned_parts);
                     PrimePartGroup { part: pp, build_quantity, owned, relics }
                 })
                 .collect();
@@ -1108,6 +1119,7 @@ mod tests {
                 mastery: &mastery,
                 quantities: &PartQuantities::empty(),
                 owned_parts: &crate::OwnedPrimeParts::new(),
+                mem_scanned_parts: false,
             },
         );
 
@@ -1132,6 +1144,7 @@ mod tests {
                 mastery: &MasterySet::default(),
                 quantities: &PartQuantities::empty(),
                 owned_parts: &crate::OwnedPrimeParts::new(),
+                mem_scanned_parts: false,
             },
         );
 
@@ -1164,6 +1177,7 @@ mod tests {
                 mastery: &MasterySet::default(),
                 quantities: &PartQuantities::empty(),
                 owned_parts: &crate::OwnedPrimeParts::new(),
+                mem_scanned_parts: false,
             },
         );
 
@@ -1185,6 +1199,7 @@ mod tests {
                 mastery: &mastery,
                 quantities: &PartQuantities::empty(),
                 owned_parts: &crate::OwnedPrimeParts::new(),
+                mem_scanned_parts: false,
             },
         );
 
@@ -1221,6 +1236,7 @@ mod tests {
                 mastery: &MasterySet::default(),
                 quantities: &quantities,
                 owned_parts: &owned_parts,
+                mem_scanned_parts: false,
             },
         );
 
@@ -1264,6 +1280,7 @@ mod tests {
                 mastery: &MasterySet::default(),
                 quantities: &quantities,
                 owned_parts: &owned_parts,
+                mem_scanned_parts: false,
             },
         );
 
@@ -1344,6 +1361,7 @@ mod tests {
                 mastery: &mastery,
                 quantities: &PartQuantities::empty(),
                 owned_parts: &crate::OwnedPrimeParts::new(),
+                mem_scanned_parts: false,
             },
         );
 
@@ -1399,6 +1417,7 @@ mod tests {
                 mastery: &MasterySet::default(),
                 quantities: &PartQuantities::empty(),
                 owned_parts: &crate::OwnedPrimeParts::new(),
+                mem_scanned_parts: false,
             },
         );
 
@@ -1432,6 +1451,7 @@ mod tests {
                 mastery: &MasterySet::default(),
                 quantities: &PartQuantities::empty(),
                 owned_parts: &crate::OwnedPrimeParts::new(),
+                mem_scanned_parts: false,
             },
         );
 
@@ -1461,6 +1481,7 @@ mod tests {
                 mastery: &MasterySet::default(),
                 quantities: &quantities,
                 owned_parts: &crate::OwnedPrimeParts::new(),
+                mem_scanned_parts: false,
             },
         );
 
@@ -1492,6 +1513,7 @@ mod tests {
                 mastery: &MasterySet::default(),
                 quantities: &PartQuantities::empty(),
                 owned_parts: &owned_parts,
+                mem_scanned_parts: false,
             },
         );
 
@@ -1501,6 +1523,42 @@ mod tests {
         // Never scanned — unknown, not zero.
         let link = afuris.parts.iter().find(|g| g.part.part == "Link").unwrap();
         assert_eq!(link.owned, None);
+    }
+
+    #[test]
+    fn mastery_plan_carries_confirmed_zero_for_an_unscanned_part_once_mem_scanned() {
+        // Same fixture as the test above, but with `mem_scanned_parts: true`:
+        // Link has no entry in `owned_parts`, but since a mem-scan snapshot
+        // treats absence as authoritative zero (see `apply_exact_snapshot`),
+        // the plan should surface `Some(0)`, not `None`.
+        let idx = RelicIndex::new(vec![relic("Axi C3", &["Afuris Prime Barrel", "Afuris Prime Link"])]);
+        let owned = HashMap::from([("Axi C3".to_string(), RelicEvidence::Confirmed(1))]);
+        let mut owned_parts = crate::OwnedPrimeParts::new();
+        crate::owned_parts::apply_count(
+            &mut owned_parts,
+            &PrimePart { prime: "Afuris Prime".to_string(), part: "Barrel".to_string() },
+            3,
+            crate::owned::Source::Ocr,
+        );
+
+        let plans = mastery_plan(
+            &owned,
+            &HashMap::new(),
+            &HashMap::new(),
+            &RelicContext {
+                index: &idx,
+                mastery: &MasterySet::default(),
+                quantities: &PartQuantities::empty(),
+                owned_parts: &owned_parts,
+                mem_scanned_parts: true,
+            },
+        );
+
+        let afuris = plans.iter().find(|p| p.prime == "Afuris Prime").unwrap();
+        let barrel = afuris.parts.iter().find(|g| g.part.part == "Barrel").unwrap();
+        assert_eq!(barrel.owned, Some(3));
+        let link = afuris.parts.iter().find(|g| g.part.part == "Link").unwrap();
+        assert_eq!(link.owned, Some(0));
     }
 
     #[test]
@@ -1520,6 +1578,7 @@ mod tests {
                 mastery: &MasterySet::default(),
                 quantities: &PartQuantities::empty(),
                 owned_parts: &crate::OwnedPrimeParts::new(),
+                mem_scanned_parts: false,
             },
         );
 
@@ -1561,6 +1620,7 @@ mod tests {
                 mastery: &MasterySet::default(),
                 quantities: &PartQuantities::empty(),
                 owned_parts: &crate::OwnedPrimeParts::new(),
+                mem_scanned_parts: false,
             },
         );
 

@@ -145,6 +145,19 @@ pub fn write_owned_parts(
             false
         }
     };
+    // Written even when `snapshot` is empty (a real all-zero inventory) — see
+    // the marker file's own doc for why that case still needs to record
+    // "a mem-scan happened," not just "here are the parts it found."
+    if saved {
+        if let Err(e) =
+            wf_cache::save_blob(wf_relic::owned_parts::OWNED_PARTS_MEM_SCANNED_MARKER_FILE, &true)
+        {
+            tracing::warn!(
+                "failed to write {}: {e}",
+                wf_relic::owned_parts::OWNED_PARTS_MEM_SCANNED_MARKER_FILE
+            );
+        }
+    }
 
     PartsWriteReport { written, skipped, saved }
 }

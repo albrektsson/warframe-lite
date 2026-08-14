@@ -39,20 +39,25 @@ use smithay_client_toolkit::{
 
 use crate::canvas::Canvas;
 
-/// Where to anchor the overlay on screen.
+/// Where to anchor the overlay on screen. `margin_x`/`margin_y` are
+/// fractions of the maximum meaningful inset on that axis (`0.0` flush
+/// against the anchored edge, `1.0` centered) rather than raw pixels — see
+/// [`edge_margins`] for the real-pixel conversion. Resolution-independent by
+/// construction, so the same `Placement` lands in the same relative spot
+/// whichever monitor it's ultimately applied to.
 #[derive(Debug, Clone, Copy)]
 pub struct Placement {
     pub anchor: Anchor,
-    pub margin_x: i32,
-    pub margin_y: i32,
+    pub margin_x: f32,
+    pub margin_y: f32,
 }
 
 impl Default for Placement {
     fn default() -> Self {
         Self {
             anchor: Anchor::TOP.union(Anchor::RIGHT),
-            margin_x: 24,
-            margin_y: 24,
+            margin_x: 0.05,
+            margin_y: 0.05,
         }
     }
 }
@@ -61,7 +66,7 @@ impl Placement {
     /// Build a placement from a config anchor string (`top-left`, `top-right`,
     /// `bottom-left`, `bottom-right`, `top`, `bottom`, `left`, `right`,
     /// `center`). Unrecognised values fall back to top-right.
-    pub fn parse(anchor: &str, margin_x: i32, margin_y: i32) -> Self {
+    pub fn parse(anchor: &str, margin_x: f32, margin_y: f32) -> Self {
         let a = match anchor.trim().to_lowercase().as_str() {
             "top-left" | "top_left" | "topleft" => Anchor::TOP.union(Anchor::LEFT),
             "top-right" | "top_right" | "topright" => Anchor::TOP.union(Anchor::RIGHT),
@@ -147,7 +152,7 @@ pub fn run(
     }
     state.chosen_geom = chosen_geom;
 
-    let (top, right, bottom, left) = edge_margins(placement, window, chosen_geom);
+    let (top, right, bottom, left) = edge_margins(placement, window, chosen_geom, (width, height));
 
     let surface = compositor.create_surface(&qh);
     let layer = layer_shell.create_layer_surface(
@@ -279,7 +284,8 @@ impl State {
         let Some(layer) = &self.layer else {
             return;
         };
-        let (top, right, bottom, left) = edge_margins(placement, self.window, self.chosen_geom);
+        let (top, right, bottom, left) =
+            edge_margins(placement, self.window, self.chosen_geom, (self.width, self.height));
         layer.set_anchor(placement.anchor);
         layer.set_size(self.width, self.height);
         layer.set_margin(top, right, bottom, left);
@@ -288,27 +294,51 @@ impl State {
     }
 }
 
+/// Convert a placement's x/y margin *fractions* (see [`Placement`]'s docs)
+/// into real pixel insets against a `(width, height)` container — the game
+/// window when known, else the output, else a synthetic fallback (see
+/// [`edge_margins`]). `0.0` gives `0` px (flush against the edge); `1.0`
+/// gives half of whatever room is left after the panel itself, which is
+/// exactly the offset at which the panel's anchored edge coincides with the
+/// container's centre.
+fn margin_px(fraction_x: f32, fraction_y: f32, container: (i32, i32), panel: (u32, u32)) -> (i32, i32) {
+    let max_x = (container.0 - panel.0 as i32).max(0) as f32 / 2.0;
+    let max_y = (container.1 - panel.1 as i32).max(0) as f32 / 2.0;
+    (
+        (fraction_x.clamp(0.0, 1.0) * max_x).round() as i32,
+        (fraction_y.clamp(0.0, 1.0) * max_y).round() as i32,
+    )
+}
+
 /// Margins (`top, right, bottom, left`) that place the panel at the placement's
 /// x/y insets from the game window's corner. Given the window rect and its
 /// output's logical geometry, each edge margin is the gap from that output edge to
-/// the matching window edge plus the inset; the compositor only applies the
-/// margins on the anchored edges, so whichever corner [`Placement`] anchors to, the
-/// panel lands the requested inset inside the game window there. Falls back to the
-/// bare insets when either rect is unknown (compositor-chosen output / fullscreen,
-/// where window edges equal output edges).
+/// the matching window edge plus the inset (in real pixels — see [`margin_px`],
+/// resolved against the window's own size so the inset fraction is relative to
+/// the window the panel is being placed inside of); the compositor only applies
+/// the margins on the anchored edges, so whichever corner [`Placement`] anchors
+/// to, the panel lands the requested inset inside the game window there. Falls
+/// back to the output's own size when the window rect is unknown (compositor-
+/// chosen output / fullscreen, where window edges equal output edges), or to a
+/// synthetic container sized off the panel itself when neither is known.
 fn edge_margins(
     placement: Placement,
     window: Option<(i32, i32, u32, u32)>,
     output: Option<((i32, i32), (i32, i32))>,
+    panel: (u32, u32),
 ) -> (i32, i32, i32, i32) {
-    let (mx, my) = (placement.margin_x, placement.margin_y);
     if let (Some((wx, wy, ww, wh)), Some(((lx, ly), (lw, lh)))) = (window, output) {
+        let (mx, my) = margin_px(placement.margin_x, placement.margin_y, (ww as i32, wh as i32), panel);
         let top = (wy - ly) + my;
         let left = (wx - lx) + mx;
         let right = (lx + lw) - (wx + ww as i32) + mx;
         let bottom = (ly + lh) - (wy + wh as i32) + my;
         return (top.max(0), right.max(0), bottom.max(0), left.max(0));
     }
+    let container = output
+        .map(|(_, (lw, lh))| (lw, lh))
+        .unwrap_or((panel.0 as i32 * 2, panel.1 as i32 * 2));
+    let (mx, my) = margin_px(placement.margin_x, placement.margin_y, container, panel);
     (my, mx, my, mx)
 }
 
@@ -426,38 +456,54 @@ mod tests {
     #[test]
     fn parse_maps_corner_strings() {
         assert_eq!(
-            Placement::parse("bottom-left", 1, 2).anchor,
+            Placement::parse("bottom-left", 0.1, 0.2).anchor,
             Anchor::BOTTOM.union(Anchor::LEFT)
         );
         // unknown falls back to top-right, preserving margins.
-        let p = Placement::parse("nonsense", 5, 7);
+        let p = Placement::parse("nonsense", 0.5, 0.7);
         assert_eq!(p.anchor, Anchor::TOP.union(Anchor::RIGHT));
-        assert_eq!((p.margin_x, p.margin_y), (5, 7));
+        assert_eq!((p.margin_x, p.margin_y), (0.5, 0.7));
     }
 
     #[test]
     fn fullscreen_window_gives_bare_insets() {
-        // Window exactly fills its output → margins are just the insets.
-        let p = Placement::parse("top-right", 24, 12);
-        let m = edge_margins(p, Some((0, 0, 3440, 1440)), Some(((0, 0), (3440, 1440))));
-        assert_eq!(m, (12, 24, 12, 24)); // top, right, bottom, left
+        // Window exactly fills its output → margins are just the fraction-derived
+        // insets, resolved against the 3440x1440 output and a 460x340 panel:
+        // max_x = (3440-460)/2 = 1490, max_y = (1440-340)/2 = 550.
+        let p = Placement::parse("top-right", 0.2, 0.1);
+        let m = edge_margins(p, Some((0, 0, 3440, 1440)), Some(((0, 0), (3440, 1440))), (460, 340));
+        assert_eq!(m, (55, 298, 55, 298)); // top, right, bottom, left
     }
 
     #[test]
     fn windowed_offset_folds_into_margins() {
-        // A 1000x800 window at (100,50) inside a 1920x1080 output.
-        let p = Placement::parse("top-right", 10, 10);
+        // A 100x60 panel placed inside a 1000x800 window at (100,50), itself
+        // inside a 1920x1080 output: max_x = (1000-100)/2 = 450,
+        // max_y = (800-60)/2 = 370.
+        let p = Placement::parse("top-right", 0.2, 0.1);
         let (top, right, bottom, left) =
-            edge_margins(p, Some((100, 50, 1000, 800)), Some(((0, 0), (1920, 1080))));
-        assert_eq!(top, 50 + 10);
-        assert_eq!(left, 100 + 10);
-        assert_eq!(right, (1920 - 1100) + 10);
-        assert_eq!(bottom, (1080 - 850) + 10);
+            edge_margins(p, Some((100, 50, 1000, 800)), Some(((0, 0), (1920, 1080))), (100, 60));
+        assert_eq!(top, 50 + 37);
+        assert_eq!(left, 100 + 90);
+        assert_eq!(right, (1920 - 1100) + 90);
+        assert_eq!(bottom, (1080 - 850) + 37);
     }
 
     #[test]
-    fn unknown_geometry_uses_insets() {
-        let p = Placement::parse("top-left", 8, 4);
-        assert_eq!(edge_margins(p, None, None), (4, 8, 4, 8));
+    fn unknown_geometry_falls_back_to_a_panel_sized_container() {
+        // No window, no output → container defaults to double the panel's own
+        // size: max_x = (200-100)/2 = 50, max_y = (120-60)/2 = 30.
+        let p = Placement::parse("top-left", 0.4, 0.5);
+        assert_eq!(edge_margins(p, None, None, (100, 60)), (15, 20, 15, 20));
+    }
+
+    #[test]
+    fn margin_fractions_are_clamped_to_0_1() {
+        // Stale/garbage fractions (e.g. a leftover absolute-pixel value from
+        // before margins became fractions) must clamp rather than blow past
+        // the container or go negative.
+        let p = Placement::parse("top-right", 5.0, -1.0);
+        let m = edge_margins(p, Some((0, 0, 2000, 1000)), Some(((0, 0), (2000, 1000))), (400, 200));
+        assert_eq!(m, (0, 800, 0, 800));
     }
 }

@@ -48,8 +48,8 @@ pub fn socket_path() -> PathBuf {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiveOverlaySettings {
     pub anchor: String,
-    pub margin_x: i32,
-    pub margin_y: i32,
+    pub margin_x: f32,
+    pub margin_y: f32,
     pub opacity: f32,
     pub fissures: bool,
     pub fissure_filter: wf_data::worldstate::FissureFilter,
@@ -173,8 +173,8 @@ mod tests {
     fn apply_settings_roundtrips() {
         let s = LiveOverlaySettings {
             anchor: "bottom-left".to_string(),
-            margin_x: 12,
-            margin_y: 34,
+            margin_x: 0.12,
+            margin_y: 0.34,
             opacity: 0.75,
             fissures: false,
             fissure_filter: wf_data::worldstate::FissureFilter {
@@ -193,8 +193,8 @@ mod tests {
     fn apply_settings_roundtrips_with_empty_fissure_filter() {
         let s = LiveOverlaySettings {
             anchor: "top-right".to_string(),
-            margin_x: 24,
-            margin_y: 24,
+            margin_x: 0.24,
+            margin_y: 0.24,
             opacity: 1.0,
             fissures: true,
             fissure_filter: wf_data::worldstate::FissureFilter::default(),

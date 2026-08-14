@@ -19,7 +19,8 @@ pub struct BomGap {
     /// from [`PartQuantities`] in the first place (see ADR-0011).
     pub build_quantity: Option<u32>,
     /// How many the player already owns, per the Inventory/Sell screen scan —
-    /// `None` when never scanned (unknown, not zero).
+    /// `None` when never scanned (unknown, not zero); confirmed-zero once a
+    /// mem-scan has run (see [`crate::owned_parts::get_or_confirmed_zero`]).
     pub owned: Option<u32>,
     /// Relics that can drop this part — cheapest first, regardless of
     /// ownership (a gap has no owned evidence by construction, so these are
@@ -77,6 +78,7 @@ pub fn buy_or_farm_plan(
     mastery: &MasterySet,
     quantities: &PartQuantities,
     owned_parts: &crate::OwnedPrimeParts,
+    mem_scanned_parts: bool,
 ) -> Vec<BomPlan> {
     // Every relic in the catalogue, regardless of ownership — what to go
     // buy/farm for an actual gap.
@@ -91,7 +93,8 @@ pub fn buy_or_farm_plan(
             for (part_label, quantity) in quantities.parts_for(&prime) {
                 let pp = PrimePart { prime: prime.clone(), part: part_label };
                 let build_quantity = Some(quantity);
-                let owned_count = crate::owned_parts::get(owned_parts, &pp);
+                let owned_count =
+                    crate::owned_parts::get_or_confirmed_zero(owned_parts, &pp, mem_scanned_parts);
 
                 let owned_meets_need =
                     matches!((owned_count, build_quantity), (Some(o), Some(n)) if o >= n);
@@ -169,6 +172,7 @@ mod tests {
             &MasterySet::default(),
             &quantities,
             &crate::OwnedPrimeParts::new(),
+            false,
         );
 
         let afentis = plans.iter().find(|p| p.prime == "Afentis Prime").unwrap();
@@ -192,11 +196,39 @@ mod tests {
             &MasterySet::default(),
             &quantities,
             &crate::OwnedPrimeParts::new(),
+            false,
         );
 
         let kompressa = plans.iter().find(|p| p.prime == "Kompressa Prime").unwrap();
         assert_eq!(kompressa.gaps.len(), 1);
         assert_eq!(kompressa.gaps[0].owned, None);
+    }
+
+    #[test]
+    fn buy_or_farm_plan_shows_confirmed_zero_for_an_unscanned_gap_once_mem_scanned() {
+        // Same fixture as the test above, but `mem_scanned_parts: true` — the
+        // gap is still a gap (0 never meets a build quantity), but its
+        // `owned` field should read `Some(0)`, not `None`.
+        let quantities = PartQuantities::from_entries_for_test(vec![(
+            "Kompressa Prime".to_string(),
+            "Barrel".to_string(),
+            1,
+        )]);
+        let idx = RelicIndex::new(Vec::new());
+
+        let plans = buy_or_farm_plan(
+            &HashMap::new(),
+            &HashMap::new(),
+            &idx,
+            &MasterySet::default(),
+            &quantities,
+            &crate::OwnedPrimeParts::new(),
+            true,
+        );
+
+        let kompressa = plans.iter().find(|p| p.prime == "Kompressa Prime").unwrap();
+        assert_eq!(kompressa.gaps.len(), 1);
+        assert_eq!(kompressa.gaps[0].owned, Some(0));
     }
 
     #[test]
@@ -228,6 +260,7 @@ mod tests {
             &MasterySet::default(),
             &quantities,
             &owned_parts,
+            false,
         );
 
         let afuris = plans.iter().find(|p| p.prime == "Afuris Prime").unwrap();
@@ -261,6 +294,7 @@ mod tests {
             &MasterySet::default(),
             &quantities,
             &owned_parts,
+            false,
         );
 
         let afuris = plans.iter().find(|p| p.prime == "Afuris Prime").unwrap();
@@ -291,6 +325,7 @@ mod tests {
             &MasterySet::default(),
             &quantities,
             &crate::OwnedPrimeParts::new(),
+            false,
         );
 
         let rubico = plans.iter().find(|p| p.prime == "Rubico Prime").unwrap();

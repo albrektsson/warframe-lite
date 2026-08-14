@@ -46,12 +46,33 @@ pub type OwnedPrimeParts = HashMap<String, HashMap<String, PartCount>>;
 /// consumer (the overlay's scanner, `wf-browse`) names the same file.
 pub const OWNED_PRIME_PARTS_FILE: &str = "owned-prime-parts.json";
 
+/// Marker file recording that a `wf-mem` mem-scan of Prime Part ownership has
+/// completed at least once (written unconditionally by the mem-scan persist
+/// path right after it successfully replaces [`OWNED_PRIME_PARTS_FILE`] via
+/// [`apply_exact_snapshot`] — even when that snapshot was empty, since an
+/// all-zero inventory is exactly the case [`get_or_confirmed_zero`] needs to
+/// tell apart from "never scanned").
+pub const OWNED_PARTS_MEM_SCANNED_MARKER_FILE: &str = "owned-prime-parts-mem-scanned.json";
+
 /// How many of `part` the player owns, if it's ever been scanned. `None`
 /// means unknown — no scanner has ever observed this part — never zero (see
 /// ADR-0011's "never guess an unknown quantity" precedent, applied here to
 /// Prime Part counts rather than build quantities).
 pub fn get(owned: &OwnedPrimeParts, part: &PrimePart) -> Option<u32> {
     owned.get(&part.prime)?.get(&part.part).map(|c| c.count.value)
+}
+
+/// [`get`], but once the player's Prime Part inventory has been mem-scanned
+/// at least once (`mem_scanned` — see [`OWNED_PARTS_MEM_SCANNED_MARKER_FILE`]),
+/// a missing entry becomes `Some(0)` instead of `None`. This isn't guessing:
+/// [`apply_exact_snapshot`]'s own contract already treats "absent from a
+/// mem-scan snapshot" as authoritative proof of zero, not missing data — so
+/// surfacing that absence as unknown here would just reintroduce the
+/// ambiguity the mem-scan already resolved. With `mem_scanned` false (an
+/// account that's only ever used the lower-trust, opt-in OCR scanner, which
+/// never proves a zero), this is identical to [`get`].
+pub fn get_or_confirmed_zero(owned: &OwnedPrimeParts, part: &PrimePart, mem_scanned: bool) -> Option<u32> {
+    get(owned, part).or(mem_scanned.then_some(0))
 }
 
 /// The [`Source`] of `part`'s current count, if it has one — `None` if the
@@ -145,6 +166,25 @@ mod tests {
     fn source_is_none_for_a_never_scanned_part() {
         let owned = OwnedPrimeParts::new();
         assert_eq!(source(&owned, &pp("Ember Prime", "Systems")), None);
+    }
+
+    #[test]
+    fn get_or_confirmed_zero_is_none_without_a_mem_scan() {
+        let owned = OwnedPrimeParts::new();
+        assert_eq!(get_or_confirmed_zero(&owned, &pp("Ember Prime", "Systems"), false), None);
+    }
+
+    #[test]
+    fn get_or_confirmed_zero_is_zero_after_a_mem_scan_when_absent() {
+        let owned = OwnedPrimeParts::new();
+        assert_eq!(get_or_confirmed_zero(&owned, &pp("Ember Prime", "Systems"), true), Some(0));
+    }
+
+    #[test]
+    fn get_or_confirmed_zero_prefers_a_real_reading_over_the_flag() {
+        let mut owned = OwnedPrimeParts::new();
+        apply_count(&mut owned, &pp("Ember Prime", "Systems"), 3, Source::Ocr);
+        assert_eq!(get_or_confirmed_zero(&owned, &pp("Ember Prime", "Systems"), true), Some(3));
     }
 
     #[test]

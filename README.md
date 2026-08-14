@@ -1,5 +1,9 @@
 # warframe-lite
 
+[![CI](https://github.com/albrektsson/warframe-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/albrektsson/warframe-lite/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/albrektsson/warframe-lite/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/albrektsson/warframe-lite/actions/workflows/github-code-scanning/codeql)
+[![Dependabot Updates](https://github.com/albrektsson/warframe-lite/actions/workflows/dependabot/dependabot-updates/badge.svg)](https://github.com/albrektsson/warframe-lite/actions/workflows/dependabot/dependabot-updates)
+
 > **Disclaimer:** built with AI assistance. Run it at your own risk — it
 > only reads `EE.log` and only reads game memory, never writes to either.
 > See [docs/research/memory-reading-ban-risk-and-prior-art.md](docs/research/memory-reading-ban-risk-and-prior-art.md)
