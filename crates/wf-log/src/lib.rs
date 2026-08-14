@@ -83,6 +83,22 @@ pub enum Event {
     /// research, resolving #31): `InventoryTest.lua` populates its item grid
     /// on open and on each tab switch — used to start an owned-Prime-Part scan.
     InventorySellOpen,
+
+    /// A mission's parameters were loaded ahead of an imminent level load —
+    /// arms "mission incoming" until the next `LevelOpen` consumes it.
+    /// Confirmed marker (issue #89, from issue #88's capture): both the
+    /// host-launch wording ("Host loading {...} with MissionInfo:") and the
+    /// wiki-documented squad-joiner wording ("Client loaded {...} with
+    /// MissionInfo:") share this suffix.
+    MissionInfoSeen,
+
+    /// A level load was commanded (loading screen begins) — fires
+    /// symmetrically for every transition, hub or mission alike. Consumes
+    /// a pending `MissionInfoSeen`: if one was pending, this is a
+    /// mission-start; if not, this is a hub-bound transition (mission end,
+    /// abort, or a hub-to-hub hop). Confirmed marker (issue #89, from issue
+    /// #88's capture): `Game [Info]: FrameworkCmd::OpenLevel - <path>`.
+    LevelOpen,
 }
 
 /// Substrings that mark the reward **selection screen appearing**. Confirmed
@@ -113,6 +129,13 @@ pub const RELIC_INVENTORY_MARKER: &str = "ThemedProjectionManager.lua: PopulateI
 /// consumer-debounces-a-double-fire shape [`RELIC_INVENTORY_MARKER`] has.
 pub const INVENTORY_SELL_MARKER: &str = "InventoryTest.lua: PopulateGrid";
 
+/// Substring marking a mission's parameters loading ahead of an imminent
+/// level load. See [`Event::MissionInfoSeen`].
+pub const MISSION_INFO_MARKER: &str = "with MissionInfo:";
+
+/// Substring marking a level load being commanded. See [`Event::LevelOpen`].
+pub const LEVEL_OPEN_MARKER: &str = "FrameworkCmd::OpenLevel";
+
 /// Classify a parsed line into an [`Event`], if it matches a known pattern.
 pub fn classify(line: &LogLine<'_>) -> Option<Event> {
     // Relic markers appear on several subsystems (HudRedux/Transmission on
@@ -129,6 +152,12 @@ pub fn classify(line: &LogLine<'_>) -> Option<Event> {
     }
     if line.message.contains(INVENTORY_SELL_MARKER) {
         return Some(Event::InventorySellOpen);
+    }
+    if line.message.contains(MISSION_INFO_MARKER) {
+        return Some(Event::MissionInfoSeen);
+    }
+    if line.message.contains(LEVEL_OPEN_MARKER) {
+        return Some(Event::LevelOpen);
     }
     match line.subsystem {
         "Sys" if line.message.starts_with("Logged in ") => {
@@ -224,6 +253,36 @@ mod tests {
             event_from_line("290.477 Script [Info]: InventoryTest.lua: PopulateGrid complete"),
             Some(Event::InventorySellOpen)
         );
+    }
+
+    #[test]
+    fn detects_mission_info_seen() {
+        // Real captured line: host launching a mission.
+        assert_eq!(
+            event_from_line(
+                "351.997 Script [Info]: ThemedSquadOverlay.lua: Host loading \
+                 {\"name\":\"SolNode856_Hard\",\"difficulty\":0} with MissionInfo:"
+            ),
+            Some(Event::MissionInfoSeen)
+        );
+        // Wiki-documented squad-joiner wording — different verb, same suffix.
+        assert_eq!(
+            event_from_line(
+                "282.067 Sys [Info]: Client loaded {\"name\":\"SolNode42_Alert\"} with MissionInfo:"
+            ),
+            Some(Event::MissionInfoSeen)
+        );
+    }
+
+    #[test]
+    fn detects_level_open() {
+        // Real captured lines: mission launch, and mission-end-to-hub return.
+        for line in [
+            "351.998 Game [Info]: FrameworkCmd::OpenLevel - /Lotus/Levels/Proc/Vania/VaniaAssassinationSummer",
+            "1075.720 Game [Info]: FrameworkCmd::OpenLevel - /Lotus/Levels/Proc/TheNewWar/PartTwo/TNWDrifterCampMain",
+        ] {
+            assert_eq!(event_from_line(line), Some(Event::LevelOpen));
+        }
     }
 
     #[test]

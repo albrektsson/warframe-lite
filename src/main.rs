@@ -1423,6 +1423,49 @@ type RelicScanStatus = std::sync::Arc<std::sync::Mutex<Option<wf_overlay::ScanPr
 /// [`crate::run_overlay`]'s normal reward/relic-scan/fissures panels.
 type DemoState = std::sync::Arc<std::sync::Mutex<Option<DemoFrames>>>;
 
+/// One step of the mission-state machine (issue #89's design): a
+/// `MissionInfoSeen` arms `pending`; the next `LevelOpen` consumes it,
+/// producing the new `in_mission` value (armed -> true, unarmed -> false).
+/// Any other event leaves both unchanged. Pulled out of
+/// [`mission_watch_loop`] as a pure function so the state machine itself is
+/// unit-testable without a real `EE.log`.
+fn mission_state_step(pending: bool, ev: &wf_log::Event) -> (bool, Option<bool>) {
+    use wf_log::Event;
+    match ev {
+        Event::MissionInfoSeen => (true, None),
+        Event::LevelOpen => (false, Some(pending)),
+        _ => (pending, None),
+    }
+}
+
+/// Watches the EE.log for mission-start/mission-end transitions (issue #89's
+/// design) and publishes the result to `in_mission`, read by `make_frame` to
+/// gate the fissures panel. Runs independently of relic auto-detection.
+async fn mission_watch_loop(
+    ee_log: std::path::PathBuf,
+    in_mission: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+
+    const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+    let mut tailer = wf_log::LogTailer::from_end(&ee_log);
+    let mut pending = false;
+
+    loop {
+        tokio::time::sleep(POLL_INTERVAL).await;
+        for line in tailer.poll().unwrap_or_default() {
+            if let Some(ev) = wf_log::event_from_line(&line) {
+                let (new_pending, new_state) = mission_state_step(pending, &ev);
+                pending = new_pending;
+                if let Some(state) = new_state {
+                    in_mission.store(state, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
 /// Show the live overlay as a `wlr-layer-shell` surface: live Fissures normally,
 /// automatically swapping to the relic reward result for a few seconds when a
 /// fissure reward is detected in the log.
@@ -1447,13 +1490,29 @@ async fn run_overlay(config: Config) -> Result<()> {
     let visible = Arc::new(AtomicBool::new(true));
     let live = Arc::new(Mutex::new(wf_config::control::LiveOverlaySettings::from(&config.overlay)));
 
+    // Mission-state gate for the fissures panel (issue #89/#90's design):
+    // fails open (stays `false`, panel shows) if the EE.log can't be
+    // resolved, matching this destination's fail-open requirement.
+    let in_mission = Arc::new(AtomicBool::new(false));
+    match config.resolve_ee_log() {
+        Ok(ee_log) => {
+            tokio::spawn(mission_watch_loop(ee_log, in_mission.clone()));
+        }
+        Err(e) => {
+            tracing::warn!(
+                "could not resolve EE.log path ({e:#}) — fissures panel will not be gated by mission state"
+            );
+        }
+    }
+
     // Build one overlay frame from the current state, honoring reward-only mode,
     // the visibility toggle, and opacity. A hidden or empty frame is a fully
     // transparent (click-through) canvas.
     // Panel priority when shown: demo mode (a settings UI is previewing
     // placement/opacity — see `spawn_control_listener`'s `demo-on`/`demo-off`)
     // → reward screen (time-critical, ~20s) → an in-progress relic scan's live
-    // status → live fissures → blank. The ranked owned-relic guide (`wf-lite
+    // status → live fissures (only outside a mission — see
+    // `mission_watch_loop`) → blank. The ranked owned-relic guide (`wf-lite
     // relic-guide-png`'s `render_relic_panel`) isn't shown live here — that
     // view lives in `wf-lite browse` instead, which reads the same
     // `owned-relics.json` without the live overlay's latency budget, and
@@ -1465,6 +1524,7 @@ async fn run_overlay(config: Config) -> Result<()> {
         let relic_scan_status = relic_scan_status.clone();
         let demo = demo.clone();
         let live = live.clone();
+        let in_mission = in_mission.clone();
         move |ws: &worldstate::WorldState, shown: bool| -> wf_overlay::Canvas {
             let (show_fissures, opacity, fissure_filter) = {
                 let live = live.lock().unwrap();
@@ -1491,7 +1551,7 @@ async fn run_overlay(config: Config) -> Result<()> {
                 wf_overlay::render_reward_panel(&rows, &font).embed(OVERLAY_W, OVERLAY_H)
             } else if let Some(progress) = *relic_scan_status.lock().unwrap() {
                 wf_overlay::render_relic_scanning_panel(progress, &font).embed(OVERLAY_W, OVERLAY_H)
-            } else if show_fissures {
+            } else if show_fissures && !in_mission.load(Ordering::Relaxed) {
                 wf_overlay::render_panel(ws, &font, &fissure_filter).embed(OVERLAY_W, OVERLAY_H)
             } else {
                 blank()
