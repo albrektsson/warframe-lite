@@ -1438,16 +1438,38 @@ fn mission_state_step(pending: bool, ev: &wf_log::Event) -> (bool, Option<bool>)
     }
 }
 
-/// Watches the EE.log for mission-start/mission-end transitions (issue #89's
-/// design) and publishes the result to `in_mission`, read by `make_frame` to
-/// gate the fissures panel. Runs independently of relic auto-detection.
+/// Whether `text` (an `EE.log`'s current contents) already contains a
+/// `Logged in <name>` line — used to seed [`mission_watch_loop`]'s login gate
+/// at startup. Unlike mission transitions, login fires once per game session
+/// and won't repeat, so a tailer started (or restarted) after the fact would
+/// otherwise never see it.
+fn text_has_login(text: &str) -> bool {
+    text.lines()
+        .any(|l| matches!(wf_log::event_from_line(l), Some(wf_log::Event::LoggedIn(_))))
+}
+
+/// Watches the EE.log for the player's login and mission-start/mission-end
+/// transitions (issue #89's design), publishing to `logged_in` and
+/// `in_mission`, both read by `make_frame` to gate the fissures panel — it
+/// has nothing useful to show over the Warframe launcher/login screen, before
+/// any account is signed in. Runs independently of relic auto-detection.
 async fn mission_watch_loop(
     ee_log: std::path::PathBuf,
+    logged_in: std::sync::Arc<std::sync::atomic::AtomicBool>,
     in_mission: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     use std::sync::atomic::Ordering;
 
     const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+    // Catches a player already logged in before this task started (the
+    // overlay was launched or restarted mid-session) — live tailing below
+    // handles a login that happens after this point.
+    if let Ok(text) = std::fs::read_to_string(&ee_log) {
+        if text_has_login(&text) {
+            logged_in.store(true, Ordering::Relaxed);
+        }
+    }
 
     let mut tailer = wf_log::LogTailer::from_end(&ee_log);
     let mut pending = false;
@@ -1456,6 +1478,9 @@ async fn mission_watch_loop(
         tokio::time::sleep(POLL_INTERVAL).await;
         for line in tailer.poll().unwrap_or_default() {
             if let Some(ev) = wf_log::event_from_line(&line) {
+                if matches!(ev, wf_log::Event::LoggedIn(_)) {
+                    logged_in.store(true, Ordering::Relaxed);
+                }
                 let (new_pending, new_state) = mission_state_step(pending, &ev);
                 pending = new_pending;
                 if let Some(state) = new_state {
@@ -1492,15 +1517,21 @@ async fn run_overlay(config: Config) -> Result<()> {
 
     // Mission-state gate for the fissures panel (issue #89/#90's design):
     // fails open (stays `false`, panel shows) if the EE.log can't be
-    // resolved, matching this destination's fail-open requirement.
+    // resolved, matching this destination's fail-open requirement. The login
+    // gate (`logged_in`) defaults the other way — it starts `true` (open) so
+    // that same unresolved-log case still shows the panel, but flips to
+    // `false` the moment detection is actually running, requiring a
+    // confirmed login before the panel shows for the first time.
+    let logged_in = Arc::new(AtomicBool::new(true));
     let in_mission = Arc::new(AtomicBool::new(false));
     match config.resolve_ee_log() {
         Ok(ee_log) => {
-            tokio::spawn(mission_watch_loop(ee_log, in_mission.clone()));
+            logged_in.store(false, Ordering::Relaxed);
+            tokio::spawn(mission_watch_loop(ee_log, logged_in.clone(), in_mission.clone()));
         }
         Err(e) => {
             tracing::warn!(
-                "could not resolve EE.log path ({e:#}) — fissures panel will not be gated by mission state"
+                "could not resolve EE.log path ({e:#}) — fissures panel will not be gated by login/mission state"
             );
         }
     }
@@ -1511,19 +1542,20 @@ async fn run_overlay(config: Config) -> Result<()> {
     // Panel priority when shown: demo mode (a settings UI is previewing
     // placement/opacity — see `spawn_control_listener`'s `demo-on`/`demo-off`)
     // → reward screen (time-critical, ~20s) → an in-progress relic scan's live
-    // status → live fissures (only outside a mission — see
-    // `mission_watch_loop`) → blank. The ranked owned-relic guide (`wf-lite
-    // relic-guide-png`'s `render_relic_panel`) isn't shown live here — that
-    // view lives in `wf-lite browse` instead, which reads the same
-    // `owned-relics.json` without the live overlay's latency budget, and
-    // demo mode doesn't preview it either (it only cycles panels the live
-    // overlay actually renders).
+    // status → live fissures (only once logged in and outside a mission —
+    // see `mission_watch_loop`) → blank. The ranked owned-relic guide
+    // (`wf-lite relic-guide-png`'s `render_relic_panel`) isn't shown live
+    // here — that view lives in `wf-lite browse` instead, which reads the
+    // same `owned-relics.json` without the live overlay's latency budget,
+    // and demo mode doesn't preview it either (it only cycles panels the
+    // live overlay actually renders).
     let make_frame = {
         let font = font.clone();
         let reward = reward.clone();
         let relic_scan_status = relic_scan_status.clone();
         let demo = demo.clone();
         let live = live.clone();
+        let logged_in = logged_in.clone();
         let in_mission = in_mission.clone();
         move |ws: &worldstate::WorldState, shown: bool| -> wf_overlay::Canvas {
             let (show_fissures, opacity, fissure_filter) = {
@@ -1551,7 +1583,10 @@ async fn run_overlay(config: Config) -> Result<()> {
                 wf_overlay::render_reward_panel(&rows, &font).embed(OVERLAY_W, OVERLAY_H)
             } else if let Some(progress) = *relic_scan_status.lock().unwrap() {
                 wf_overlay::render_relic_scanning_panel(progress, &font).embed(OVERLAY_W, OVERLAY_H)
-            } else if show_fissures && !in_mission.load(Ordering::Relaxed) {
+            } else if show_fissures
+                && logged_in.load(Ordering::Relaxed)
+                && !in_mission.load(Ordering::Relaxed)
+            {
                 wf_overlay::render_panel(ws, &font, &fissure_filter).embed(OVERLAY_W, OVERLAY_H)
             } else {
                 blank()
@@ -1978,5 +2013,57 @@ mod demo_fissures_tests {
         let ws = demo_fissures();
         assert!(ws.fissures.iter().any(|f| f.is_hard), "expected a Steel Path fissure");
         assert!(ws.fissures.iter().any(|f| f.is_storm), "expected a Void Storm fissure");
+    }
+}
+
+#[cfg(test)]
+mod mission_state_tests {
+    use super::mission_state_step;
+    use wf_log::Event;
+
+    #[test]
+    fn mission_info_arms_pending_without_publishing() {
+        assert_eq!(mission_state_step(false, &Event::MissionInfoSeen), (true, None));
+    }
+
+    #[test]
+    fn level_open_with_pending_publishes_in_mission() {
+        assert_eq!(mission_state_step(true, &Event::LevelOpen), (false, Some(true)));
+    }
+
+    #[test]
+    fn level_open_without_pending_publishes_hub_bound() {
+        assert_eq!(mission_state_step(false, &Event::LevelOpen), (false, Some(false)));
+    }
+
+    #[test]
+    fn other_events_leave_state_unchanged() {
+        assert_eq!(mission_state_step(true, &Event::HostMigration), (true, None));
+        assert_eq!(mission_state_step(false, &Event::HostMigration), (false, None));
+    }
+}
+
+#[cfg(test)]
+mod text_has_login_tests {
+    use super::text_has_login;
+
+    #[test]
+    fn detects_a_login_line_anywhere_in_the_text() {
+        let text = "\
+1.0 Sys [Info]: some earlier line
+18.148 Sys [Info]: Logged in SpiroTris
+20.0 Game [Info]: FrameworkCmd::OpenLevel - /Lotus/Levels/ShipRooms/CorpusShip";
+        assert!(text_has_login(text));
+    }
+
+    #[test]
+    fn false_when_no_login_line_present() {
+        let text = "1.0 Sys [Info]: some earlier line\n20.0 Game [Info]: FrameworkCmd::OpenLevel - /x";
+        assert!(!text_has_login(text));
+    }
+
+    #[test]
+    fn false_for_empty_text() {
+        assert!(!text_has_login(""));
     }
 }
