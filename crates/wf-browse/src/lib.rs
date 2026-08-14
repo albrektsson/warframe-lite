@@ -2673,16 +2673,19 @@ impl BrowseApp {
         stopped
     }
 
-    /// Keep the running overlay's demo mode in sync with whether the Home
-    /// tab (where the drag-to-place preview lives — this app folded its
-    /// old standalone Settings destination into Home, #77) is *actually*
-    /// focused: the Home tab being selected *and* the `wf-browse` window
-    /// having real OS-level input focus, not just being the last-selected
-    /// tab. Tab selection alone isn't enough — leaving `wf-browse` sitting
-    /// in the background on the Home tab while playing (the common case:
-    /// adjust placement, then alt-tab into the game) would otherwise never
-    /// register as "left", leaving demo mode stuck on and burying the real
-    /// fissure/reward panels under curated content indefinitely. Entering
+    /// Keep the running overlay's demo mode in sync with whether the
+    /// Home / Placement sub-tab (where the drag-to-place preview lives —
+    /// this app folded its old standalone Settings destination into Home,
+    /// #77) is *actually* focused: that sub-tab being selected *and* the
+    /// `wf-browse` window having real OS-level input focus, not just being
+    /// the last-selected tab. Tab selection alone isn't enough — leaving
+    /// `wf-browse` sitting in the background on Placement while playing
+    /// (the common case: adjust placement, then alt-tab into the game)
+    /// would otherwise never register as "left", leaving demo mode stuck
+    /// on and burying the real fissure/reward panels under curated content
+    /// indefinitely. Gated on Placement specifically (not all of Home) so
+    /// Overview and Fissures — which don't preview the overlay — don't
+    /// needlessly swap live gameplay content out for demo content. Entering
     /// shows real curated content for a true WYSIWYG preview, leaving
     /// resumes live data. Best-effort and idempotent: called every frame,
     /// it only actually sends a command when the desired state changes
@@ -2696,7 +2699,8 @@ impl BrowseApp {
         // rather than "focused" — if we can't tell, err toward not
         // clobbering live gameplay with demo content over a false positive.
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(false);
-        let want_active = self.tab == Tab::Home && focused;
+        let want_active =
+            self.tab == Tab::Home && self.home_sub_tab == HomeSubTab::Placement && focused;
         if want_active == self.demo_active {
             return;
         }
