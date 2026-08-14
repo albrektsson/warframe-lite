@@ -25,7 +25,7 @@ tokio.workspace = true
 # Same feature set as wf-settings: glow backend keeps the GUI pure-Rust with no
 # system GTK/Qt dev dependency; winit/glutin dlopen libxkbcommon / libGL /
 # libwayland at runtime.
-eframe = { version = "0.35", default-features = false, features = [
+eframe = { version = "0.36", default-features = false, features = [
     "glow",
     "default_fonts",
     "wayland",
