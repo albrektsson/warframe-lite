@@ -16,21 +16,25 @@ Overwolf**. Built for KDE Plasma (Wayland) with the game under Steam Proton, in 
 It shows a click-through overlay on top of the game with:
 
 - **Live Void Fissures** — sorted normal → Steel Path → Storm, with ETAs that
-  tick down each second. (General world state — the Void Trader and open-world
-  cycles — is out of scope; see `docs/adr/0007-live-world-state-out-of-scope.md`.)
+  tick down each second, filterable by relic tier, mission type, and kind
+  (Steel Path/Void Storm) so the panel only shows what you're farming for.
 - **An automatic relic reward picker** — when a Void Fissure reward screen
-  appears, the overlay swaps to the 2–4 rewards ranked by live warframe.market
+  appears, the overlay shows the 2–4 rewards ranked by live warframe.market
   plat price, with the best pick highlighted and a mastery emblem in front of
   primes you have already **mastered**. No keypress needed.
 - **An owned-relic mastery guide** — open the in-game **Void Relics** screen and
   the overlay automatically scans your relics as you scroll, then shows which of
   the ones you own can still drop a prime you **haven't mastered**, ranked by
-  relic price. Also `wf-lite relics <codes…>` from the CLI.
-- **A mastery planner** — `wf-lite mastery-plan` flips the view around: for every
-  prime you haven't mastered, which of your owned relics (and how many) can
-  still drop it, so you know which fissure tier is worth farming next. The
-  scanned owned-relic set is saved to disk, so this works any time — no need to
-  have the Relics screen open.
+  relic price.
+- **A mastery planner** — flips the view around: for every prime you haven't
+  mastered, which of your owned relics (and how many) can still drop it, so you
+  know which fissure tier is worth farming next. The scanned owned-relic set is
+  saved to disk, so this works any time — no need to have the Relics screen open.
+
+<p align="center">
+  <img src="docs/img/overlay-fissures.png" alt="Live Void Fissures overlay panel" width="49%">
+  <img src="docs/img/overlay-relic-picker.png" alt="Relic reward picker overlay panel" width="49%">
+</p>
 
 ## Install & run
 
