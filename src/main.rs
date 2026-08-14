@@ -1424,7 +1424,7 @@ type RelicScanStatus = std::sync::Arc<std::sync::Mutex<Option<wf_overlay::ScanPr
 type DemoState = std::sync::Arc<std::sync::Mutex<Option<DemoFrames>>>;
 
 /// One step of the mission-state machine (issue #89's design): a
-/// `MissionInfoSeen` arms `pending`; the next `LevelOpen` consumes it,
+/// `MissionInfoSeen` arms `pending`; the next `LevelConnected` consumes it,
 /// producing the new `in_mission` value (armed -> true, unarmed -> false).
 /// Any other event leaves both unchanged. Pulled out of
 /// [`mission_watch_loop`] as a pure function so the state machine itself is
@@ -1433,7 +1433,7 @@ fn mission_state_step(pending: bool, ev: &wf_log::Event) -> (bool, Option<bool>)
     use wf_log::Event;
     match ev {
         Event::MissionInfoSeen => (true, None),
-        Event::LevelOpen => (false, Some(pending)),
+        Event::LevelConnected => (false, Some(pending)),
         _ => (pending, None),
     }
 }
@@ -1461,13 +1461,33 @@ async fn mission_watch_loop(
     use std::sync::atomic::Ordering;
 
     const POLL_INTERVAL: Duration = Duration::from_secs(1);
+    // How recently EE.log must have been written to for its *existing*
+    // contents to be trusted as describing the session that's actually
+    // running right now, rather than a previous session's leftovers.
+    // Warframe's game engine (unlike its launcher, a separate process)
+    // truncates/rewrites EE.log on its own startup — but that doesn't
+    // happen until well past the launcher screen, so a wf-lite that starts
+    // watching while the launcher is still up can find a stale `Logged in`
+    // line sitting untouched from the *previous* session. Trusting that
+    // unconditionally showed the fissures panel over the bare launcher,
+    // before this session had logged in at all.
+    const STALE_THRESHOLD: Duration = Duration::from_secs(30);
 
     // Catches a player already logged in before this task started (the
     // overlay was launched or restarted mid-session) — live tailing below
-    // handles a login that happens after this point.
-    if let Ok(text) = std::fs::read_to_string(&ee_log) {
-        if text_has_login(&text) {
-            logged_in.store(true, Ordering::Relaxed);
+    // handles a login that happens after this point. Gated on freshness
+    // (see `STALE_THRESHOLD`'s docs) so a stale file from the last session
+    // doesn't get misread as "already logged in" this time around.
+    let fresh = std::fs::metadata(&ee_log)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|m| m.elapsed().ok())
+        .is_some_and(|age| age < STALE_THRESHOLD);
+    if fresh {
+        if let Ok(text) = std::fs::read_to_string(&ee_log) {
+            if text_has_login(&text) {
+                logged_in.store(true, Ordering::Relaxed);
+            }
         }
     }
 
@@ -2027,13 +2047,13 @@ mod mission_state_tests {
     }
 
     #[test]
-    fn level_open_with_pending_publishes_in_mission() {
-        assert_eq!(mission_state_step(true, &Event::LevelOpen), (false, Some(true)));
+    fn level_connected_with_pending_publishes_in_mission() {
+        assert_eq!(mission_state_step(true, &Event::LevelConnected), (false, Some(true)));
     }
 
     #[test]
-    fn level_open_without_pending_publishes_hub_bound() {
-        assert_eq!(mission_state_step(false, &Event::LevelOpen), (false, Some(false)));
+    fn level_connected_without_pending_publishes_hub_bound() {
+        assert_eq!(mission_state_step(false, &Event::LevelConnected), (false, Some(false)));
     }
 
     #[test]

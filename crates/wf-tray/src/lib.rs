@@ -31,6 +31,24 @@ use std::time::Duration;
 use ksni::TrayMethods;
 
 const POLL: Duration = Duration::from_secs(2);
+/// Consecutive failed presence polls required before treating the game as
+/// actually gone (see [`WfTray::on_game_state`]'s docs) — at [`POLL`]'s
+/// cadence, ~6 seconds of sustained absence.
+const ABSENCE_DEBOUNCE: u32 = 3;
+
+/// One step of the presence-debounce counter: given this poll's raw result
+/// and the running count of consecutive misses so far, returns the updated
+/// count and whether the game should now be considered gone. Any single
+/// `present` poll resets the count to 0 immediately (auto-start stays
+/// responsive); `false` polls only cross into "gone" after
+/// [`ABSENCE_DEBOUNCE`] in a row. Pulled out of [`WfTray::on_game_state`] as
+/// a pure function so the debounce itself is unit-testable without spawning
+/// a real overlay child process.
+fn debounce_absence(present: bool, absent_polls: u32) -> (u32, bool) {
+    let absent_polls = if present { 0 } else { absent_polls + 1 };
+    (absent_polls, !present && absent_polls >= ABSENCE_DEBOUNCE)
+}
+
 /// How much of a failed scan's error message `status_text` shows in the
 /// tooltip/menu status line — long enough to be useful (the setcap-hint
 /// command itself is well under this), short enough not to blow out the
@@ -77,6 +95,7 @@ pub async fn run() -> anyhow::Result<()> {
         game_present: false,
         overlay: None,
         overlay_visible: true,
+        absent_polls: 0,
         scan_status: Arc::new(Mutex::new(None)),
     };
     let handle = tray
@@ -106,6 +125,9 @@ struct WfTray {
     overlay: Option<Child>,
     /// Our intended overlay visibility (what the last show/hide asked for).
     overlay_visible: bool,
+    /// Consecutive presence polls in a row that came back "not found" — see
+    /// [`ABSENCE_DEBOUNCE`] and [`WfTray::on_game_state`]'s docs.
+    absent_polls: u32,
     /// The last `Scan Memory` outcome (#72), `None` until the first click.
     /// `Arc<Mutex<>>` so it can be cloned into the detached reaping thread
     /// [`run_scan`] runs on while the live `WfTray` instance (which `ksni`
@@ -171,8 +193,21 @@ impl WfTray {
 
     /// React to the game's presence: reap a self-exited overlay, then auto start
     /// when the game is up (and stop when it's gone).
+    ///
+    /// "Gone" is debounced over [`ABSENCE_DEBOUNCE`] consecutive failed polls,
+    /// not acted on from a single miss: [`wf_capture::warframe_geometry`]
+    /// locates the game by matching its window title, which can transiently
+    /// fail to find a window during a mission-end transition (the `EndOfMatch`
+    /// results screen, the loading-screen cinematic back to the hub) without
+    /// the game actually having exited. Reacting to a single miss killed and
+    /// respawned the overlay on essentially every mission end — losing its
+    /// in-memory placement/opacity/fissure-filter overrides pushed live over
+    /// the control socket (a fresh process only has whatever's on disk) and
+    /// presenting as the panel randomly "resetting" position mid-session.
     fn on_game_state(&mut self, present: bool) {
-        self.game_present = present;
+        let game_gone;
+        (self.absent_polls, game_gone) = debounce_absence(present, self.absent_polls);
+        self.game_present = present || !game_gone;
         if let Some(child) = &mut self.overlay {
             if matches!(child.try_wait(), Ok(Some(_))) {
                 self.overlay = None;
@@ -182,7 +217,7 @@ impl WfTray {
             if self.auto_start && self.overlay.is_none() {
                 self.start_overlay();
             }
-        } else if self.overlay.is_some() {
+        } else if game_gone && self.overlay.is_some() {
             self.stop_overlay();
         }
     }
@@ -438,5 +473,32 @@ mod tests {
     #[test]
     fn self_binary_is_current_exe_not_a_sibling_lookup() {
         assert_eq!(self_binary(), std::env::current_exe().unwrap());
+    }
+
+    #[test]
+    fn single_miss_does_not_declare_gone() {
+        // A lone blip (e.g. a mission-end loading screen) mustn't kill the
+        // overlay — only ABSENCE_DEBOUNCE misses in a row do.
+        let (count, gone) = debounce_absence(false, 0);
+        assert_eq!(count, 1);
+        assert!(!gone);
+    }
+
+    #[test]
+    fn sustained_absence_eventually_declares_gone() {
+        let mut count = 0;
+        let mut gone = false;
+        for _ in 0..ABSENCE_DEBOUNCE {
+            (count, gone) = debounce_absence(false, count);
+        }
+        assert!(gone);
+        assert_eq!(count, ABSENCE_DEBOUNCE);
+    }
+
+    #[test]
+    fn a_single_present_poll_resets_the_streak() {
+        let (count, _) = debounce_absence(false, ABSENCE_DEBOUNCE - 1);
+        assert!(!debounce_absence(true, count).1);
+        assert_eq!(debounce_absence(true, count).0, 0);
     }
 }

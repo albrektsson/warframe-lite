@@ -143,13 +143,24 @@ impl Config {
     }
 
     /// Persist config to `path`, creating parent directories as needed.
+    ///
+    /// Writes to a sibling temp file and `rename`s it over `path` rather than
+    /// writing `path` in place: a plain in-place write is visible to
+    /// concurrent readers mid-write (e.g. `wf-tray` spawning a fresh
+    /// `wf-lite overlay` right as a settings UI saves a placement change) —
+    /// `read_to_string` can catch it truncated or empty, and an empty file
+    /// parses as valid, fully-defaulted TOML rather than erroring, silently
+    /// resetting whatever reads it to `Config::default()`. `rename` on the
+    /// same filesystem is atomic, so a concurrent reader only ever sees the
+    /// old complete file or the new complete file, never a partial one.
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
+        let parent = path.parent().context("config path has no parent directory")?;
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         let text = toml::to_string_pretty(self).context("serializing config")?;
-        std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+        let file_name = path.file_name().context("config path has no file name")?.to_string_lossy();
+        let tmp = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
+        std::fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
         Ok(())
     }
 
@@ -289,5 +300,29 @@ mod tests {
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.platform, cfg.platform);
         assert_eq!(back.fissure_refresh_secs, cfg.fissure_refresh_secs);
+    }
+
+    #[test]
+    fn save_leaves_no_temp_file_behind_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!("wf-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        let mut cfg = Config::default();
+        cfg.overlay.margin_x = 42;
+        cfg.save(&path).unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.overlay.margin_x, 42);
+
+        // save() must land exactly one file (the final rename target), not a
+        // leftover `.config.toml.tmp-<pid>` alongside it — a leftover would
+        // mean the rename step never ran and a plain in-place write happened
+        // instead, reintroducing the torn-write race this atomic save exists
+        // to close.
+        let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("config.toml")]);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -81,14 +81,19 @@ const NO_OWNED_PARTS_MSG: &str = "no owned Prime Part data yet. Run `wf-lite ove
 const TIERS: [&str; 5] = ["Lith", "Meso", "Neo", "Axi", "Requiem"];
 /// Standard Warframe mission types, offered by the fissure-filter's
 /// mission-type checkboxes. The live API's `mission_type` field is
-/// free-form text, so this is a curated (not authoritative) list.
+/// free-form text, so this is a curated (not authoritative) list — the
+/// values here must match the API's own spelling exactly, since
+/// `FissureFilter::matches` compares by plain string equality. `warframestat.us`
+/// sends `"Extermination"` (confirmed against the live API, 2026-08-14), not
+/// the in-game menu's "Exterminate" — using the latter here silently
+/// excluded every Exterminate fissure from the panel, filter checked or not.
 const MISSION_TYPES: [&str; 13] = [
     "Assassination",
     "Capture",
     "Defense",
     "Disruption",
     "Excavation",
-    "Exterminate",
+    "Extermination",
     "Hijack",
     "Interception",
     "Mobile Defense",

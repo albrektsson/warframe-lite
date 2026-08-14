@@ -85,20 +85,37 @@ pub enum Event {
     InventorySellOpen,
 
     /// A mission's parameters were loaded ahead of an imminent level load —
-    /// arms "mission incoming" until the next `LevelOpen` consumes it.
+    /// arms "mission incoming" until the next `LevelConnected` consumes it.
     /// Confirmed marker (issue #89, from issue #88's capture): both the
     /// host-launch wording ("Host loading {...} with MissionInfo:") and the
     /// wiki-documented squad-joiner wording ("Client loaded {...} with
-    /// MissionInfo:") share this suffix.
+    /// MissionInfo:") share this suffix. Also confirmed (live capture,
+    /// 2026-08-14) to fire when joining a public squad already mid-launch
+    /// into a mission — the "Client loaded" wording, same as any other
+    /// non-host join.
     MissionInfoSeen,
 
-    /// A level load was commanded (loading screen begins) — fires
-    /// symmetrically for every transition, hub or mission alike. Consumes
-    /// a pending `MissionInfoSeen`: if one was pending, this is a
-    /// mission-start; if not, this is a hub-bound transition (mission end,
-    /// abort, or a hub-to-hub hop). Confirmed marker (issue #89, from issue
-    /// #88's capture): `Game [Info]: FrameworkCmd::OpenLevel - <path>`.
-    LevelOpen,
+    /// A level finished loading and became playable — fires symmetrically
+    /// for every transition, hub or mission alike, regardless of launch
+    /// path. Consumes a pending `MissionInfoSeen`: if one was pending, this
+    /// is a mission-start; if not, this is a hub-bound transition (mission
+    /// end, abort, or a hub-to-hub hop). Confirmed marker (issue #89, from
+    /// issue #88's capture): `Sys [Info]: ===[ Game successfully connected
+    /// to: <path> ]===`.
+    ///
+    /// Deliberately *not* `Game [Info]: FrameworkCmd::OpenLevel - <path>`
+    /// (an earlier version of this marker, fired when a level load is
+    /// *commanded* rather than finished): a live capture (2026-08-14) of a
+    /// player joining a public squad already mid-launch into a mission
+    /// showed `MissionInfoSeen` firing normally, but no `OpenLevel` line at
+    /// all before the level connected — that join path never commands its
+    /// own level load locally, it just receives one from the session it's
+    /// joining. `OpenLevel`-gated tracking left `in_mission` stuck `false`
+    /// for that entire mission (the fissures panel never hid). The
+    /// "connected" line, by contrast, fired for every transition in that
+    /// same capture — mission or hub, host-launched or matchmaking-joined —
+    /// with no gaps.
+    LevelConnected,
 }
 
 /// Substrings that mark the reward **selection screen appearing**. Confirmed
@@ -133,8 +150,9 @@ pub const INVENTORY_SELL_MARKER: &str = "InventoryTest.lua: PopulateGrid";
 /// level load. See [`Event::MissionInfoSeen`].
 pub const MISSION_INFO_MARKER: &str = "with MissionInfo:";
 
-/// Substring marking a level load being commanded. See [`Event::LevelOpen`].
-pub const LEVEL_OPEN_MARKER: &str = "FrameworkCmd::OpenLevel";
+/// Substring marking a level load finishing (the level is now connected and
+/// playable). See [`Event::LevelConnected`].
+pub const LEVEL_CONNECTED_MARKER: &str = "Game successfully connected to:";
 
 /// Classify a parsed line into an [`Event`], if it matches a known pattern.
 pub fn classify(line: &LogLine<'_>) -> Option<Event> {
@@ -156,8 +174,8 @@ pub fn classify(line: &LogLine<'_>) -> Option<Event> {
     if line.message.contains(MISSION_INFO_MARKER) {
         return Some(Event::MissionInfoSeen);
     }
-    if line.message.contains(LEVEL_OPEN_MARKER) {
-        return Some(Event::LevelOpen);
+    if line.message.contains(LEVEL_CONNECTED_MARKER) {
+        return Some(Event::LevelConnected);
     }
     match line.subsystem {
         "Sys" if line.message.starts_with("Logged in ") => {
@@ -275,13 +293,17 @@ mod tests {
     }
 
     #[test]
-    fn detects_level_open() {
-        // Real captured lines: mission launch, and mission-end-to-hub return.
+    fn detects_level_connected() {
+        // Real captured lines: host-launched mission, hub return, and (2026-08-14
+        // capture) a public-squad matchmaking join straight into an
+        // already-launching mission — the one path that never emits
+        // `FrameworkCmd::OpenLevel` at all (see `Event::LevelConnected`'s docs).
         for line in [
-            "351.998 Game [Info]: FrameworkCmd::OpenLevel - /Lotus/Levels/Proc/Vania/VaniaAssassinationSummer",
-            "1075.720 Game [Info]: FrameworkCmd::OpenLevel - /Lotus/Levels/Proc/TheNewWar/PartTwo/TNWDrifterCampMain",
+            "56.381 Sys [Info]: ===[ Game successfully connected to: /Lotus/Levels/Proc/Orokin/OrokinTowerDerelictCapture/aZhHBuEmnBFFxEGJWNWTGBcOvwjQ1IirSoiSsorQhoyAkUSUng.lp ]===",
+            "1075.720 Sys [Info]: ===[ Game successfully connected to: /Lotus/Levels/Proc/TheNewWar/PartTwo/TNWDrifterCampMain/BoC8ACA.lp ]===",
+            "284.538 Sys [Info]: ===[ Game successfully connected to: /Lotus/Levels/Proc/Corpus/CorpusShipCapture/AmYItmFZYIq3oAS5E9tDAriSoAKIoA.lp ]===",
         ] {
-            assert_eq!(event_from_line(line), Some(Event::LevelOpen));
+            assert_eq!(event_from_line(line), Some(Event::LevelConnected));
         }
     }
 
