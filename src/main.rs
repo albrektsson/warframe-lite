@@ -1585,7 +1585,7 @@ async fn run_overlay(config: Config) -> Result<()> {
         let live = live.clone();
         let logged_in = logged_in.clone();
         let in_mission = in_mission.clone();
-        move |ws: &worldstate::WorldState, shown: bool| -> wf_overlay::Canvas {
+        move |ws: &worldstate::WorldState, shown: bool, api_unreachable: bool| -> wf_overlay::Canvas {
             let (show_fissures, opacity, fissure_filter) = {
                 let live = live.lock().unwrap();
                 (live.fissures, live.opacity, live.fissure_filter.clone())
@@ -1604,7 +1604,7 @@ async fn run_overlay(config: Config) -> Result<()> {
                     // Demo mode previews the panel's full visual states
                     // regardless of the user's real filter, so its synthetic
                     // fissures always show unfiltered.
-                    wf_overlay::render_panel(&frames.fissures, &font, &Default::default())
+                    wf_overlay::render_panel(&frames.fissures, &font, &Default::default(), false)
                         .embed(OVERLAY_W, OVERLAY_H)
                 }
             } else if let Some(rows) = current_reward_rows(&reward) {
@@ -1615,7 +1615,8 @@ async fn run_overlay(config: Config) -> Result<()> {
                 && logged_in.load(Ordering::Relaxed)
                 && !in_mission.load(Ordering::Relaxed)
             {
-                wf_overlay::render_panel(ws, &font, &fissure_filter).embed(OVERLAY_W, OVERLAY_H)
+                wf_overlay::render_panel(ws, &font, &fissure_filter, api_unreachable)
+                    .embed(OVERLAY_W, OVERLAY_H)
             } else {
                 blank()
             };
@@ -1647,7 +1648,7 @@ async fn run_overlay(config: Config) -> Result<()> {
             worldstate::WorldState::default()
         }
     };
-    let initial = make_frame(&ws, visible.load(Ordering::Relaxed));
+    let initial = make_frame(&ws, visible.load(Ordering::Relaxed), consecutive_failures > 0);
 
     let (tx, rx) = mpsc::channel();
     let (placement_tx, placement_rx) = mpsc::channel();
@@ -1723,7 +1724,8 @@ async fn run_overlay(config: Config) -> Result<()> {
                     }
                     last_fetch = tokio::time::Instant::now();
                 }
-                let frame = make_frame(&cached, visible.load(Ordering::Relaxed));
+                let frame =
+                    make_frame(&cached, visible.load(Ordering::Relaxed), consecutive_failures > 0);
                 if tx.send(frame).is_err() {
                     break; // overlay closed
                 }
@@ -1937,7 +1939,7 @@ async fn overlay_png(config: &Config, out: Option<String>) -> Result<()> {
     println!("\n== Rendering overlay panel ==");
     let ws = worldstate::fetch(&http_client(), &config.platform).await?;
     let font = wf_overlay::load_font()?;
-    let canvas = wf_overlay::render_panel(&ws, &font, &config.overlay.fissure_filter);
+    let canvas = wf_overlay::render_panel(&ws, &font, &config.overlay.fissure_filter, false);
     let img = image::RgbaImage::from_raw(canvas.width, canvas.height, canvas.buf)
         .context("canvas buffer -> image")?;
     img.save(&out).map_err(|e| anyhow::anyhow!("saving {out}: {e}"))?;

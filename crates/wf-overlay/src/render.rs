@@ -61,7 +61,16 @@ fn tier_color(tier: &str) -> Color {
 /// Render the panel for `ws` and return the finished canvas. `filter`
 /// narrows which active fissures show (e.g. only Axi Capture); an inactive
 /// (default) filter shows every active fissure, matching prior behavior.
-pub fn render_panel(ws: &WorldState, font: &Font, filter: &FissureFilter) -> Canvas {
+/// `api_unreachable` is true when the last worldstate fetch failed (see
+/// `consecutive_failures` in `run_overlay`) — an empty fissure list then
+/// means "no live data", not "the filter matched nothing", and the panel
+/// says so instead of implying the filter is at fault.
+pub fn render_panel(
+    ws: &WorldState,
+    font: &Font,
+    filter: &FissureFilter,
+    api_unreachable: bool,
+) -> Canvas {
     let mut fissures: Vec<_> =
         ws.fissures.iter().filter(|f| f.active() && filter.matches(f)).collect();
     // Prioritise normal fissures (best for relic running) over Steel Path, then
@@ -109,6 +118,18 @@ pub fn render_panel(ws: &WorldState, font: &Font, filter: &FissureFilter) -> Can
     if fissures.len() > MAX_FISSURES {
         let more = format!("+{} more fissures", fissures.len() - MAX_FISSURES);
         canvas.draw_text(font, &more, PAD as f32, y as f32, FONT_PX, DIM);
+    } else if fissures.is_empty() && api_unreachable {
+        // A failed fetch means the empty list reflects stale/missing data,
+        // not a real "nothing matches" — say so rather than blaming the
+        // filter (or, worse, implying nothing is active right now).
+        canvas.draw_text(
+            font,
+            "Live data unavailable — API unreachable",
+            PAD as f32,
+            y as f32,
+            FONT_PX,
+            DIM,
+        );
     } else if fissures.is_empty() && filter.is_active() {
         // Distinguish "the filter matched nothing" from "nothing is active
         // right now" (the latter keeps today's blank body).
@@ -359,7 +380,7 @@ mod tests {
     fn renders_nonempty_panel() {
         let font = load_font().expect("a system monospace font");
         let ws = WorldState::default();
-        let canvas = render_panel(&ws, &font, &FissureFilter::default());
+        let canvas = render_panel(&ws, &font, &FissureFilter::default(), false);
         assert_eq!(canvas.width, WIDTH);
         assert!(canvas.height > 0);
         // The background alone should make many pixels non-transparent.
@@ -380,7 +401,7 @@ mod tests {
             expiry: String::new(),
         });
 
-        let no_filter = render_panel(&ws, &font, &FissureFilter::default());
+        let no_filter = render_panel(&ws, &font, &FissureFilter::default(), false);
         let non_matching_filter = render_panel(
             &ws,
             &font,
@@ -388,10 +409,24 @@ mod tests {
                 tiers: ["Neo".to_string()].into_iter().collect(),
                 ..Default::default()
             },
+            false,
         );
         assert_ne!(
             no_filter.buf, non_matching_filter.buf,
             "an active, non-matching filter should render a placeholder message"
+        );
+    }
+
+    #[test]
+    fn shows_placeholder_when_api_unreachable() {
+        let font = load_font().expect("a system monospace font");
+        let ws = WorldState::default();
+
+        let reachable = render_panel(&ws, &font, &FissureFilter::default(), false);
+        let unreachable = render_panel(&ws, &font, &FissureFilter::default(), true);
+        assert_ne!(
+            reachable.buf, unreachable.buf,
+            "an unreachable API should render a placeholder message even with no filter set"
         );
     }
 
