@@ -188,10 +188,15 @@ listings and which **Disposition** value apply.
 **Floor price**:
 The cheapest real price signal for a riven's **Riven type** on
 warframe.market, derived from a live-listing snapshot only — rivens have no
-sale-history endpoint, unlike Prime Parts — filtered to active sellers and
-outlier-trimmed rather than a single listing taken at face value. The
-primary signal for "is this weapon's riven worth anything at all"; when too
-few real listings exist to trust, the **Verdict** abstains rather than
+sale-history endpoint, unlike Prime Parts — filtered by listing recency and
+outlier-trimmed rather than a single listing taken at face value. Filtered
+by the listing's own `updated` timestamp, not seller online/ingame/offline
+status: a listing from an offline seller is exactly as valid a price signal
+as one from someone currently reachable, so status plays no role in Floor/
+Ceiling — a recency-only filter also avoids skewing the result toward
+whichever timezone happens to be awake when the player checks. The primary
+signal for "is this weapon's riven worth anything at all"; when too few
+real listings exist to trust, the **Verdict** abstains rather than
 guessing.
 
 **Ceiling price**:
@@ -203,13 +208,18 @@ low-confidence instead, since it's informational rather than the load-bearing
 number the **Verdict** depends on.
 
 **Verdict**:
-The browse tab's computed recommendation for one riven — "likely
-dissolve/transmute," "likely keep," or an abstained "insufficient data" when
-its **Riven type** has too few real listings to trust — derived from its
-**Floor price** and **Ceiling price** alone (no community weapon-tier signal
-exists with a real API), always shown alongside the raw numbers it's based
-on rather than as a standalone badge. Never an action the app performs
-itself — see
+The browse tab's computed recommendation for one **Riven type** (a
+group-level fact shown once per weapon group, not per owned copy — see
+**Riven type**) — "likely dissolve/transmute," "likely keep," or an
+abstained "insufficient data" when the type has too few real listings to
+trust — derived from its **Floor price** alone (no community weapon-tier
+signal exists with a real API): "likely dissolve/transmute" when Floor sits
+below a placeholder minimum-worth constant (an absolute plat amount, not
+scaled to that weapon's own price range — a Riven type's Floor is either
+worth real plat or it isn't, regardless of how much its Ceiling reaches),
+"likely keep" otherwise. Always shown alongside the raw Floor/Ceiling numbers
+it's based on rather than as a standalone badge. Never an action the app
+performs itself — see
 [ADR-0001](docs/adr/0001-observe-only-never-touch-game-process.md) and
 [ADR-0003](docs/adr/0003-browse-gui-is-read-only.md).
 
