@@ -144,6 +144,75 @@ the Ducats tab's default sort (highest efficiency first).
 _Avoid_: Ducat/plat ratio (fine informally, but "efficiency" is the canonical
 term for the sorted metric itself).
 
+### Rivens
+
+**Riven**:
+A randomized mod exclusive to one weapon once identified, carrying 2-3 buffs
+and up to one curse rolled from that weapon's **Riven type**. Read from the
+mobile inventory API's `Upgrades[]` via the same token-relay technique as
+Foundry/owned-relic state (see [ADR-0013](docs/adr/0013-token-relay-session-nonce-is-not-a-credential.md)),
+parsed into raw encoded buff/curse values — not yet decoded into a
+displayable stat line (see **Disposition**).
+_Avoid_: Riven mod (redundant — "Riven" already implies "mod" in this
+glossary).
+
+**Unveiled riven**:
+A Riven whose identifying challenge has been completed in-game, so its
+weapon, polarity, and roll are known and it can be assigned a **Riven
+type**'s price/tier. The only riven state the app surfaces — see **Veiled
+riven**.
+_Avoid_: Identified riven.
+
+**Veiled riven**:
+A Riven not yet identified in-game — no weapon, no decoded stats, nothing to
+price or rank. Out of scope for the browse tab: there's nothing to show
+until the player unveils it themselves.
+_Avoid_: Unidentified riven.
+
+**Disposition**:
+DE's per-weapon riven-quality multiplier — shown in-game as 1-5 circles —
+that scales how strong a given weapon's Rivens can roll, independent of the
+roll itself. **Provisional**: no source for disposition values exists in
+this repo yet; where that table comes from is an open research question.
+_Avoid_: Riven rating (used informally by the community; "Disposition" is
+DE's own term).
+
+**Riven type**:
+The buff/curse-slot archetype a weapon's Rivens roll from — effectively
+"which weapon's Riven" (a Dual Toxocyst riven and a Soma riven are different
+Riven types even though both are rifles; note "Toxocyst" alone isn't a
+distinct weapon on warframe.market — only "Dual Toxocyst" is, confirmed live
+against its `/v2/riven/weapons` catalog). Determines which warframe.market
+listings and which **Disposition** value apply.
+
+**Floor price**:
+The cheapest real price signal for a riven's **Riven type** on
+warframe.market, derived from a live-listing snapshot only — rivens have no
+sale-history endpoint, unlike Prime Parts — filtered to active sellers and
+outlier-trimmed rather than a single listing taken at face value. The
+primary signal for "is this weapon's riven worth anything at all"; when too
+few real listings exist to trust, the **Verdict** abstains rather than
+guessing.
+
+**Ceiling price**:
+The highest real price signal for a riven's **Riven type**, computed the
+same way as **Floor price** — a signal for how much upside a well-rolled
+copy could fetch, not a claim about what a specific owned riven is worth.
+Unlike Floor price, thin data never hides the Ceiling; it's shown flagged as
+low-confidence instead, since it's informational rather than the load-bearing
+number the **Verdict** depends on.
+
+**Verdict**:
+The browse tab's computed recommendation for one riven — "likely
+dissolve/transmute," "likely keep," or an abstained "insufficient data" when
+its **Riven type** has too few real listings to trust — derived from its
+**Floor price** and **Ceiling price** alone (no community weapon-tier signal
+exists with a real API), always shown alongside the raw numbers it's based
+on rather than as a standalone badge. Never an action the app performs
+itself — see
+[ADR-0001](docs/adr/0001-observe-only-never-touch-game-process.md) and
+[ADR-0003](docs/adr/0003-browse-gui-is-read-only.md).
+
 ### Out of scope: general world state
 
 **World state** (out of scope):
