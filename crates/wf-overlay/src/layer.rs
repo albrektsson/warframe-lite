@@ -39,6 +39,16 @@ use smithay_client_toolkit::{
 
 use crate::canvas::Canvas;
 
+/// A window rectangle on the X root: `(x, y, width, height)`.
+pub type WindowRect = (i32, i32, u32, u32);
+
+/// A live placement update pushed over `placement_rx`: the new [`Placement`]
+/// paired with a freshly re-queried [`WindowRect`] (see [`run`]'s docs and
+/// [`State::apply_placement`]). `pub` so the caller wiring up `run`'s
+/// `placement_tx`/`placement_rx` channel (`wf-lite`'s control-socket
+/// listener) can name the same type rather than repeating the tuple.
+pub type PlacementUpdate = (Placement, Option<WindowRect>);
+
 /// Where to anchor the overlay on screen. `margin_x`/`margin_y` are
 /// fractions of the maximum meaningful inset on that axis (`0.0` flush
 /// against the anchored edge, `1.0` centered) rather than raw pixels — see
@@ -104,8 +114,8 @@ pub fn run(
     initial: Canvas,
     rx: Receiver<Canvas>,
     placement: Placement,
-    placement_rx: Receiver<(Placement, Option<(i32, i32, u32, u32)>)>,
-    window: Option<(i32, i32, u32, u32)>,
+    placement_rx: Receiver<PlacementUpdate>,
+    window: Option<WindowRect>,
 ) -> Result<()> {
     let conn = Connection::connect_to_env().context("connecting to Wayland ($WAYLAND_DISPLAY)")?;
     let (globals, mut event_queue) = registry_queue_init(&conn).context("registry init")?;
@@ -233,7 +243,7 @@ struct State {
     /// New [`Placement`]s pushed live by a settings UI, paired with a
     /// freshly re-queried game window rectangle (see [`run`]'s docs and
     /// [`Self::apply_placement`]).
-    placement_rx: Receiver<(Placement, Option<(i32, i32, u32, u32)>)>,
+    placement_rx: Receiver<PlacementUpdate>,
     /// The game window's rectangle. Set once at startup, then overwritten by
     /// [`Self::apply_placement`] with whatever the caller re-queried just
     /// before pushing a live [`Placement`] — the startup snapshot alone
@@ -245,7 +255,7 @@ struct State {
     /// regression this fixed: settings showing `top-right` while the
     /// rendered overlay sat near screen-center, traced to exactly this
     /// staleness).
-    window: Option<(i32, i32, u32, u32)>,
+    window: Option<WindowRect>,
     /// The chosen output's logical geometry, captured once at startup — see
     /// `window`'s docs.
     chosen_geom: Option<((i32, i32), (i32, i32))>,
@@ -293,7 +303,7 @@ impl State {
     /// game window rectangle, replacing `self.window` before recomputing
     /// margins — see [`State::window`]'s docs for why the startup snapshot
     /// alone goes stale.
-    fn apply_placement(&mut self, placement: Placement, window: Option<(i32, i32, u32, u32)>) {
+    fn apply_placement(&mut self, placement: Placement, window: Option<WindowRect>) {
         let Some(layer) = &self.layer else {
             return;
         };
@@ -337,7 +347,7 @@ fn margin_px(fraction_x: f32, fraction_y: f32, container: (i32, i32), panel: (u3
 /// synthetic container sized off the panel itself when neither is known.
 fn edge_margins(
     placement: Placement,
-    window: Option<(i32, i32, u32, u32)>,
+    window: Option<WindowRect>,
     output: Option<((i32, i32), (i32, i32))>,
     panel: (u32, u32),
 ) -> (i32, i32, i32, i32) {

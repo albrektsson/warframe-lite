@@ -1686,8 +1686,8 @@ async fn run_overlay(config: Config) -> Result<()> {
 
     let (tx, rx) = mpsc::channel();
     let (placement_tx, placement_rx): (
-        mpsc::Sender<(wf_overlay::layer::Placement, Option<(i32, i32, u32, u32)>)>,
-        mpsc::Receiver<(wf_overlay::layer::Placement, Option<(i32, i32, u32, u32)>)>,
+        mpsc::Sender<wf_overlay::layer::PlacementUpdate>,
+        mpsc::Receiver<wf_overlay::layer::PlacementUpdate>,
     ) = mpsc::channel();
 
     // Control socket: `wf-lite toggle|show|hide` flips `visible` at runtime,
@@ -1811,7 +1811,7 @@ fn spawn_control_listener(
     reward: RewardState,
     live: std::sync::Arc<std::sync::Mutex<wf_config::control::LiveOverlaySettings>>,
     demo: DemoState,
-    placement_tx: std::sync::mpsc::Sender<(wf_overlay::layer::Placement, Option<(i32, i32, u32, u32)>)>,
+    placement_tx: std::sync::mpsc::Sender<wf_overlay::layer::PlacementUpdate>,
     config: Config,
     client: reqwest::Client,
 ) {
