@@ -39,9 +39,9 @@ use eframe::egui;
 use futures::stream::{self, StreamExt};
 use wf_config::Config;
 use wf_relic::{
-    DucatPick, EquipmentCategory, EvRefinement, FarmPick, ItemIndex, MasteryEntry, MasterySet,
-    PartMarketInfo, PartQuantities, PrimePart, PrimePlan, RelicIndex, RelicInfo, RelicPick,
-    CATEGORY_ORDER,
+    DecodedRiven, DucatPick, EquipmentCategory, EvRefinement, FarmPick, ItemIndex, MasteryEntry,
+    MasterySet, OwnedRivens, PartMarketInfo, PartQuantities, PrimePart, PrimePlan, RelicIndex,
+    RelicInfo, RelicPick, RivenTypeVerdict, RivenVerdict, CATEGORY_ORDER,
 };
 
 const CATALOGUE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -86,6 +86,12 @@ const NO_OWNED_DATA_MSG: &str = "no owned-relic data yet. Run `wf-lite overlay` 
 /// Shown on the Ducats tab when no Prime Part has been scanned yet.
 const NO_OWNED_PARTS_MSG: &str = "no owned Prime Part data yet. Run `wf-lite overlay` (or the tray) \
      and open the in-game Inventory/Sell screen once — it scans automatically as you scroll.";
+/// Shown on the Rivens tab when no Unveiled riven has been scanned yet.
+/// Unlike relics/parts, rivens only ever come from a mem-scan (Scan Memory /
+/// `wf-lite mem-scan`) — there is no OCR path for them (ADR-0001/ADR-0003).
+const NO_OWNED_RIVENS_MSG: &str =
+    "no owned riven data yet. Click Scan Memory on the Home tab (or run `wf-lite mem-scan`) \
+     once you have at least one Unveiled riven.";
 /// Relic tiers offered by the tier-filter checkboxes, in drop order.
 const TIERS: [&str; 5] = ["Lith", "Meso", "Neo", "Axi", "Requiem"];
 /// Standard Warframe mission types, offered by the fissure-filter's
@@ -584,6 +590,15 @@ struct Prices {
     farm: HashMap<String, Option<u32>>,
     set: HashMap<String, Option<u32>>,
     ducats: HashMap<String, Option<u32>>,
+    /// The Rivens tab's per-owned-weapon Floor/Ceiling/Verdict, keyed by
+    /// `weapon_unique_name` (DE's own id — the same string
+    /// [`DecodedRiven::weapon_unique_name`] carries) rather than the
+    /// warframe.market slug, since that's what a [`RivenGroup`] already
+    /// groups by. Resolved once in [`load_data`], same "fetched at launch,
+    /// not re-fetched on poll" rule as `ducats` (a newly mem-scanned riven
+    /// of an already-priced weapon shows its Verdict immediately; a riven of
+    /// a brand-new weapon waits for the next launch).
+    riven_verdicts: HashMap<String, RivenTypeVerdict>,
 }
 
 /// The Relics EV tab's lazy, on-expand pricing state for one relic — `None`
@@ -745,6 +760,52 @@ struct Live {
     /// set: it's driven by `PartQuantities`/mastery, not owned-relic
     /// evidence.
     unmastered_primes: Vec<String>,
+    /// The Rivens tab's data, grouped by owned weapon and Verdict-attached —
+    /// recomputed each poll tick against the same launch-time
+    /// `Prices::riven_verdicts` (mirrors `ducat_picks`'s same "recompute
+    /// ranking, don't refetch price" rule).
+    riven_groups: Vec<RivenGroup>,
+}
+
+/// Every Unveiled riven the player owns of one weapon, plus that weapon's
+/// Floor/Ceiling/Verdict (a group-level fact per CONTEXT.md's Verdict entry
+/// — computed once for the group, not per copy). The Rivens tab's grouped-
+/// by-type layout (`docs/specs/riven-browse-tab.md` §4) renders one of
+/// these per collapsing section.
+#[derive(Clone)]
+struct RivenGroup {
+    weapon_name: String,
+    weapon_unique_name: String,
+    /// `None` when the weapon has no cached Verdict yet — a weapon newly
+    /// mem-scanned since launch (see `Prices::riven_verdicts`'s doc), not an
+    /// "insufficient data" abstain (that's [`RivenTypeVerdict::verdict`]
+    /// being [`RivenVerdict::InsufficientData`], a distinct, already-priced
+    /// state).
+    verdict: Option<RivenTypeVerdict>,
+    rivens: Vec<DecodedRiven>,
+}
+
+/// Group `owned` by [`DecodedRiven::weapon_unique_name`], attaching each
+/// group's Verdict from `verdicts` — sorted by weapon name for a stable,
+/// scan-order-independent render.
+fn group_owned_rivens(
+    owned: &OwnedRivens,
+    verdicts: &HashMap<String, RivenTypeVerdict>,
+) -> Vec<RivenGroup> {
+    let mut groups: Vec<RivenGroup> = Vec::new();
+    for riven in owned {
+        match groups.iter_mut().find(|g| g.weapon_unique_name == riven.weapon_unique_name) {
+            Some(g) => g.rivens.push(riven.clone()),
+            None => groups.push(RivenGroup {
+                weapon_name: riven.weapon_name.clone(),
+                weapon_unique_name: riven.weapon_unique_name.clone(),
+                verdict: verdicts.get(&riven.weapon_unique_name).copied(),
+                rivens: vec![riven.clone()],
+            }),
+        }
+    }
+    groups.sort_by(|a, b| a.weapon_name.cmp(&b.weapon_name));
+    groups
 }
 
 /// Launch-time [`load_data`] plus the first [`Live::compute`] derived from
@@ -799,6 +860,7 @@ impl Live {
         owned: Option<&wf_cache::Stamped<wf_relic::OwnedRelics>>,
         owned_parts: &wf_relic::OwnedPrimeParts,
         mem_scanned_parts: bool,
+        owned_rivens: &OwnedRivens,
         static_data: &StaticData,
         prices: &Prices,
         active_tiers: HashSet<String>,
@@ -834,6 +896,7 @@ impl Live {
             .map(|e| index.all().iter().filter(|r| e.contains_key(&r.display)).map(|r| r.slug()).collect())
             .unwrap_or_default();
         let unmastered_primes = wf_relic::unmastered_primes(quantities, mastery);
+        let riven_groups = group_owned_rivens(owned_rivens, &prices.riven_verdicts);
         Self {
             plans,
             sell_picks,
@@ -847,6 +910,7 @@ impl Live {
             ducat_picks,
             priceable_relic_slugs,
             unmastered_primes,
+            riven_groups,
         }
     }
 }
@@ -868,6 +932,7 @@ async fn load_and_poll(
         owned,
         owned_parts,
         mem_scanned_parts,
+        owned_rivens,
         active_tiers,
         mut prices,
         part_market,
@@ -885,8 +950,15 @@ async fn load_and_poll(
     // anything, which `poll`'s own snapshot below picks up on its next tick.
     prices.sell = snapshot_prices(&relic_prices);
     prices.set = snapshot_prices(&set_prices);
-    let live =
-        Live::compute(owned.as_ref(), &owned_parts, mem_scanned_parts, &static_data, &prices, active_tiers);
+    let live = Live::compute(
+        owned.as_ref(),
+        &owned_parts,
+        mem_scanned_parts,
+        &owned_rivens,
+        &static_data,
+        &prices,
+        active_tiers,
+    );
     *lock_loaded(&loaded) = Some(Loaded {
         mastery_rows,
         live,
@@ -948,6 +1020,9 @@ async fn poll(args: PollArgs) {
         let mem_scanned_parts =
             wf_cache::load_blob::<bool>(wf_relic::owned_parts::OWNED_PARTS_MEM_SCANNED_MARKER_FILE)
                 .is_some();
+        let owned_rivens: OwnedRivens = wf_cache::load_blob::<OwnedRivens>(wf_relic::OWNED_RIVENS_FILE)
+            .map(|s| s.value)
+            .unwrap_or_default();
         let active_tiers = wf_data::worldstate::fetch(&client, &platform)
             .await
             .map(|ws| ws.active_fissure_tiers())
@@ -964,6 +1039,7 @@ async fn poll(args: PollArgs) {
             owned.as_ref(),
             &owned_parts,
             mem_scanned_parts,
+            &owned_rivens,
             &static_data,
             &prices,
             active_tiers,
@@ -988,6 +1064,9 @@ struct LoadedData {
     owned: Option<wf_cache::Stamped<wf_relic::OwnedRelics>>,
     owned_parts: wf_relic::OwnedPrimeParts,
     mem_scanned_parts: bool,
+    /// Every decoded Unveiled riven from the last mem-scan (`rivens.json`),
+    /// if any — see [`wf_relic::owned_rivens`].
+    owned_rivens: OwnedRivens,
     active_tiers: HashSet<String>,
     prices: Prices,
     /// Vaulted status + ducat value per Prime Part, resolved once against the
@@ -1027,6 +1106,42 @@ where
         .await
 }
 
+/// Look up a bounded-concurrency batch of riven Floor/Ceiling/Verdicts, one
+/// per distinct owned weapon — mirrors [`fetch_prices`]'s exact pattern
+/// (same concurrency cap, same cache-first/timeout-falls-back-to-stale
+/// behavior via [`wf_relic::cached_riven_verdict`]), just keyed by
+/// `weapon_unique_name` instead of a market item slug. A weapon absent from
+/// `slug_by_weapon` (not in warframe.market's riven-weapon catalogue at all)
+/// is skipped — nothing to query.
+async fn fetch_riven_verdicts(
+    weapon_unique_names: Vec<String>,
+    slug_by_weapon: &HashMap<String, String>,
+    cache: &wf_relic::RivenPriceCache,
+    market: &wf_data::riven_market::RivenMarketClient,
+) -> HashMap<String, RivenTypeVerdict> {
+    // Resolved synchronously, before entering the stream — a slug lookup is
+    // cheap and borrowing `slug_by_weapon` across the stream's own futures
+    // would tie their lifetime to this call, which `tokio::spawn`'s `'static`
+    // bound (see `load_and_poll`'s caller) doesn't allow.
+    let to_fetch: Vec<(String, String)> = weapon_unique_names
+        .into_iter()
+        .filter_map(|weapon_unique_name| {
+            slug_by_weapon.get(&weapon_unique_name).cloned().map(|slug| (weapon_unique_name, slug))
+        })
+        .collect();
+
+    stream::iter(to_fetch)
+        .map(|(weapon_unique_name, slug)| async move {
+            let verdict =
+                wf_relic::cached_riven_verdict(cache, market, &slug, wf_relic::PriceOpts::default()).await;
+            (weapon_unique_name, verdict)
+        })
+        .buffer_unordered(PRICE_FETCH_CONCURRENCY)
+        .filter_map(|(weapon_unique_name, verdict)| async move { verdict.map(|v| (weapon_unique_name, v)) })
+        .collect()
+        .await
+}
+
 /// Load the relic catalogue, the player's mastered set, their scanned Owned
 /// relic counts, active Fissure tiers, and (once, up front) mastered-reward
 /// part prices for every owned relic (Farm tab) and every owned Prime Part
@@ -1056,6 +1171,9 @@ async fn load_data(config: &Config) -> LoadedData {
     let mem_scanned_parts =
         wf_cache::load_blob::<bool>(wf_relic::owned_parts::OWNED_PARTS_MEM_SCANNED_MARKER_FILE)
             .is_some();
+    let owned_rivens: OwnedRivens = wf_cache::load_blob::<OwnedRivens>(wf_relic::OWNED_RIVENS_FILE)
+        .map(|s| s.value)
+        .unwrap_or_default();
     let active_tiers = wf_data::worldstate::fetch(&client, &config.platform)
         .await
         .map(|ws| ws.active_fissure_tiers())
@@ -1109,6 +1227,37 @@ async fn load_data(config: &Config) -> LoadedData {
 
     cache.save();
 
+    // Rivens-tab pricing: one Floor/Ceiling/Verdict per distinct owned
+    // weapon, resolved once at launch like every other owned-driven price
+    // above. The weapon catalogue itself (`/v2/riven/weapons`) is small
+    // (~400 entries) and fetched fresh each launch rather than disk-cached,
+    // same as `active_tiers`'s worldstate fetch above.
+    let riven_weapons = wf_data::riven_market::weapon_catalogue(&client).await.unwrap_or_else(|e| {
+        tracing::warn!("riven weapon catalogue load failed: {e:#}");
+        Vec::new()
+    });
+    let riven_slug_by_weapon: HashMap<String, String> =
+        riven_weapons.into_iter().map(|w| (w.game_ref, w.slug)).collect();
+    let riven_market =
+        wf_data::riven_market::RivenMarketClient::new(client.clone(), config.market_platform.clone());
+    let riven_price_cache = wf_relic::riven_price_cache();
+    let distinct_owned_weapons: Vec<String> = {
+        let mut seen = HashSet::new();
+        owned_rivens
+            .iter()
+            .filter(|r| seen.insert(r.weapon_unique_name.clone()))
+            .map(|r| r.weapon_unique_name.clone())
+            .collect()
+    };
+    let riven_verdicts = fetch_riven_verdicts(
+        distinct_owned_weapons,
+        &riven_slug_by_weapon,
+        &riven_price_cache,
+        &riven_market,
+    )
+    .await;
+    riven_price_cache.save();
+
     let part_market = wf_relic::part_market_info(&quantities, &item_index);
 
     LoadedData {
@@ -1118,12 +1267,14 @@ async fn load_data(config: &Config) -> LoadedData {
         owned,
         owned_parts,
         mem_scanned_parts,
+        owned_rivens,
         active_tiers,
         prices: Prices {
             sell: HashMap::new(),
             farm: farm_prices,
             set: HashMap::new(),
             ducats: ducat_prices,
+            riven_verdicts,
         },
         part_market,
         item_index,
@@ -1145,6 +1296,7 @@ enum Tab {
     BuyOrFarm,
     Sell,
     Farm,
+    Rivens,
     Ducats,
     Owned,
 }
@@ -1166,25 +1318,32 @@ impl Tab {
             Tab::BuyOrFarm => "Buy or Farm Parts",
             Tab::Sell => "Sell Relics",
             Tab::Farm => "Farm Relics",
+            Tab::Rivens => "Rivens",
             Tab::Ducats => "Ducats",
             Tab::Owned => "Owned Relics",
         }
     }
 }
 
-/// The shell's top-level nav (#77) — four groups instead of the old flat
+/// The shell's top-level nav (#77) — five groups instead of the old flat
 /// 10-tab row (or the five-group "Home/Plan/Market/Owned/Settings" first
 /// pass): Settings folds into Home rather than staying a destination of its
-/// own, and `Relics`/`Ducats` split by *what they act on* rather than being
-/// lumped into one "Market" group. `Relics` is every owned-relic action
-/// (inventory, sell-whole, crack-for-parts, plus the relic-catalogue
-/// reference); `Ducats` is the one Prime-Part (post-crack) action; `Progress`
-/// is explicitly "parts you still need."
+/// own, and `Relics`/`Rivens`/`Ducats` split by *what they act on* rather
+/// than being lumped into one "Market" group. `Relics` is every owned-relic
+/// action (inventory, sell-whole, crack-for-parts, plus the relic-catalogue
+/// reference); `Rivens` is the riven-economy view (decode/price/verdict,
+/// per `docs/specs/riven-browse-tab.md` §5 — a riven isn't a Prime Part, so
+/// it doesn't fold into `Ducats` despite both being single-tab "is this
+/// worth anything" valuation views); `Ducats` is the one Prime-Part
+/// (post-crack) action; `Progress` is explicitly "parts you still need."
+/// Positioned between `Relics` and `Ducats` (owned-relic economy → riven
+/// economy → prime-part economy).
 #[derive(Clone, Copy, PartialEq)]
 enum Group {
     Home,
     Progress,
     Relics,
+    Rivens,
     Ducats,
 }
 
@@ -1194,6 +1353,7 @@ impl Group {
             Group::Home => "Home",
             Group::Progress => "Progress",
             Group::Relics => "Relics",
+            Group::Rivens => "Rivens",
             Group::Ducats => "Ducats",
         }
     }
@@ -1203,6 +1363,7 @@ impl Group {
             Tab::Home => Group::Home,
             Tab::Mastery | Tab::Relics | Tab::BuyOrFarm => Group::Progress,
             Tab::Owned | Tab::Sell | Tab::Farm | Tab::RelicsEv => Group::Relics,
+            Tab::Rivens => Group::Rivens,
             Tab::Ducats => Group::Ducats,
         }
     }
@@ -1211,7 +1372,8 @@ impl Group {
         match self {
             Group::Progress => &[Tab::Mastery, Tab::Relics, Tab::BuyOrFarm],
             Group::Relics => &[Tab::Owned, Tab::Sell, Tab::Farm, Tab::RelicsEv],
-            Group::Home | Group::Ducats => &[],
+            // Single tab, no children — same shape as `Group::Ducats`.
+            Group::Home | Group::Rivens | Group::Ducats => &[],
         }
     }
 
@@ -1221,12 +1383,14 @@ impl Group {
             Group::Progress => Tab::Mastery,
             // Opens on the inventory itself, not an action on it.
             Group::Relics => Tab::Owned,
+            Group::Rivens => Tab::Rivens,
             Group::Ducats => Tab::Ducats,
         }
     }
 }
 
-const GROUPS: [Group; 4] = [Group::Home, Group::Progress, Group::Relics, Group::Ducats];
+const GROUPS: [Group; 5] =
+    [Group::Home, Group::Progress, Group::Relics, Group::Rivens, Group::Ducats];
 
 /// The Home tab's own sub-nav: general app settings/actions, the
 /// drag-to-place overlay mock, and the fissure filter. Split out so
@@ -2558,6 +2722,73 @@ impl BrowseApp {
         });
     }
 
+    /// The riven browse tab (`docs/specs/riven-browse-tab.md`): every
+    /// Unveiled riven grouped by owned weapon, one collapsing section per
+    /// weapon stating Floor/Ceiling/Verdict once (a weapon-level fact, not
+    /// per-copy — see §3/§4 and CONTEXT.md's Verdict entry), with each owned
+    /// copy's decoded stats nested underneath. Real production code — not
+    /// the throwaway `prototype/riven-tab-layout-99` branch's mock-data
+    /// variant switcher (issue #99), though the layout itself (Variant C,
+    /// the winning prototype) is unchanged.
+    fn rivens_tab(&mut self, ui: &mut egui::Ui) {
+        let Some(groups) = self.loaded_or_placeholder(ui, |l| l.live.riven_groups.clone()) else {
+            return;
+        };
+
+        if groups.is_empty() {
+            ui.label(NO_OWNED_RIVENS_MSG);
+            return;
+        }
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for group in &groups {
+                let header_text = match &group.verdict {
+                    Some(v) => format!(
+                        "{}  —  Floor {} · Ceiling {} · {}  ({} owned)",
+                        group.weapon_name,
+                        floor_str(v.floor),
+                        ceiling_str(v.ceiling, v.ceiling_low_confidence),
+                        verdict_label(v.verdict),
+                        group.rivens.len()
+                    ),
+                    None => format!(
+                        "{}  —  price not yet fetched  ({} owned)",
+                        group.weapon_name,
+                        group.rivens.len()
+                    ),
+                };
+                let color = group.verdict.map(|v| verdict_color(v.verdict)).unwrap_or(UNMASTERED_COLOR);
+
+                egui::CollapsingHeader::new(egui::RichText::new(header_text).color(color))
+                    .default_open(true)
+                    .id_salt(&group.weapon_unique_name)
+                    .show(ui, |ui| {
+                        egui::Grid::new(format!("riven_grid_{}", group.weapon_unique_name))
+                            .num_columns(3)
+                            .striped(true)
+                            .show(ui, |ui| {
+                                ui.strong("stats");
+                                ui.strong("polarity");
+                                ui.strong("mastery / rank / rerolls");
+                                ui.end_row();
+                                for r in &group.rivens {
+                                    ui.label(stat_line(&r.stats));
+                                    ui.label(r.polarity.as_deref().unwrap_or("—"));
+                                    ui.label(format!(
+                                        "{} · R{}/8 · {} rerolls",
+                                        r.mastery_req.map(|v| format!("MR{v}")).unwrap_or_else(|| "—".to_string()),
+                                        r.rank,
+                                        r.rerolls
+                                    ));
+                                    ui.end_row();
+                                }
+                            });
+                    });
+                ui.add_space(4.0);
+            }
+        });
+    }
+
     /// Raw owned-relic inventory, across every refinement (unlike the
     /// Intact-only Relics/Sell/Farm tabs) — where a specific `(code,
     /// refinement)` entry can be cleared, or the whole set reset. See
@@ -3054,6 +3285,107 @@ fn plat_str(v: Option<u32>) -> String {
     v.map(|v| format!("{v}p")).unwrap_or_else(|| "—".into())
 }
 
+/// Rivens tab: Floor price cell — see CONTEXT.md's Floor price entry. `None`
+/// only when there are zero price-bearing listings (see
+/// [`wf_relic::RivenTypeVerdict::floor`]'s doc); the low-listing-count
+/// abstain case is communicated by the Verdict label sitting right next to
+/// this, not by a separate caveat on the number itself (spec §3.3).
+fn floor_str(floor: Option<u32>) -> String {
+    floor.map(|p| format!("{p}p")).unwrap_or_else(|| "—".to_string())
+}
+
+/// Rivens tab: Ceiling price cell — see CONTEXT.md's Ceiling price entry.
+/// Unlike Floor, a thin sample is flagged inline (`low_confidence`) rather
+/// than just relying on the Verdict label, since Ceiling is informational
+/// upside rather than the number the Verdict is derived from (spec §3.3).
+fn ceiling_str(ceiling: Option<u32>, low_confidence: bool) -> String {
+    match ceiling {
+        None => "—".to_string(),
+        Some(p) if low_confidence => format!("{p}p (low confidence)"),
+        Some(p) => format!("{p}p"),
+    }
+}
+
+fn verdict_label(v: RivenVerdict) -> &'static str {
+    match v {
+        RivenVerdict::LikelyKeep => "likely keep",
+        RivenVerdict::LikelyDissolve => "likely dissolve/transmute",
+        RivenVerdict::InsufficientData => "insufficient data",
+    }
+}
+
+/// Mirrors the `/prototype`-validated palette from issue #99's winning
+/// variant: [`MASTERED_COLOR`] for a real "keep" recommendation,
+/// [`UNMASTERED_COLOR`] (neutral gray) for an abstain, and a dedicated muted
+/// red for "likely dissolve/transmute" — distinct from both, since it's an
+/// actionable negative signal, not a neutral unknown.
+fn verdict_color(v: RivenVerdict) -> egui::Color32 {
+    match v {
+        RivenVerdict::LikelyKeep => MASTERED_COLOR,
+        RivenVerdict::LikelyDissolve => egui::Color32::from_rgb(210, 100, 90),
+        RivenVerdict::InsufficientData => UNMASTERED_COLOR,
+    }
+}
+
+/// One riven's decoded stats as a single comma-joined display line, e.g.
+/// `"+45.7% Crit Chance, -12.3% Recoil"`.
+fn stat_line(stats: &[wf_relic::DecodedStat]) -> String {
+    if stats.is_empty() {
+        return "—".to_string();
+    }
+    stats.iter().map(stat_display).collect::<Vec<_>>().join(", ")
+}
+
+fn stat_display(s: &wf_relic::DecodedStat) -> String {
+    let label = stat_tag_label(&s.tag);
+    if s.is_multiplier {
+        format!("{:.2}x {label}", s.value)
+    } else if s.is_non_percentage {
+        format!("{:+.1} {label}", s.value)
+    } else if s.value >= 0.0 {
+        format!("+{:.1}% {label}", s.value)
+    } else {
+        format!("{:.1}% {label}", s.value)
+    }
+}
+
+/// A riven stat tag (e.g. `"WeaponCritChanceMod"`) to a readable label
+/// (`"Crit Chance"`) — strips the common `Weapon`/`WeaponMelee` prefix and
+/// `Mod` suffix, then camelCase-splits what's left. Not locTag-driven (see
+/// `docs/specs/riven-browse-tab.md` §1's implementation-step note): a small,
+/// local, good-enough label rather than pulling `Mods.json`'s `locTag`
+/// templates and stripping their DE color-tag markup.
+fn stat_tag_label(tag: &str) -> String {
+    let stripped =
+        tag.strip_prefix("WeaponMelee").or_else(|| tag.strip_prefix("Weapon")).unwrap_or(tag);
+    let stripped = stripped.strip_suffix("Mod").unwrap_or(stripped);
+    let spaced = camel_case_split(stripped);
+    if spaced.trim().is_empty() {
+        tag.to_string()
+    } else {
+        spaced
+    }
+}
+
+/// Insert a space before each uppercase letter that follows a lowercase
+/// letter or digit, e.g. `"CritChance"` -> `"Crit Chance"`. Mirrors
+/// `wf-lite`'s `readable_item_name`/`wf_relic::mastery`'s own
+/// camelCase-splitting convention, duplicated here for the same reason
+/// those two duplicate each other — no shared crate this app's binary,
+/// `wf-relic`, and `wf-browse` could all depend on for one tiny helper.
+fn camel_case_split(leaf: &str) -> String {
+    let mut out = String::new();
+    let mut prev: Option<char> = None;
+    for c in leaf.chars() {
+        if c.is_uppercase() && prev.is_some_and(|p| p.is_lowercase() || p.is_ascii_digit()) {
+            out.push(' ');
+        }
+        out.push(c);
+        prev = Some(c);
+    }
+    out
+}
+
 /// Render a lazily-fetched, auto-retrying price cell (see [`LazyPrice`]):
 /// the resolved plat price once known, `"…"` while a fetch is in flight,
 /// hasn't started yet, or is waiting out its retry cooldown, or an explicit
@@ -3201,6 +3533,7 @@ impl eframe::App for BrowseApp {
                 Tab::BuyOrFarm => self.buy_or_farm_tab(ui),
                 Tab::Sell => self.sell_tab(ui),
                 Tab::Farm => self.farm_tab(ui),
+                Tab::Rivens => self.rivens_tab(ui),
                 Tab::Ducats => self.ducats_tab(ui),
                 Tab::Owned => self.owned_tab(ui),
             }

@@ -204,7 +204,7 @@ mod tests {
         );
         assert_eq!(
             riven.curses,
-            vec![RivenStat { tag: "WeaponRecoilMod".to_string(), value: 190_442_017 }]
+            vec![RivenStat { tag: "WeaponRecoilReductionMod".to_string(), value: 190_442_017 }]
         );
     }
 

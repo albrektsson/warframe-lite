@@ -298,6 +298,8 @@ async fn mem_scan_cmd(config: &Config) -> Result<()> {
     println!("\n== mem-scan: Rivens ==");
     let rivens = wf_mem::parse_rivens(&raw)?;
     print_rivens(&rivens);
+    let riven_catalogue = load_riven_catalogue(&client).await;
+    write_owned_rivens(&rivens, &riven_catalogue);
 
     println!("\n== mem-scan: Relics (LevelKeys) ==");
     let level_keys = wf_mem::parse_level_keys(&raw)?;
@@ -1401,6 +1403,37 @@ fn write_owned_parts(state: &wf_mem::OwnedPartsState, quantities: &wf_relic::Par
             report.written,
             wf_relic::OWNED_PRIME_PARTS_FILE,
             report.skipped
+        );
+    }
+}
+
+/// Best-effort riven decode-reference catalogue load (disposition +
+/// per-Riven-type base values): an empty catalogue (every raw Unveiled
+/// riven dropped, see [`write_owned_rivens`]) is returned if the WFCD
+/// dataset can't be loaded, so `mem-scan` still runs — mirrors
+/// [`load_part_quantities`]'s same fail-open convention.
+#[cfg(feature = "mem-scan")]
+async fn load_riven_catalogue(client: &reqwest::Client) -> wf_relic::RivenCatalogue {
+    match wf_relic::RivenCatalogue::load_cached(client, CATALOGUE_TTL).await {
+        Ok(catalogue) => catalogue,
+        Err(e) => {
+            tracing::warn!("riven catalogue load failed ({e:#}); owned rivens shown undecoded");
+            wf_relic::RivenCatalogue::empty()
+        }
+    }
+}
+
+/// Print the outcome of decoding and writing Unveiled riven entries to
+/// `rivens.json` — mirrors [`write_owned_parts`]'s wrapper.
+#[cfg(feature = "mem-scan")]
+fn write_owned_rivens(state: &wf_mem::RivenState, catalogue: &wf_relic::RivenCatalogue) {
+    let report = wf_mem::write_owned_rivens(state, catalogue);
+    if report.saved {
+        println!(
+            "  wrote {} entries to {} ({} unrecognized weapon, undecoded)",
+            report.written,
+            wf_relic::OWNED_RIVENS_FILE,
+            report.undecoded
         );
     }
 }

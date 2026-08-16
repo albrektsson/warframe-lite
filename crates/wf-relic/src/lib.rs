@@ -7,12 +7,16 @@ pub mod mastery;
 pub mod owned;
 pub mod ducats;
 pub mod owned_parts;
+pub mod owned_rivens;
 pub mod part_market;
 pub mod part_quantities;
 #[cfg(feature = "grid-scan")]
 pub mod regions;
 pub mod relic_names;
 pub mod relics;
+pub mod riven_catalogue;
+pub mod riven_decode;
+pub mod riven_pricing;
 pub mod wishlist;
 
 pub use bom::{buy_or_farm_plan, unmastered_primes, BomGap, BomPlan};
@@ -25,6 +29,7 @@ pub use owned::{
 };
 pub use ducats::{ducat_picks, DucatPick};
 pub use owned_parts::{OwnedPrimeParts, OWNED_PRIME_PARTS_FILE};
+pub use owned_rivens::{apply_exact_snapshot as apply_riven_snapshot, OwnedRivens, OWNED_RIVENS_FILE};
 pub use part_market::{reward_label, resolve as part_market_info, PartMarketInfo};
 pub use part_quantities::{EquipmentCategory, PartQuantities, CATEGORY_ORDER};
 #[cfg(feature = "grid-scan")]
@@ -38,12 +43,16 @@ pub use relics::{
     FarmPick, MasteryEntry, PartsOwnedSummary, PrimePartGroup, PrimePlan, PrimeRelicSource,
     RelicContext, RelicIndex, RelicInfo, RelicPick, RelicReward, OWNED_RELICS_FILE,
 };
+pub use riven_catalogue::{RivenCatalogue, RivenModCategory, WeaponRivenInfo};
+pub use riven_decode::{decode as decode_riven, DecodedRiven, DecodedStat, RawRiven as RivenRawRiven, RawStat as RivenRawStat};
+pub use riven_pricing::{evaluate as evaluate_riven_price, ListingInput, RivenTypeVerdict, Verdict as RivenVerdict};
 pub use wishlist::{Wishlist, WISHLIST_FILE};
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use wf_data::market::{MarketClient, PriceSummary};
+use wf_data::riven_market::RivenMarketClient;
 
 /// A disk-backed cache of per-item price summaries.
 pub type PriceCache = wf_cache::KeyedCache<PriceSummary>;
@@ -52,6 +61,19 @@ pub type PriceCache = wf_cache::KeyedCache<PriceSummary>;
 /// reads from and writes back to.
 pub fn price_cache() -> PriceCache {
     PriceCache::load("prices.json")
+}
+
+/// A disk-backed cache of per-Riven-type Floor/Ceiling/Verdict results,
+/// keyed by `weapon_url_name` (the warframe.market riven-weapon slug — see
+/// [`wf_data::riven_market`]). Never shares storage with [`OwnedRivens`]'s
+/// `rivens.json`: identity/decoded-stat data persists across sessions, but
+/// price/Verdict data is explicitly live-only (spec §6) — this cache exists
+/// purely for the stale-serves-instantly pattern, not as a source of truth.
+pub type RivenPriceCache = wf_cache::KeyedCache<RivenTypeVerdict>;
+
+/// Load the shared on-disk riven-price cache.
+pub fn riven_price_cache() -> RivenPriceCache {
+    RivenPriceCache::load("riven-prices.json")
 }
 
 /// Tuning for cached price lookups.
@@ -394,6 +416,41 @@ pub async fn cached_plat(
     opts: PriceOpts,
 ) -> Option<u32> {
     cached_price(cache, market, slug, opts).await.and_then(|s| s.lowest_sell)
+}
+
+/// [`RivenTypeVerdict`] for `weapon_url_name` via the disk riven-price
+/// cache: fresh → instant, stale/missing → bounded fetch (falling back to
+/// stale on timeout/error), mirroring [`cached_price`]'s exact pattern for
+/// Prime Part prices.
+pub async fn cached_riven_verdict(
+    cache: &RivenPriceCache,
+    market: &RivenMarketClient,
+    weapon_url_name: &str,
+    opts: PriceOpts,
+) -> Option<RivenTypeVerdict> {
+    let stale = cache.get(weapon_url_name);
+    if let Some(s) = &stale {
+        if s.age() < opts.fresh_ttl {
+            return Some(s.value);
+        }
+    }
+    match tokio::time::timeout(opts.fetch_timeout, market.auctions_for(weapon_url_name)).await {
+        Ok(Ok(auctions)) => {
+            let listings: Vec<ListingInput> = auctions
+                .iter()
+                .map(|a| ListingInput {
+                    is_direct_sell: a.is_direct_sell,
+                    buyout_price: a.buyout_price,
+                    top_bid: a.top_bid,
+                    updated: a.updated,
+                })
+                .collect();
+            let verdict = evaluate_riven_price(&listings, time::OffsetDateTime::now_utc());
+            cache.put(weapon_url_name, verdict);
+            Some(verdict)
+        }
+        _ => stale.map(|s| s.value),
+    }
 }
 
 /// Index of the highest-platinum reward, if any have a price.

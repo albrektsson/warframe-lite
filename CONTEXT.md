@@ -172,8 +172,12 @@ _Avoid_: Unidentified riven.
 **Disposition**:
 DE's per-weapon riven-quality multiplier — shown in-game as 1-5 circles —
 that scales how strong a given weapon's Rivens can roll, independent of the
-roll itself. **Provisional**: no source for disposition values exists in
-this repo yet; where that table comes from is an open research question.
+roll itself. Sourced from WFCD's `warframe-items` dataset's `disposition`
+(the 1-5 circle count) and `omegaAttenuation` (the exact float the decode
+formula multiplies by) fields, per
+[issue #95](https://github.com/albrektsson/warframe-lite/issues/95)'s
+research (`docs/research/riven-disposition-and-stat-decoding.md`) — see
+`crates/wf-relic/src/riven_catalogue.rs`.
 _Avoid_: Riven rating (used informally by the community; "Disposition" is
 DE's own term).
 

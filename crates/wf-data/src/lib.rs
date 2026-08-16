@@ -9,6 +9,7 @@
 
 pub mod items;
 pub mod market;
+pub mod riven_market;
 pub mod worldstate;
 
 use std::time::Duration;
