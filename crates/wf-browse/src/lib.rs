@@ -327,6 +327,58 @@ fn app_icon() -> egui::IconData {
     }
 }
 
+/// Bundled polarity icons (ADR-0019) for the Riven browse tab's polarity
+/// column — sourced from WFCD/genesis-assets (Apache 2.0) rather than the
+/// wiki's SVGs (CC BY-NC-SA), see the ADR. Decoded and uploaded to the GPU
+/// once and cached here, since `Context::load_texture` allocates a fresh
+/// texture on every call.
+struct PolarityIcons {
+    madurai: egui::TextureHandle,
+    vazarin: egui::TextureHandle,
+    naramon: egui::TextureHandle,
+    zenurik: egui::TextureHandle,
+    unairu: egui::TextureHandle,
+}
+
+impl PolarityIcons {
+    fn load(ctx: &egui::Context) -> Self {
+        Self {
+            madurai: load_polarity_icon(ctx, "madurai", include_bytes!("../assets/polarity/madurai.png")),
+            vazarin: load_polarity_icon(ctx, "vazarin", include_bytes!("../assets/polarity/vazarin.png")),
+            naramon: load_polarity_icon(ctx, "naramon", include_bytes!("../assets/polarity/naramon.png")),
+            zenurik: load_polarity_icon(ctx, "zenurik", include_bytes!("../assets/polarity/zenurik.png")),
+            unairu: load_polarity_icon(ctx, "unairu", include_bytes!("../assets/polarity/unairu.png")),
+        }
+    }
+
+    /// The icon for `polarity`, or `None` for [`wf_data::Polarity::Unknown`]
+    /// — there's no bundled art for a polarity DE hasn't shipped yet.
+    fn get(&self, polarity: &wf_data::Polarity) -> Option<&egui::TextureHandle> {
+        use wf_data::Polarity::*;
+        match polarity {
+            Madurai => Some(&self.madurai),
+            Vazarin => Some(&self.vazarin),
+            Naramon => Some(&self.naramon),
+            Zenurik => Some(&self.zenurik),
+            Unairu => Some(&self.unairu),
+            Unknown(_) => None,
+        }
+    }
+}
+
+fn load_polarity_icon(ctx: &egui::Context, name: &str, bytes: &[u8]) -> egui::TextureHandle {
+    let image = match image::load_from_memory(bytes) {
+        Ok(img) => img.to_rgba8(),
+        Err(e) => {
+            tracing::error!("failed to decode bundled {name} polarity icon: {e}");
+            image::RgbaImage::new(1, 1)
+        }
+    };
+    let size = [image.width() as usize, image.height() as usize];
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, image.as_flat_samples().as_slice());
+    ctx.load_texture(format!("polarity-{name}"), color_image, egui::TextureOptions::LINEAR)
+}
+
 /// Open the browse window and run its event loop until closed.
 pub fn run() -> eframe::Result<()> {
     let config_path = Config::default_path().unwrap_or_else(|_| PathBuf::from("config.toml"));
@@ -1693,6 +1745,10 @@ struct BrowseApp {
     /// Cursor position minus the dragged box's top-left corner, captured on
     /// drag start — see [`Self::drag_to_place`].
     drag_offset: egui::Vec2,
+    /// The Riven browse tab's bundled polarity icons (ADR-0019), loaded on
+    /// first render of [`Self::rivens_tab`] — `None` until then, since
+    /// loading needs an `egui::Context` that isn't available in [`Self::new`].
+    polarity_icons: Option<PolarityIcons>,
 }
 
 impl BrowseApp {
@@ -1744,6 +1800,7 @@ impl BrowseApp {
             overlay_launch_tried: false,
             dragging_placement: false,
             drag_offset: egui::Vec2::ZERO,
+            polarity_icons: None,
         }
     }
 
@@ -2903,6 +2960,8 @@ impl BrowseApp {
             return;
         }
 
+        let icons = &*self.polarity_icons.get_or_insert_with(|| PolarityIcons::load(ui.ctx()));
+
         egui::ScrollArea::vertical().show(ui, |ui| {
             for group in &groups {
                 let header_text = match &group.verdict {
@@ -2936,7 +2995,19 @@ impl BrowseApp {
                                 ui.end_row();
                                 for r in &group.rivens {
                                     ui.label(stat_line(&r.stats));
-                                    ui.label(r.polarity.as_ref().map(|p| p.display_name()).unwrap_or("—"));
+                                    match &r.polarity {
+                                        Some(p) => {
+                                            ui.horizontal(|ui| {
+                                                if let Some(tex) = icons.get(p) {
+                                                    ui.image((tex.id(), egui::vec2(16.0, 16.0)));
+                                                }
+                                                ui.label(p.display_name());
+                                            });
+                                        }
+                                        None => {
+                                            ui.label("—");
+                                        }
+                                    }
                                     ui.label(format!(
                                         "{} · R{}/8 · {} rerolls",
                                         r.mastery_req.map(|v| format!("MR{v}")).unwrap_or_else(|| "—".to_string()),

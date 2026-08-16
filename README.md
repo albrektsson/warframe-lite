@@ -134,12 +134,16 @@ the OCR/mem-scan feature details and build requirements.
 MIT — see [`LICENSE`](LICENSE).
 
 The bundled *Warframe* UI assets — the mastery laurel
-(`crates/wf-overlay/assets/mastered.png`, shown on mastered rewards) and the
+(`crates/wf-overlay/assets/mastered.png`, shown on mastered rewards), the
 "unowned" eye icon (`assets/relic-unowned-eye.png`, used only to detect which
-relics you don't own) — remain the property of **Digital Extremes Ltd.** They are
-included solely to identify game state in this fan companion; *Warframe* is a
-trademark of Digital Extremes. This project is unofficial and not affiliated with
-or endorsed by Digital Extremes.
+relics you don't own), and the five Riven polarity icons
+(`crates/wf-browse/assets/polarity/*.png`, redistributed under
+[WFCD/genesis-assets](https://github.com/WFCD/genesis-assets)'s Apache 2.0
+project license — see [ADR-0019](docs/adr/0019-bundled-polarity-icons-sourced-from-wfcd.md))
+— remain the property of **Digital Extremes Ltd.** They are included solely to
+identify game state in this fan companion; *Warframe* is a trademark of Digital
+Extremes. This project is unofficial and not affiliated with or endorsed by
+Digital Extremes.
 
 ## Design & roadmap
 
