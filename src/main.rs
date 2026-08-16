@@ -1684,7 +1684,10 @@ async fn run_overlay(config: Config) -> Result<()> {
     let initial = make_frame(&ws, visible.load(Ordering::Relaxed), consecutive_failures > 0);
 
     let (tx, rx) = mpsc::channel();
-    let (placement_tx, placement_rx) = mpsc::channel();
+    let (placement_tx, placement_rx): (
+        mpsc::Sender<(wf_overlay::layer::Placement, Option<(i32, i32, u32, u32)>)>,
+        mpsc::Receiver<(wf_overlay::layer::Placement, Option<(i32, i32, u32, u32)>)>,
+    ) = mpsc::channel();
 
     // Control socket: `wf-lite toggle|show|hide` flips `visible` at runtime,
     // `copy` copies the current best-pick reward, `apply-settings` (from a
@@ -1804,7 +1807,7 @@ fn spawn_control_listener(
     reward: RewardState,
     live: std::sync::Arc<std::sync::Mutex<wf_config::control::LiveOverlaySettings>>,
     demo: DemoState,
-    placement_tx: std::sync::mpsc::Sender<wf_overlay::layer::Placement>,
+    placement_tx: std::sync::mpsc::Sender<(wf_overlay::layer::Placement, Option<(i32, i32, u32, u32)>)>,
     config: Config,
     client: reqwest::Client,
 ) {
@@ -1873,7 +1876,17 @@ fn spawn_control_listener(
                                 p.margin_x,
                                 p.margin_y,
                             );
-                            let _ = placement_tx.send(placement);
+                            // Re-query the game window rather than reusing the
+                            // one captured at overlay startup: the overlay is
+                            // deliberately started early, often while the game
+                            // is still on a loading/menu-sized window, so that
+                            // startup snapshot can be stale by the time a
+                            // settings UI pushes a live placement — margins
+                            // recomputed against it then land far from where
+                            // the same anchor/margin values would land against
+                            // the game's actual current window.
+                            let window = wf_capture::warframe_geometry().ok();
+                            let _ = placement_tx.send((placement, window));
                             tracing::info!("applied live overlay settings: {p:?}");
                         }
                         None => tracing::warn!("malformed apply-settings command: {other:?}"),

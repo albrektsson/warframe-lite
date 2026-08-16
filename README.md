@@ -97,6 +97,24 @@ wf-lite logwatch           # follow EE.log live, print recognized events
 wf-lite mem-scan           # read live Foundry/relic/equipment state — see docs/mem-scan.md
 ```
 
+## When we scan game memory
+
+Memory is only ever read when you explicitly trigger it — never in the
+background, never on a timer, never as part of the overlay's normal
+operation. The three equivalent entry points are `wf-lite mem-scan` on the
+command line, the **Scan Memory** button on `wf-lite browse`'s Home tab, and
+the matching item in `wf-tray`'s right-click menu. Each click or invocation
+*is* the consent; there's no separate confirmation prompt. See
+[docs/mem-scan.md](docs/mem-scan.md) for what gets read and why.
+
+If you never run a memory scan, owned-relic and owned-Prime-Part tracking
+still works — it falls back to OCR, reading the screen pixels instead. That
+only picks up what you actually show it, though: open the in-game **Void
+Relics** screen (or **Inventory → Sell**) and scroll through it while the
+overlay is running, and it scans each grid page as it passes. Memory scans
+are exact; OCR scans are a frame-agreement estimate, and the app tracks
+which source last wrote each count.
+
 ## Build
 
 ```

@@ -104,7 +104,7 @@ pub fn run(
     initial: Canvas,
     rx: Receiver<Canvas>,
     placement: Placement,
-    placement_rx: Receiver<Placement>,
+    placement_rx: Receiver<(Placement, Option<(i32, i32, u32, u32)>)>,
     window: Option<(i32, i32, u32, u32)>,
 ) -> Result<()> {
     let conn = Connection::connect_to_env().context("connecting to Wayland ($WAYLAND_DISPLAY)")?;
@@ -200,8 +200,8 @@ pub fn run(
             while let Ok(p) = state.placement_rx.try_recv() {
                 latest_placement = Some(p);
             }
-            if let Some(p) = latest_placement {
-                state.apply_placement(p);
+            if let Some((p, w)) = latest_placement {
+                state.apply_placement(p, w);
             }
             TimeoutAction::ToDuration(Duration::from_millis(250))
         })
@@ -230,11 +230,21 @@ struct State {
     height: u32,
     canvas: Canvas,
     rx: Receiver<Canvas>,
-    /// New [`Placement`]s pushed live by a settings UI (see [`run`]'s docs).
-    placement_rx: Receiver<Placement>,
-    /// The game window's rectangle, captured once at startup — reused by
-    /// [`Self::apply_placement`] to recompute margins the same way [`run`]'s
-    /// initial setup does.
+    /// New [`Placement`]s pushed live by a settings UI, paired with a
+    /// freshly re-queried game window rectangle (see [`run`]'s docs and
+    /// [`Self::apply_placement`]).
+    placement_rx: Receiver<(Placement, Option<(i32, i32, u32, u32)>)>,
+    /// The game window's rectangle. Set once at startup, then overwritten by
+    /// [`Self::apply_placement`] with whatever the caller re-queried just
+    /// before pushing a live [`Placement`] — the startup snapshot alone
+    /// isn't safe to keep reusing: the overlay is deliberately started early
+    /// (see [`run`]'s docs), often while the game is still on a
+    /// loading/menu-sized window, so a margin recomputed against that stale
+    /// rectangle can land far from where the same anchor/margin values
+    /// would land against the game's actual, current window (see the
+    /// regression this fixed: settings showing `top-right` while the
+    /// rendered overlay sat near screen-center, traced to exactly this
+    /// staleness).
     window: Option<(i32, i32, u32, u32)>,
     /// The chosen output's logical geometry, captured once at startup — see
     /// `window`'s docs.
@@ -279,11 +289,15 @@ impl State {
     /// Re-anchor the already-committed layer surface to a new [`Placement`]
     /// pushed live over the control socket — no teardown, just
     /// `set_anchor`/`set_margin`/`set_size` again and a fresh `commit()`
-    /// (see [`run`]'s docs).
-    fn apply_placement(&mut self, placement: Placement) {
+    /// (see [`run`]'s docs). `window` is the caller's freshly re-queried
+    /// game window rectangle, replacing `self.window` before recomputing
+    /// margins — see [`State::window`]'s docs for why the startup snapshot
+    /// alone goes stale.
+    fn apply_placement(&mut self, placement: Placement, window: Option<(i32, i32, u32, u32)>) {
         let Some(layer) = &self.layer else {
             return;
         };
+        self.window = window;
         let (top, right, bottom, left) =
             edge_margins(placement, self.window, self.chosen_geom, (self.width, self.height));
         layer.set_anchor(placement.anchor);
