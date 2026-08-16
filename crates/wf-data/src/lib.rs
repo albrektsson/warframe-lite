@@ -9,6 +9,7 @@
 
 pub mod items;
 pub mod market;
+pub mod poll;
 pub mod riven_market;
 pub mod worldstate;
 

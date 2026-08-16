@@ -221,7 +221,7 @@ pub async fn evaluate_cached(
     // Price all matched items concurrently.
     let price_futs = resolutions.iter().map(|r| async move {
         match r {
-            Resolution::Matched { slug, .. } => cached_price(cache, market, slug, opts).await,
+            Resolution::Matched { slug, .. } => cached_price(cache, market, slug, opts).await.0,
             _ => None,
         }
     });
@@ -346,6 +346,25 @@ fn build_eval(
     }
 }
 
+/// Whether a cached lookup's value came from a fresh cache hit or a live
+/// fetch that just succeeded ([`Ok`]), or from a live fetch that failed —
+/// timeout, network error, or a non-2xx like a warframe.market 429 —
+/// falling back to any stale cached value it could find ([`Failed`]).
+/// Retrying callers (e.g. wf-browse's lazy price map, see ADR-0012 and issue
+/// #100) need this distinction: a confirmed empty market (a successful fetch
+/// that just found no listings) is safe to retry on a fixed short cooldown,
+/// but a *failed* fetch — especially a sustained one, like a rate limit —
+/// should back off instead of hammering the same endpoint at that cadence
+/// forever.
+///
+/// [`Ok`]: FetchStatus::Ok
+/// [`Failed`]: FetchStatus::Failed
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchStatus {
+    Ok,
+    Failed,
+}
+
 /// Resolve a price via the cache: fresh → instant; stale/missing → bounded
 /// fetch, falling back to any stale value on timeout/error.
 async fn cached_price(
@@ -353,19 +372,21 @@ async fn cached_price(
     market: &MarketClient,
     slug: &str,
     opts: PriceOpts,
-) -> Option<PriceSummary> {
+) -> (Option<PriceSummary>, FetchStatus) {
     let stale = cache.get(slug);
     if let Some(s) = &stale {
         if s.age() < opts.fresh_ttl {
-            return Some(s.value.clone());
+            return (Some(s.value.clone()), FetchStatus::Ok);
         }
     }
     match tokio::time::timeout(opts.fetch_timeout, market.price_summary(slug)).await {
         Ok(Ok(fresh)) => {
             cache.put(slug, fresh.clone());
-            Some(fresh)
+            (Some(fresh), FetchStatus::Ok)
         }
-        _ => stale.map(|s| s.value), // timeout or error → serve stale if we have it
+        // timeout or error → serve stale if we have it, but tell the caller
+        // the live fetch itself failed.
+        _ => (stale.map(|s| s.value), FetchStatus::Failed),
     }
 }
 
@@ -415,7 +436,22 @@ pub async fn cached_plat(
     slug: &str,
     opts: PriceOpts,
 ) -> Option<u32> {
-    cached_price(cache, market, slug, opts).await.and_then(|s| s.lowest_sell)
+    cached_plat_status(cache, market, slug, opts).await.0
+}
+
+/// Like [`cached_plat`], but also reports [`FetchStatus`] — whether the
+/// result came from a fresh cache hit / successful live fetch, or a failed
+/// one falling back to a stale value. Used by wf-browse's lazy price map
+/// (ADR-0012, issue #100) to back off its retry cadence on repeated
+/// failures instead of a confirmed empty market.
+pub async fn cached_plat_status(
+    cache: &PriceCache,
+    market: &MarketClient,
+    slug: &str,
+    opts: PriceOpts,
+) -> (Option<u32>, FetchStatus) {
+    let (price, status) = cached_price(cache, market, slug, opts).await;
+    (price.and_then(|s| s.lowest_sell), status)
 }
 
 /// [`RivenTypeVerdict`] for `weapon_url_name` via the disk riven-price
@@ -428,10 +464,21 @@ pub async fn cached_riven_verdict(
     weapon_url_name: &str,
     opts: PriceOpts,
 ) -> Option<RivenTypeVerdict> {
+    cached_riven_verdict_status(cache, market, weapon_url_name, opts).await.0
+}
+
+/// Like [`cached_riven_verdict`], but also reports [`FetchStatus`] — see
+/// [`cached_plat_status`] for why retrying callers need the distinction.
+pub async fn cached_riven_verdict_status(
+    cache: &RivenPriceCache,
+    market: &RivenMarketClient,
+    weapon_url_name: &str,
+    opts: PriceOpts,
+) -> (Option<RivenTypeVerdict>, FetchStatus) {
     let stale = cache.get(weapon_url_name);
     if let Some(s) = &stale {
         if s.age() < opts.fresh_ttl {
-            return Some(s.value);
+            return (Some(s.value), FetchStatus::Ok);
         }
     }
     match tokio::time::timeout(opts.fetch_timeout, market.auctions_for(weapon_url_name)).await {
@@ -447,9 +494,9 @@ pub async fn cached_riven_verdict(
                 .collect();
             let verdict = evaluate_riven_price(&listings, time::OffsetDateTime::now_utc());
             cache.put(weapon_url_name, verdict);
-            Some(verdict)
+            (Some(verdict), FetchStatus::Ok)
         }
-        _ => stale.map(|s| s.value),
+        _ => (stale.map(|s| s.value), FetchStatus::Failed),
     }
 }
 

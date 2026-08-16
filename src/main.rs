@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use wf_config::Config;
-use wf_data::{http_client, market::MarketClient, worldstate};
+use wf_data::{http_client, market::MarketClient, poll::backoff_interval, worldstate};
 
 // The real OCR/relic-grid-scan pipeline (`ocr_enabled.rs`) when the `ocr`
 // cargo feature is compiled in, or a friendly "not compiled in" stand-in
@@ -1314,25 +1314,19 @@ const CATALOGUE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 /// Mastery data is refreshed at most this often (it changes slowly).
 const MASTERY_TTL: Duration = Duration::from_secs(24 * 3600);
 
-/// Ceiling on the worldstate-refresh backoff (see `worldstate_retry_interval`)
+/// Ceiling on the worldstate-refresh backoff (see [`wf_data::poll::backoff_interval`])
 /// — long enough to stop hammering a struggling warframestat.us, short enough
 /// that fissures come back within a reasonable window once it recovers.
 const WORLDSTATE_RETRY_CAP: Duration = Duration::from_secs(600);
 
-/// Retry interval for the overlay's worldstate refresh loop, given how many
-/// fetches have failed in a row: `base` on a clean run, doubling per
-/// consecutive failure and capped at [`WORLDSTATE_RETRY_CAP`] (issue #40 — a
-/// struggling/erroring API shouldn't be polled at the steady-state cadence
-/// forever). Resets to `base` the moment a fetch succeeds.
-fn worldstate_retry_interval(base: Duration, consecutive_failures: u32) -> Duration {
-    if consecutive_failures == 0 {
-        return base;
-    }
-    // Cap the shift, not just the result: `1u32 << 32` panics, and this many
-    // consecutive failures already blows past the cap many times over.
-    let multiplier = 1u32 << consecutive_failures.min(16);
-    base.checked_mul(multiplier).unwrap_or(WORLDSTATE_RETRY_CAP).min(WORLDSTATE_RETRY_CAP)
-}
+/// How much jitter (as a fraction of the interval) to apply to worldstate
+/// refresh timing, so relaunch clustering and update-triggered cache
+/// invalidation across independent installs don't line up into synchronized
+/// bursts against warframestat.us (issue #100).
+const WORLDSTATE_JITTER: f64 = 0.2;
+/// Ceiling on the one-time random delay before the overlay's first network
+/// call (issue #100) — see [`wf_data::poll::startup_delay`].
+const STARTUP_JITTER_MAX: Duration = Duration::from_secs(3);
 
 /// Load the player's mastered set (cached) if an account id is configured,
 /// otherwise an empty set (mastery indicators simply off).
@@ -1667,6 +1661,13 @@ async fn run_overlay(config: Config) -> Result<()> {
         if config.overlay.fissures { "on" } else { "reward-only" },
         config.overlay.opacity,
     );
+    // A small random delay before the very first network call (issue #100):
+    // many independent installs launching around the same real-world moment
+    // (a patch drop, a scheduled restart) would otherwise all fire their
+    // first request in the same instant; negligible next to the window
+    // placement wait further below (`WINDOW_WAIT`, up to 30s).
+    tokio::time::sleep(wf_data::poll::startup_delay(STARTUP_JITTER_MAX)).await;
+
     // A failed initial fetch (warframestat.us down/erroring right at launch —
     // see issue #40) must never take the overlay down with it: start with an
     // empty world-state and let the refresh loop below fill it in once the API
@@ -1732,7 +1733,10 @@ async fn run_overlay(config: Config) -> Result<()> {
             let mut consecutive_failures = consecutive_failures;
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                let interval = worldstate_retry_interval(refresh, consecutive_failures);
+                let interval = wf_data::poll::jitter(
+                    backoff_interval(refresh, consecutive_failures, WORLDSTATE_RETRY_CAP),
+                    WORLDSTATE_JITTER,
+                );
                 if last_fetch.elapsed() >= interval {
                     match worldstate::fetch(&client, &platform).await {
                         Ok(fresh) => {
@@ -1751,7 +1755,7 @@ async fn run_overlay(config: Config) -> Result<()> {
                         }
                         Err(e) => {
                             consecutive_failures += 1;
-                            let next = worldstate_retry_interval(refresh, consecutive_failures);
+                            let next = backoff_interval(refresh, consecutive_failures, WORLDSTATE_RETRY_CAP);
                             tracing::warn!(
                                 "worldstate refresh failed: {e:#} — backing off to {}s",
                                 next.as_secs()
@@ -2044,32 +2048,6 @@ mod clipboard_tests {
     #[test]
     fn falls_back_to_name_when_plat_unresolved() {
         assert_eq!(clipboard_text(&row("Volnus Prime Blueprint", None)), "Volnus Prime Blueprint");
-    }
-}
-
-#[cfg(test)]
-mod worldstate_retry_tests {
-    use super::worldstate_retry_interval;
-    use std::time::Duration;
-
-    #[test]
-    fn no_failures_uses_the_base_interval() {
-        assert_eq!(worldstate_retry_interval(Duration::from_secs(60), 0), Duration::from_secs(60));
-    }
-
-    #[test]
-    fn doubles_per_consecutive_failure() {
-        let base = Duration::from_secs(60);
-        assert_eq!(worldstate_retry_interval(base, 1), Duration::from_secs(120));
-        assert_eq!(worldstate_retry_interval(base, 2), Duration::from_secs(240));
-        assert_eq!(worldstate_retry_interval(base, 3), Duration::from_secs(480));
-    }
-
-    #[test]
-    fn caps_at_ten_minutes() {
-        let base = Duration::from_secs(60);
-        assert_eq!(worldstate_retry_interval(base, 4), Duration::from_secs(600));
-        assert_eq!(worldstate_retry_interval(base, 30), Duration::from_secs(600));
     }
 }
 

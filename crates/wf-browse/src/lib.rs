@@ -52,6 +52,17 @@ const MASTERY_TTL: Duration = Duration::from_secs(24 * 3600);
 /// once the shared cache goes stale; unbounded concurrency, on the other
 /// hand, would fire every lookup at warframe.market in one burst.
 const PRICE_FETCH_CONCURRENCY: usize = 8;
+/// How many backed-off in-batch retries [`fetch_prices`]/[`fetch_riven_verdicts`]
+/// give an item that comes back with nothing at all (no stale value, failed
+/// live fetch — see their docs) before leaving it unresolved for this batch.
+const BATCH_FETCH_RETRIES: u32 = 2;
+/// Base backoff delay between batch-fetch retry rounds, doubling per round
+/// via [`wf_data::poll::backoff_interval`].
+const BATCH_RETRY_BASE: Duration = Duration::from_secs(2);
+/// Ceiling on the batch-fetch retry backoff — kept short since this delays
+/// `load_data` completing, which the loading placeholder is already covering
+/// for (see this module's docs), not a background poll.
+const BATCH_RETRY_CAP: Duration = Duration::from_secs(20);
 /// How long a lazily-fetched price that resolved to "no listing found" (see
 /// [`LazyPrice`]) waits before [`BrowseApp::ensure_lazy_prices`] retries it.
 /// Long enough that `relics_tab`'s every-frame, unvirtualized re-render (see
@@ -60,6 +71,12 @@ const PRICE_FETCH_CONCURRENCY: usize = 8;
 /// a slug with nothing cached yet whose fetch times out gets stuck on `None`
 /// forever) clears up within the same session instead of needing a relaunch.
 const LAZY_PRICE_RETRY_COOLDOWN: Duration = Duration::from_secs(45);
+/// Ceiling on the lazy price/riven-verdict retry backoff (issue #100) — a
+/// run of failed fetches (network error, timeout, or a warframe.market 429;
+/// see [`wf_relic::FetchStatus`]) doubles [`LAZY_PRICE_RETRY_COOLDOWN`] per
+/// consecutive failure up to this cap, rather than retrying at the same
+/// fixed 45s forever.
+const LAZY_PRICE_RETRY_CAP: Duration = Duration::from_secs(600);
 /// How many relic badges the Relics & Plan tab's "relics you own that can
 /// still drop it" cell shows before collapsing the rest into a "+N more"
 /// label (mirroring [`worst_off_part_cell`]'s "+N more" pattern). A part
@@ -73,8 +90,21 @@ const RELIC_LIST_MAX_VISIBLE: usize = 3;
 /// active-Fissure flag refresh while the window stays open. Only these two (a
 /// local file and a lightweight world-state fetch) are cheap enough to poll;
 /// mastery, the relic catalogue, and Sell/Farm-tab prices are loaded once at
-/// launch and never re-fetched on this timer.
-const POLL_INTERVAL: Duration = Duration::from_secs(15);
+/// launch and never re-fetched on this timer. Matches the overlay's default
+/// `fissure_refresh_secs` (issue #100) — Fissures change on the order of
+/// minutes in-game, so the old fixed 15s bought no real freshness, just
+/// extra load on warframestat.us.
+const POLL_INTERVAL: Duration = Duration::from_secs(60);
+/// Ceiling on the poll loop's failure backoff (see [`wf_data::poll::backoff_interval`]),
+/// mirroring the overlay's `WORLDSTATE_RETRY_CAP`.
+const POLL_RETRY_CAP: Duration = Duration::from_secs(600);
+/// Jitter fraction applied to the poll interval (issue #100), so relaunch
+/// clustering across independent installs doesn't line up into a
+/// synchronized burst against warframestat.us.
+const POLL_JITTER: f64 = 0.2;
+/// Ceiling on the one-time random delay before `load_data`'s first network
+/// call (issue #100) — see [`wf_data::poll::startup_delay`].
+const STARTUP_JITTER_MAX: Duration = Duration::from_secs(3);
 /// Repaint cadence while [`BrowseApp::loaded`] is still `None`, so the
 /// "Loading…" placeholder resolves promptly instead of waiting out a full
 /// [`POLL_INTERVAL`] for the next scheduled repaint.
@@ -615,13 +645,18 @@ enum RelicPriceState {
 /// tab's relic-level sell prices and Set prices both use this shape (see
 /// ADR-0012). Unlike [`RelicPriceState`] (fetched once, on row expand, never
 /// retried), `Ready`'s `plat: None` case records when it resolved so
-/// [`BrowseApp::ensure_lazy_prices`] knows when [`LAZY_PRICE_RETRY_COOLDOWN`]
-/// has elapsed and it's time to try again — for as long as a tab that needs
-/// it stays open.
+/// [`BrowseApp::ensure_lazy_prices`] knows when the retry cooldown has
+/// elapsed and it's time to try again — for as long as a tab that needs it
+/// stays open. `consecutive_failures` (issue #100) tracks a run of *failed*
+/// live fetches — network error, timeout, or a warframe.market 429 — as
+/// reported by [`wf_relic::FetchStatus`], distinct from a successful fetch
+/// that genuinely found no listings: only the failure streak backs the
+/// cooldown off past [`LAZY_PRICE_RETRY_COOLDOWN`], so a real rate limit
+/// doesn't get hammered at the same fixed cadence as a plain cache miss.
 #[derive(Clone, Copy)]
 enum LazyPrice {
     Loading,
-    Ready { plat: Option<u32>, resolved_at: Instant },
+    Ready { plat: Option<u32>, resolved_at: Instant, consecutive_failures: u32 },
 }
 
 /// Shared between the UI thread — which triggers fetches from
@@ -638,14 +673,22 @@ type LazyPriceMap = Arc<Mutex<HashMap<String, LazyPrice>>>;
 /// Whether a `LazyPriceMap` entry (`None` if the key is absent) should have a
 /// fetch (re)triggered right now — the decision [`BrowseApp::ensure_lazy_prices`]
 /// applies per key: fetch when never attempted, or when the last attempt
-/// resolved to "no listing" and [`LAZY_PRICE_RETRY_COOLDOWN`] has elapsed
-/// since; skip while a fetch is already in flight, or a resolved price is
-/// known, or the cooldown hasn't elapsed yet.
+/// resolved to "no listing" and its cooldown has elapsed since; skip while a
+/// fetch is already in flight, or a resolved price is known, or the cooldown
+/// hasn't elapsed yet. The cooldown itself is [`LAZY_PRICE_RETRY_COOLDOWN`]
+/// on a clean "no listing" result, backed off past that
+/// (`consecutive_failures > 0`) after a run of failed fetches — see
+/// [`LazyPrice`].
 fn needs_fetch(current: Option<&LazyPrice>, now: Instant) -> bool {
     match current {
         None => true,
-        Some(LazyPrice::Ready { plat: None, resolved_at }) => {
-            now.duration_since(*resolved_at) >= LAZY_PRICE_RETRY_COOLDOWN
+        Some(LazyPrice::Ready { plat: None, resolved_at, consecutive_failures }) => {
+            let cooldown = wf_data::poll::backoff_interval(
+                LAZY_PRICE_RETRY_COOLDOWN,
+                *consecutive_failures,
+                LAZY_PRICE_RETRY_CAP,
+            );
+            now.duration_since(*resolved_at) >= cooldown
         }
         _ => false,
     }
@@ -1010,8 +1053,17 @@ async fn poll(args: PollArgs) {
     let PollArgs { loaded, index, mastery, quantities, part_market, mut prices, relic_prices, set_prices, platform } =
         args;
     let client = wf_data::http_client();
+    // Consecutive world-state fetch failures — backs off the poll cadence
+    // instead of hammering a struggling warframestat.us at a fixed interval
+    // forever (issue #100; mirrors the overlay's own worldstate refresh loop
+    // in `src/main.rs`).
+    let mut consecutive_failures: u32 = 0;
     loop {
-        tokio::time::sleep(POLL_INTERVAL).await;
+        let interval = wf_data::poll::jitter(
+            wf_data::poll::backoff_interval(POLL_INTERVAL, consecutive_failures, POLL_RETRY_CAP),
+            POLL_JITTER,
+        );
+        tokio::time::sleep(interval).await;
         let owned = wf_cache::load_blob::<wf_relic::OwnedRelics>(wf_relic::OWNED_RELICS_FILE);
         let owned_parts =
             wf_cache::load_blob::<wf_relic::OwnedPrimeParts>(wf_relic::OWNED_PRIME_PARTS_FILE)
@@ -1023,10 +1075,20 @@ async fn poll(args: PollArgs) {
         let owned_rivens: OwnedRivens = wf_cache::load_blob::<OwnedRivens>(wf_relic::OWNED_RIVENS_FILE)
             .map(|s| s.value)
             .unwrap_or_default();
-        let active_tiers = wf_data::worldstate::fetch(&client, &platform)
-            .await
-            .map(|ws| ws.active_fissure_tiers())
-            .unwrap_or_default();
+        let active_tiers = match wf_data::worldstate::fetch(&client, &platform).await {
+            Ok(ws) => {
+                consecutive_failures = 0;
+                ws.active_fissure_tiers()
+            }
+            Err(e) => {
+                consecutive_failures += 1;
+                tracing::warn!(
+                    "worldstate refresh failed: {e:#} — backing off to {}s",
+                    wf_data::poll::backoff_interval(POLL_INTERVAL, consecutive_failures, POLL_RETRY_CAP).as_secs()
+                );
+                HashSet::default()
+            }
+        };
         let static_data = StaticData {
             index: &index,
             mastery: &mastery,
@@ -1083,36 +1145,70 @@ struct LoadedData {
 /// `key_and_slug` maps each input to. Shared by the Sell tab's relic prices
 /// and the Farm tab's reward-part prices — both fetch dozens to hundreds of
 /// entries against the same cache and market client.
+///
+/// Firing [`PRICE_FETCH_CONCURRENCY`] requests at once is exactly the kind
+/// of burst likely to trip a rate limit (issue #100 — confirmed live: a
+/// 429 from `api.warframe.market` blanking out prices for an entire batch).
+/// An item that comes back with nothing at all — no stale cache to fall
+/// back on and a failed live fetch, per [`wf_relic::FetchStatus`] — gets a
+/// few backed-off retries within this same call rather than being left
+/// permanently blank for the rest of the session; an item with *some*
+/// value (fresh or stale) is accepted immediately.
 async fn fetch_prices<T>(
     inputs: Vec<T>,
     cache: &wf_relic::PriceCache,
     market: &wf_data::market::MarketClient,
     key_and_slug: impl Fn(T) -> (String, String),
-) -> HashMap<String, Option<u32>>
+) -> HashMap<String, (Option<u32>, wf_relic::FetchStatus)>
 where
     T: Send,
 {
-    stream::iter(inputs)
-        .map(|input| {
-            let (key, slug) = key_and_slug(input);
-            async move {
-                let plat =
-                    wf_relic::cached_plat(cache, market, &slug, wf_relic::PriceOpts::default()).await;
-                (key, plat)
+    let mut pending: Vec<(String, String)> = inputs.into_iter().map(key_and_slug).collect();
+    let mut resolved: HashMap<String, (Option<u32>, wf_relic::FetchStatus)> = HashMap::new();
+    let mut attempt: u32 = 0;
+    loop {
+        let batch = std::mem::take(&mut pending);
+        let results: Vec<(String, String, Option<u32>, wf_relic::FetchStatus)> = stream::iter(batch)
+            .map(|(key, slug)| async move {
+                let (plat, status) =
+                    wf_relic::cached_plat_status(cache, market, &slug, wf_relic::PriceOpts::default())
+                        .await;
+                (key, slug, plat, status)
+            })
+            .buffer_unordered(PRICE_FETCH_CONCURRENCY)
+            .collect()
+            .await;
+        for (key, slug, plat, status) in results {
+            if plat.is_none() && status == wf_relic::FetchStatus::Failed && attempt < BATCH_FETCH_RETRIES
+            {
+                pending.push((key, slug));
+            } else {
+                resolved.insert(key, (plat, status));
             }
-        })
-        .buffer_unordered(PRICE_FETCH_CONCURRENCY)
-        .collect()
-        .await
+        }
+        if pending.is_empty() {
+            break;
+        }
+        attempt += 1;
+        tokio::time::sleep(wf_data::poll::backoff_interval(
+            BATCH_RETRY_BASE,
+            attempt,
+            BATCH_RETRY_CAP,
+        ))
+        .await;
+    }
+    resolved
 }
 
 /// Look up a bounded-concurrency batch of riven Floor/Ceiling/Verdicts, one
 /// per distinct owned weapon — mirrors [`fetch_prices`]'s exact pattern
 /// (same concurrency cap, same cache-first/timeout-falls-back-to-stale
-/// behavior via [`wf_relic::cached_riven_verdict`]), just keyed by
-/// `weapon_unique_name` instead of a market item slug. A weapon absent from
-/// `slug_by_weapon` (not in warframe.market's riven-weapon catalogue at all)
-/// is skipped — nothing to query.
+/// behavior via [`wf_relic::cached_riven_verdict_status`], same backed-off
+/// in-batch retry for an item that failed with nothing to fall back on —
+/// see [`fetch_prices`]'s doc), just keyed by `weapon_unique_name` instead
+/// of a market item slug. A weapon absent from `slug_by_weapon` (not in
+/// warframe.market's riven-weapon catalogue at all) is skipped — nothing to
+/// query.
 async fn fetch_riven_verdicts(
     weapon_unique_names: Vec<String>,
     slug_by_weapon: &HashMap<String, String>,
@@ -1123,23 +1219,55 @@ async fn fetch_riven_verdicts(
     // cheap and borrowing `slug_by_weapon` across the stream's own futures
     // would tie their lifetime to this call, which `tokio::spawn`'s `'static`
     // bound (see `load_and_poll`'s caller) doesn't allow.
-    let to_fetch: Vec<(String, String)> = weapon_unique_names
+    let mut pending: Vec<(String, String)> = weapon_unique_names
         .into_iter()
         .filter_map(|weapon_unique_name| {
             slug_by_weapon.get(&weapon_unique_name).cloned().map(|slug| (weapon_unique_name, slug))
         })
         .collect();
 
-    stream::iter(to_fetch)
-        .map(|(weapon_unique_name, slug)| async move {
-            let verdict =
-                wf_relic::cached_riven_verdict(cache, market, &slug, wf_relic::PriceOpts::default()).await;
-            (weapon_unique_name, verdict)
-        })
-        .buffer_unordered(PRICE_FETCH_CONCURRENCY)
-        .filter_map(|(weapon_unique_name, verdict)| async move { verdict.map(|v| (weapon_unique_name, v)) })
-        .collect()
-        .await
+    let mut resolved: HashMap<String, RivenTypeVerdict> = HashMap::new();
+    let mut attempt: u32 = 0;
+    loop {
+        let batch = std::mem::take(&mut pending);
+        let results: Vec<(String, String, Option<RivenTypeVerdict>, wf_relic::FetchStatus)> =
+            stream::iter(batch)
+                .map(|(weapon_unique_name, slug)| async move {
+                    let (verdict, status) = wf_relic::cached_riven_verdict_status(
+                        cache,
+                        market,
+                        &slug,
+                        wf_relic::PriceOpts::default(),
+                    )
+                    .await;
+                    (weapon_unique_name, slug, verdict, status)
+                })
+                .buffer_unordered(PRICE_FETCH_CONCURRENCY)
+                .collect()
+                .await;
+        for (weapon_unique_name, slug, verdict, status) in results {
+            match verdict {
+                Some(v) => {
+                    resolved.insert(weapon_unique_name, v);
+                }
+                None if status == wf_relic::FetchStatus::Failed && attempt < BATCH_FETCH_RETRIES => {
+                    pending.push((weapon_unique_name, slug));
+                }
+                None => {}
+            }
+        }
+        if pending.is_empty() {
+            break;
+        }
+        attempt += 1;
+        tokio::time::sleep(wf_data::poll::backoff_interval(
+            BATCH_RETRY_BASE,
+            attempt,
+            BATCH_RETRY_CAP,
+        ))
+        .await;
+    }
+    resolved
 }
 
 /// Load the relic catalogue, the player's mastered set, their scanned Owned
@@ -1150,6 +1278,15 @@ async fn fetch_riven_verdicts(
 /// prices are fetched lazily instead (see ADR-0012), so `prices.sell`/`.set`
 /// on the returned [`LoadedData`] always start empty.
 async fn load_data(config: &Config) -> LoadedData {
+    // A small random delay before the very first network call (issue #100):
+    // many independent installs launching around the same real-world moment
+    // (a patch drop, a scheduled restart), or all waking up to a
+    // cache-format bump that invalidates every cache at once, would
+    // otherwise all fire their first request in the same instant. The
+    // window already opens immediately with a "Loading…" placeholder (see
+    // this module's docs), so a couple of extra seconds here is invisible.
+    tokio::time::sleep(wf_data::poll::startup_delay(STARTUP_JITTER_MAX)).await;
+
     let client = wf_data::http_client();
     let index = RelicIndex::load_cached(&client, CATALOGUE_TTL).await.unwrap_or_else(|e| {
         tracing::warn!("relic catalogue load failed: {e:#}");
@@ -1202,7 +1339,11 @@ async fn load_data(config: &Config) -> LoadedData {
             .into_iter()
             .filter_map(|name| item_index.best_match(&name).map(|m| (name, m.item.slug.clone())))
             .collect();
-        farm_prices = fetch_prices(resolved, &cache, &market, |(name, slug)| (name, slug)).await;
+        farm_prices = fetch_prices(resolved, &cache, &market, |(name, slug)| (name, slug))
+            .await
+            .into_iter()
+            .map(|(k, (plat, _))| (k, plat))
+            .collect();
     }
 
     // Ducats-tab pricing: every owned Prime Part's plat price, resolved once
@@ -1222,8 +1363,11 @@ async fn load_data(config: &Config) -> LoadedData {
         .into_iter()
         .filter_map(|name| item_index.best_match(&name).map(|m| (name, m.item.slug.clone())))
         .collect();
-    let ducat_prices =
-        fetch_prices(resolved_owned_parts, &cache, &market, |(name, slug)| (name, slug)).await;
+    let ducat_prices = fetch_prices(resolved_owned_parts, &cache, &market, |(name, slug)| (name, slug))
+        .await
+        .into_iter()
+        .map(|(k, (plat, _))| (k, plat))
+        .collect();
 
     cache.save();
 
@@ -1648,7 +1792,12 @@ impl BrowseApp {
                     item_index.best_match(&r.item_name).map(|m| (r.item_name.clone(), m.item.slug.clone()))
                 })
                 .collect();
-            let mut prices = fetch_prices(resolved, &cache, &market, |(name, slug)| (name, slug)).await;
+            let mut prices: HashMap<String, Option<u32>> =
+                fetch_prices(resolved, &cache, &market, |(name, slug)| (name, slug))
+                    .await
+                    .into_iter()
+                    .map(|(k, (plat, _))| (k, plat))
+                    .collect();
             for r in &relic.rewards {
                 prices.entry(r.item_name.clone()).or_insert(None);
             }
@@ -1674,10 +1823,18 @@ impl BrowseApp {
     fn ensure_lazy_prices(&self, needed: Vec<(String, String)>, map: &LazyPriceMap) {
         let now = Instant::now();
         let mut to_fetch: Vec<(String, String)> = Vec::new();
+        // Consecutive-failure count each key carried into this attempt (0 if
+        // never attempted, or if it last resolved successfully) — carried
+        // forward so a run of failures keeps backing off across calls to
+        // `ensure_lazy_prices` instead of resetting every time (issue #100).
+        let mut prev_failures: HashMap<String, u32> = HashMap::new();
         {
             let mut guard = map.lock().unwrap_or_else(|p| p.into_inner());
             for (key, slug) in needed {
                 if needs_fetch(guard.get(&key), now) {
+                    if let Some(LazyPrice::Ready { consecutive_failures, .. }) = guard.get(&key) {
+                        prev_failures.insert(key.clone(), *consecutive_failures);
+                    }
                     guard.insert(key.clone(), LazyPrice::Loading);
                     to_fetch.push((key, slug));
                 }
@@ -1697,8 +1854,14 @@ impl BrowseApp {
             cache.save();
             let resolved_at = Instant::now();
             let mut guard = map.lock().unwrap_or_else(|p| p.into_inner());
-            for (key, plat) in resolved {
-                guard.insert(key, LazyPrice::Ready { plat, resolved_at });
+            for (key, (plat, status)) in resolved {
+                let consecutive_failures = match status {
+                    wf_relic::FetchStatus::Ok => 0,
+                    wf_relic::FetchStatus::Failed => {
+                        prev_failures.get(&key).copied().unwrap_or(0) + 1
+                    }
+                };
+                guard.insert(key, LazyPrice::Ready { plat, resolved_at, consecutive_failures });
             }
         });
     }
@@ -3642,30 +3805,65 @@ mod tests {
     #[test]
     fn needs_fetch_is_false_once_a_price_is_resolved_even_if_stale() {
         let resolved_at = Instant::now() - LAZY_PRICE_RETRY_COOLDOWN * 10;
-        let ready = LazyPrice::Ready { plat: Some(42), resolved_at };
+        let ready = LazyPrice::Ready { plat: Some(42), resolved_at, consecutive_failures: 0 };
         assert!(!needs_fetch(Some(&ready), Instant::now()));
     }
 
     #[test]
     fn needs_fetch_waits_out_the_cooldown_after_a_no_listing_result() {
         let resolved_at = Instant::now();
-        let ready = LazyPrice::Ready { plat: None, resolved_at };
+        let ready = LazyPrice::Ready { plat: None, resolved_at, consecutive_failures: 0 };
         assert!(!needs_fetch(Some(&ready), resolved_at + LAZY_PRICE_RETRY_COOLDOWN / 2));
     }
 
     #[test]
     fn needs_fetch_retries_a_no_listing_result_once_the_cooldown_elapses() {
         let resolved_at = Instant::now();
-        let ready = LazyPrice::Ready { plat: None, resolved_at };
+        let ready = LazyPrice::Ready { plat: None, resolved_at, consecutive_failures: 0 };
         assert!(needs_fetch(Some(&ready), resolved_at + LAZY_PRICE_RETRY_COOLDOWN));
+    }
+
+    #[test]
+    fn needs_fetch_doubles_the_cooldown_after_one_failure() {
+        // consecutive_failures: 1 already doubles the cooldown to 90s
+        // (backoff_interval doubles per failure starting at the first one).
+        let resolved_at = Instant::now();
+        let ready = LazyPrice::Ready { plat: None, resolved_at, consecutive_failures: 1 };
+        assert!(!needs_fetch(Some(&ready), resolved_at + LAZY_PRICE_RETRY_COOLDOWN));
+        assert!(needs_fetch(Some(&ready), resolved_at + LAZY_PRICE_RETRY_COOLDOWN * 2));
+    }
+
+    #[test]
+    fn needs_fetch_backs_off_further_on_a_longer_failure_streak() {
+        // Issue #100: a sustained run of failures (e.g. a 429 rate limit)
+        // must not be retried at the same fixed 45s cadence forever.
+        let resolved_at = Instant::now();
+        let ready = LazyPrice::Ready { plat: None, resolved_at, consecutive_failures: 3 };
+        // 45s * 2^3 = 360s — still within cooldown just past the old flat 45s.
+        assert!(!needs_fetch(Some(&ready), resolved_at + LAZY_PRICE_RETRY_COOLDOWN * 2));
+        assert!(needs_fetch(Some(&ready), resolved_at + Duration::from_secs(360)));
+    }
+
+    #[test]
+    fn needs_fetch_backoff_is_capped() {
+        let resolved_at = Instant::now();
+        let ready = LazyPrice::Ready { plat: None, resolved_at, consecutive_failures: 30 };
+        assert!(!needs_fetch(Some(&ready), resolved_at + LAZY_PRICE_RETRY_CAP - Duration::from_secs(1)));
+        assert!(needs_fetch(Some(&ready), resolved_at + LAZY_PRICE_RETRY_CAP));
     }
 
     #[test]
     fn snapshot_prices_treats_loading_the_same_as_absent() {
         let now = Instant::now();
         let map: LazyPriceMap = Arc::new(Mutex::new(HashMap::from([
-            ("resolved".to_string(), LazyPrice::Ready { plat: Some(15), resolved_at: now }),
-            ("empty".to_string(), LazyPrice::Ready { plat: None, resolved_at: now }),
+            (
+                "resolved".to_string(),
+                LazyPrice::Ready { plat: Some(15), resolved_at: now, consecutive_failures: 0 },
+            ),
+            (
+                "empty".to_string(),
+                LazyPrice::Ready { plat: None, resolved_at: now, consecutive_failures: 0 },
+            ),
             ("loading".to_string(), LazyPrice::Loading),
         ])));
         let snapshot = snapshot_prices(&map);
@@ -3678,8 +3876,14 @@ mod tests {
     fn lazy_price_str_distinguishes_loading_from_no_listing_from_priced() {
         let now = Instant::now();
         let map: LazyPriceMap = Arc::new(Mutex::new(HashMap::from([
-            ("no_listing".to_string(), LazyPrice::Ready { plat: None, resolved_at: now }),
-            ("priced".to_string(), LazyPrice::Ready { plat: Some(7), resolved_at: now }),
+            (
+                "no_listing".to_string(),
+                LazyPrice::Ready { plat: None, resolved_at: now, consecutive_failures: 0 },
+            ),
+            (
+                "priced".to_string(),
+                LazyPrice::Ready { plat: Some(7), resolved_at: now, consecutive_failures: 0 },
+            ),
             ("loading".to_string(), LazyPrice::Loading),
         ])));
         assert_eq!(lazy_price_str(&map, "priced"), "7p");
@@ -3700,7 +3904,7 @@ mod tests {
         // long as 15s (see ADR-0012 review).
         let map: LazyPriceMap = Arc::new(Mutex::new(HashMap::from([(
             "axi_h3_relic".to_string(),
-            LazyPrice::Ready { plat: Some(30), resolved_at: Instant::now() },
+            LazyPrice::Ready { plat: Some(30), resolved_at: Instant::now(), consecutive_failures: 0 },
         )])));
         assert_eq!(lazy_price_str(&map, "axi_h3_relic"), "30p");
     }

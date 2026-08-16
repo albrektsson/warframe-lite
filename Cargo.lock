@@ -4111,6 +4111,7 @@ name = "wf-data"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "fastrand",
  "reqwest",
  "serde",
  "serde_json",

@@ -10,6 +10,14 @@
 //! Caps derive from the standard formula (cumulative affinity to rank 30):
 //! weapons `1000·r²/2 = 450,000`; Warframes/companions/archwing `2×` that
 //! `= 900,000`. Verified against a real high-MR profile.
+//!
+//! Sends the same honest `warframe-lite/<version>` User-Agent as every other
+//! request in this app (see [`wf_data::http_client`]), rather than spoofing
+//! a browser UA. Verified live, 2026-08-16 (issue #100): a spoofed
+//! `Mozilla/5.0` and the honest UA get byte-identical `409 Conflict`
+//! responses (including an empty body either way, and even with no UA
+//! header at all) against a bogus `playerId` — this endpoint doesn't
+//! discriminate on User-Agent content, so the earlier spoof bought nothing.
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -93,8 +101,6 @@ pub async fn fetch(client: &reqwest::Client, account_id: &str) -> anyhow::Result
     tracing::debug!("GET {url}");
     let body = client
         .get(&url)
-        // DE's CDN expects a browser-like UA.
-        .header("User-Agent", "Mozilla/5.0")
         .send()
         .await?
         .error_for_status()
@@ -129,7 +135,6 @@ pub async fn fetch_display_name(
     let url = format!("{PC_ENDPOINT}?playerId={account_id}");
     let body = client
         .get(&url)
-        .header("User-Agent", "Mozilla/5.0")
         .send()
         .await?
         .error_for_status()
