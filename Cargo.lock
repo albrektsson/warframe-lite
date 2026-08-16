@@ -4146,6 +4146,7 @@ dependencies = [
  "time",
  "tracing",
  "wf-cache",
+ "wf-data",
  "wf-relic",
 ]
 

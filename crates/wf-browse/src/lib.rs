@@ -2936,7 +2936,7 @@ impl BrowseApp {
                                 ui.end_row();
                                 for r in &group.rivens {
                                     ui.label(stat_line(&r.stats));
-                                    ui.label(r.polarity.as_deref().unwrap_or("—"));
+                                    ui.label(r.polarity.as_ref().map(|p| p.display_name()).unwrap_or("—"));
                                     ui.label(format!(
                                         "{} · R{}/8 · {} rerolls",
                                         r.mastery_req.map(|v| format!("MR{v}")).unwrap_or_else(|| "—".to_string()),

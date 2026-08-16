@@ -28,6 +28,7 @@
 //! total.
 
 use serde::Deserialize;
+use wf_data::Polarity;
 
 /// One `buffs`/`curses` entry: a stat tag and its raw encoded roll value
 /// (not a percentage — see the module doc).
@@ -47,7 +48,7 @@ pub struct Riven {
     /// The weapon this riven is attuned to (`compat`'s unique name), or
     /// `None` while still veiled — unidentified, no weapon resolved yet.
     pub weapon_unique_name: Option<String>,
-    pub polarity: Option<String>,
+    pub polarity: Option<Polarity>,
     pub mastery_req: Option<i64>,
     pub rank: Option<i64>,
     pub rerolls: Option<i64>,
@@ -129,7 +130,7 @@ pub fn parse_rivens(raw_json: &str) -> anyhow::Result<RivenState> {
                 item_type,
                 item_count: item_count_or_default(e.item_count),
                 weapon_unique_name: fp.compat,
-                polarity: fp.pol,
+                polarity: fp.pol.as_deref().map(Polarity::from_ap_code),
                 mastery_req: fp.lvl_req,
                 rank: fp.lvl,
                 rerolls: fp.rerolls,
@@ -191,7 +192,7 @@ mod tests {
             riven.weapon_unique_name.as_deref(),
             Some("/Lotus/Weapons/Tenno/Rifle/Soma/SomaPrimeRifle")
         );
-        assert_eq!(riven.polarity.as_deref(), Some("AP_ATTACK"));
+        assert_eq!(riven.polarity, Some(Polarity::Madurai));
         assert_eq!(riven.mastery_req, Some(10));
         assert_eq!(riven.rank, Some(8));
         assert_eq!(riven.rerolls, Some(3));

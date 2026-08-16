@@ -10,8 +10,11 @@
 pub mod items;
 pub mod market;
 pub mod poll;
+pub mod polarity;
 pub mod riven_market;
 pub mod worldstate;
+
+pub use polarity::Polarity;
 
 use std::time::Duration;
 

@@ -203,7 +203,7 @@ pub fn write_owned_rivens(state: &RivenState, catalogue: &wf_relic::RivenCatalog
         let decoded = wf_relic::decode_riven(
             wf_relic::RivenRawRiven {
                 weapon_unique_name,
-                polarity: r.polarity.as_deref(),
+                polarity: r.polarity.clone(),
                 mastery_req: r.mastery_req,
                 rank: r.rank,
                 rerolls: r.rerolls,

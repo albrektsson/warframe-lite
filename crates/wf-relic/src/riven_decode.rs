@@ -24,6 +24,7 @@
 //! citations and worked examples.
 
 use serde::{Deserialize, Serialize};
+use wf_data::Polarity;
 
 use crate::riven_catalogue::{RivenCatalogue, RivenModCategory, WeaponRivenInfo};
 
@@ -101,7 +102,7 @@ pub struct DecodedRiven {
     pub weapon_name: String,
     pub weapon_unique_name: String,
     pub mod_category: RivenModCategory,
-    pub polarity: Option<String>,
+    pub polarity: Option<Polarity>,
     pub mastery_req: Option<i64>,
     pub rank: i64,
     pub rerolls: i64,
@@ -113,7 +114,7 @@ pub struct DecodedRiven {
 /// [`decode`] stays under clippy's `too_many_arguments` threshold.
 pub struct RawRiven<'a> {
     pub weapon_unique_name: &'a str,
-    pub polarity: Option<&'a str>,
+    pub polarity: Option<Polarity>,
     pub mastery_req: Option<i64>,
     pub rank: Option<i64>,
     pub rerolls: Option<i64>,
@@ -149,7 +150,7 @@ pub fn decode(raw: RawRiven, catalogue: &RivenCatalogue) -> Option<DecodedRiven>
         weapon_name: weapon.name.clone(),
         weapon_unique_name: raw.weapon_unique_name.to_string(),
         mod_category: weapon.mod_category,
-        polarity: raw.polarity.map(str::to_string),
+        polarity: raw.polarity,
         mastery_req: raw.mastery_req,
         rank,
         rerolls: raw.rerolls.unwrap_or(0),
@@ -370,7 +371,7 @@ mod tests {
         let riven = decode(
             RawRiven {
                 weapon_unique_name: unique_name,
-                polarity: Some("AP_ATTACK"),
+                polarity: Some(Polarity::Madurai),
                 mastery_req: Some(10),
                 rank: Some(8),
                 rerolls: Some(3),

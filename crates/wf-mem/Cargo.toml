@@ -17,3 +17,7 @@ time.workspace = true
 # implementation. Neither crate depends back on `wf-mem` — no circularity.
 wf-relic.workspace = true
 wf-cache.workspace = true
+# For the `Polarity` type (#104/ADR-0018): the riven mem-scan parse site
+# (`riven.rs`) parses the raw AP_* code into it directly, rather than
+# leaving that to `wf-relic::riven_decode` downstream.
+wf-data.workspace = true
