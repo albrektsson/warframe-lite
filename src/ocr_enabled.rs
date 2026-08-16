@@ -42,7 +42,8 @@ pub(crate) async fn relic_file(config: &Config) -> Result<()> {
         .to_rgba8();
 
     let client = wf_data::http_client();
-    let index = wf_relic::ItemIndex::load_cached(&client, CATALOGUE_TTL).await?;
+    let index =
+        wf_relic::ItemIndex::load_cached(&client, CATALOGUE_TTL, &config.market_platform).await?;
     let regions = reward_regions(config);
     let ocr = wf_ocr::Ocr::new()?;
 
@@ -434,7 +435,8 @@ pub(crate) async fn relic_scan(config: &Config) -> Result<()> {
     println!("  captured {}x{}", cap.image.width(), cap.image.height());
 
     let client = wf_data::http_client();
-    let index = wf_relic::ItemIndex::load_cached(&client, CATALOGUE_TTL).await?;
+    let index =
+        wf_relic::ItemIndex::load_cached(&client, CATALOGUE_TTL, &config.market_platform).await?;
     let regions = reward_regions(config);
     let ocr = wf_ocr::Ocr::new()?;
 
@@ -559,7 +561,13 @@ pub(crate) async fn start_relic_watch(
     relic_scan_status: RelicScanStatus,
 ) -> Option<PrewarmCtx> {
     match (wf_ocr::Ocr::new(), config.resolve_ee_log()) {
-        (Ok(ocr), Ok(ee_log)) => match wf_relic::ItemIndex::load_cached(client, CATALOGUE_TTL).await {
+        (Ok(ocr), Ok(ee_log)) => match wf_relic::ItemIndex::load_cached(
+            client,
+            CATALOGUE_TTL,
+            &config.market_platform,
+        )
+        .await
+        {
             Ok(index) => {
                 let index = Arc::new(index);
                 let cache = Arc::new(wf_relic::price_cache());

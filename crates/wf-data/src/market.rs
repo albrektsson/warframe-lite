@@ -71,7 +71,7 @@ impl MarketClient {
         let resp = self
             .client
             .get(&url)
-            .query(&[("platform", self.platform.as_str())])
+            .header("Platform", self.platform.as_str())
             .header("Language", "en")
             .send()
             .await?

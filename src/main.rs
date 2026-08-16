@@ -709,7 +709,7 @@ async fn relic_eval(config: &Config) -> Result<()> {
 
     println!("\n== Relic reward evaluation ==");
     let client = http_client();
-    let index = wf_relic::ItemIndex::load_cached(&client, CATALOGUE_TTL).await?;
+    let index = wf_relic::ItemIndex::load_cached(&client, CATALOGUE_TTL, &config.market_platform).await?;
     println!("  catalogue: {} items", index.len());
     let market = MarketClient::new(client.clone(), config.market_platform.clone());
     let cache = wf_relic::price_cache();
@@ -1149,7 +1149,7 @@ async fn reward_png(config: &Config) -> Result<()> {
     ];
     println!("\n== Rendering reward panel ==");
     let client = http_client();
-    let index = wf_relic::ItemIndex::load_cached(&client, CATALOGUE_TTL).await?;
+    let index = wf_relic::ItemIndex::load_cached(&client, CATALOGUE_TTL, &config.market_platform).await?;
     let market = MarketClient::new(client.clone(), config.market_platform.clone());
     let cache = wf_relic::price_cache();
     let vaulted = load_vaulted(&client, &index).await;
@@ -1218,7 +1218,7 @@ struct DemoFrames {
 /// spread of synthetic Fissures for the fissures panel.
 async fn build_demo_frames(config: &Config, client: &reqwest::Client) -> Result<DemoFrames> {
     let names: Vec<String> = DEMO_REWARD_NAMES.iter().map(|s| s.to_string()).collect();
-    let index = wf_relic::ItemIndex::load_cached(client, CATALOGUE_TTL).await?;
+    let index = wf_relic::ItemIndex::load_cached(client, CATALOGUE_TTL, &config.market_platform).await?;
     let market = MarketClient::new(client.clone(), config.market_platform.clone());
     let cache = wf_relic::price_cache();
     let vaulted = load_vaulted(client, &index).await;

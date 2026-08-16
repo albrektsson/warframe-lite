@@ -1370,10 +1370,12 @@ async fn load_data(config: &Config) -> LoadedData {
 
     let market = wf_data::market::MarketClient::new(client.clone(), config.market_platform.clone());
     let cache = wf_relic::price_cache();
-    let item_index = ItemIndex::load_cached(&client, CATALOGUE_TTL).await.unwrap_or_else(|e| {
-        tracing::warn!("item catalogue load failed: {e:#}");
-        ItemIndex::new(Vec::new())
-    });
+    let item_index = ItemIndex::load_cached(&client, CATALOGUE_TTL, &config.market_platform)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("item catalogue load failed: {e:#}");
+            ItemIndex::new(Vec::new())
+        });
 
     // Relic-level sell prices (Relics & Plan/Sell tabs) and Set prices
     // (Relics & Plan/Buy or Farm tabs) are no longer fetched here: both are
@@ -1428,10 +1430,12 @@ async fn load_data(config: &Config) -> LoadedData {
     // above. The weapon catalogue itself (`/v2/riven/weapons`) is small
     // (~400 entries) and fetched fresh each launch rather than disk-cached,
     // same as `active_tiers`'s worldstate fetch above.
-    let riven_weapons = wf_data::riven_market::weapon_catalogue(&client).await.unwrap_or_else(|e| {
-        tracing::warn!("riven weapon catalogue load failed: {e:#}");
-        Vec::new()
-    });
+    let riven_weapons = wf_data::riven_market::weapon_catalogue(&client, &config.market_platform)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("riven weapon catalogue load failed: {e:#}");
+            Vec::new()
+        });
     let riven_slug_by_weapon: HashMap<String, String> =
         riven_weapons.into_iter().map(|w| (w.game_ref, w.slug)).collect();
     let riven_market =

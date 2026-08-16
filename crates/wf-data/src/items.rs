@@ -69,11 +69,12 @@ impl RawItem {
 }
 
 /// Fetch the full item catalogue.
-pub async fn fetch_items(client: &reqwest::Client) -> anyhow::Result<Vec<Item>> {
+pub async fn fetch_items(client: &reqwest::Client, platform: &str) -> anyhow::Result<Vec<Item>> {
     let url = format!("{BASE}/items");
     tracing::debug!("GET {url}");
     let resp = client
         .get(&url)
+        .header("Platform", platform)
         .header("Language", "en")
         .send()
         .await?

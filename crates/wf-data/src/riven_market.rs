@@ -65,11 +65,15 @@ struct WeaponsResponse {
 }
 
 /// Fetch the full riven-eligible weapon catalogue — `GET /v2/riven/weapons`.
-pub async fn weapon_catalogue(client: &reqwest::Client) -> anyhow::Result<Vec<RivenWeapon>> {
+pub async fn weapon_catalogue(
+    client: &reqwest::Client,
+    platform: &str,
+) -> anyhow::Result<Vec<RivenWeapon>> {
     let url = format!("{V2_BASE}/riven/weapons");
     tracing::debug!("GET {url}");
     let resp = client
         .get(&url)
+        .header("Platform", platform)
         .send()
         .await?
         .error_for_status()?
@@ -205,11 +209,8 @@ impl RivenMarketClient {
         let resp = self
             .client
             .get(&url)
-            .query(&[
-                ("type", "riven"),
-                ("weapon_url_name", weapon_url_name),
-                ("platform", &self.platform),
-            ])
+            .query(&[("type", "riven"), ("weapon_url_name", weapon_url_name)])
+            .header("Platform", self.platform.as_str())
             .send()
             .await?
             .error_for_status()?

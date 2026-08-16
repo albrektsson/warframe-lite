@@ -28,8 +28,8 @@ impl ItemIndex {
     }
 
     /// Fetch the catalogue and build an index.
-    pub async fn load(client: &reqwest::Client) -> anyhow::Result<Self> {
-        Ok(Self::new(fetch_items(client).await?))
+    pub async fn load(client: &reqwest::Client, platform: &str) -> anyhow::Result<Self> {
+        Ok(Self::new(fetch_items(client, platform).await?))
     }
 
     /// Build the index from a disk cache when fresh (younger than `ttl`),
@@ -38,6 +38,7 @@ impl ItemIndex {
     pub async fn load_cached(
         client: &reqwest::Client,
         ttl: std::time::Duration,
+        platform: &str,
     ) -> anyhow::Result<Self> {
         const FILE: &str = "items.json";
         if let Some(cached) = wf_cache::load_blob::<Vec<Item>>(FILE) {
@@ -46,7 +47,7 @@ impl ItemIndex {
                 return Ok(Self::new(cached.value));
             }
             // Stale: try to refresh, but keep the stale copy if the network fails.
-            match fetch_items(client).await {
+            match fetch_items(client, platform).await {
                 Ok(items) => {
                     let _ = wf_cache::save_blob(FILE, &items);
                     tracing::info!("item catalogue refreshed ({} items)", items.len());
@@ -58,7 +59,7 @@ impl ItemIndex {
                 }
             }
         }
-        let items = fetch_items(client).await?;
+        let items = fetch_items(client, platform).await?;
         let _ = wf_cache::save_blob(FILE, &items);
         Ok(Self::new(items))
     }
