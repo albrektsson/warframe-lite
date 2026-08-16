@@ -189,6 +189,17 @@ distinct weapon on warframe.market — only "Dual Toxocyst" is, confirmed live
 against its `/v2/riven/weapons` catalog). Determines which warframe.market
 listings and which **Disposition** value apply.
 
+**Polarity**:
+The slot shape a Riven carries, one of five: Madurai, Vazarin, Naramon,
+Zenurik, Unairu. Two upstream sources spell it differently — the mobile
+inventory API's `Upgrades[]` (see **Riven**) gives DE's own internal codes
+(`AP_ATTACK`, `AP_DEFENSE`, `AP_TACTIC`, `AP_POWER`, `AP_WARD`), while
+warframe.market's auction listings give the plain name directly — both parsed
+into one canonical type at the `wf-data` boundary (see
+[ADR-0018](docs/adr/0018-riven-polarity-is-a-typed-value.md)).
+_Avoid_: Polarity code, AP code (the raw upstream spelling — never surfaced
+past the parse boundary).
+
 **Floor price**:
 The cheapest real price signal for a riven's **Riven type** on
 warframe.market, derived from a live-listing snapshot only — rivens have no
