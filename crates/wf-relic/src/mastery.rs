@@ -11,13 +11,19 @@
 //! weapons `1000·r²/2 = 450,000`; Warframes/companions/archwing `2×` that
 //! `= 900,000`. Verified against a real high-MR profile.
 //!
-//! Sends the same honest `warframe-lite/<version>` User-Agent as every other
-//! request in this app (see [`wf_data::http_client`]), rather than spoofing
-//! a browser UA. Verified live, 2026-08-16 (issue #100): a spoofed
-//! `Mozilla/5.0` and the honest UA get byte-identical `409 Conflict`
-//! responses (including an empty body either way, and even with no UA
-//! header at all) against a bogus `playerId` — this endpoint doesn't
-//! discriminate on User-Agent content, so the earlier spoof bought nothing.
+//! Sends [`wf_data::DE_USER_AGENT`] rather than this app's own honest
+//! `warframe-lite/<version>` UA (see [`wf_data::http_client`]'s default).
+//! Issue #100 (2026-08-16) originally switched this *to* the honest UA,
+//! after finding a spoofed `Mozilla/5.0` and the honest UA get
+//! byte-identical `409 Conflict` responses against a bogus `playerId` — but
+//! that only checked this one endpoint's immediate response, not whatever
+//! DE's edge does with the UA afterward. Reversed back to a spoofed UA once
+//! we found two community tools that have called this same DE domain for
+//! years without issue — WFHelper's `apiHelperRunner.ts` and the
+//! `calamity-inc/Soup` library behind `Sainan/warframe-api-helper` — both
+//! independently choosing a browser-style UA specifically for DE's
+//! endpoints (never their own honest name there), the opposite of what
+//! issue #100 concluded. See [`wf_data::DE_USER_AGENT`]'s docs.
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -101,6 +107,7 @@ pub async fn fetch(client: &reqwest::Client, account_id: &str) -> anyhow::Result
     tracing::debug!("GET {url}");
     let body = client
         .get(&url)
+        .header("User-Agent", wf_data::DE_USER_AGENT)
         .send()
         .await?
         .error_for_status()
@@ -135,6 +142,7 @@ pub async fn fetch_display_name(
     let url = format!("{PC_ENDPOINT}?playerId={account_id}");
     let body = client
         .get(&url)
+        .header("User-Agent", wf_data::DE_USER_AGENT)
         .send()
         .await?
         .error_for_status()

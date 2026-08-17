@@ -25,7 +25,13 @@ pub async fn fetch_inventory(client: &reqwest::Client, authz: &Authz) -> Result<
     for host in HOSTS {
         let url = format!("https://{host}/api/inventory.php{qs}");
         let outcome = async {
-            let resp = client.get(&url).send().await?;
+            // Spoofed browser UA, not this app's own honest one — see
+            // `wf_data::DE_USER_AGENT`'s docs for why.
+            let resp = client
+                .get(&url)
+                .header("User-Agent", wf_data::DE_USER_AGENT)
+                .send()
+                .await?;
             let status = resp.status();
             if !status.is_success() {
                 anyhow::bail!("HTTP {status}");
