@@ -466,7 +466,17 @@ pub fn run() -> eframe::Result<()> {
     // opacity/fissures fields live-applying to a running overlay — see
     // `settings_tab`'s docs).
     let settings_config = config.clone();
-    rt_handle.spawn(load_and_poll(loaded.clone(), config, relic_prices.clone(), set_prices.clone()));
+    // Lets `BrowseApp::spawn_scan` wake `poll` immediately once a Scan
+    // Memory run lands fresh data, instead of leaving tabs stale for up to
+    // `POLL_INTERVAL` — see `PollArgs::scan_notify`'s docs.
+    let scan_notify = Arc::new(tokio::sync::Notify::new());
+    rt_handle.spawn(load_and_poll(
+        loaded.clone(),
+        config,
+        relic_prices.clone(),
+        set_prices.clone(),
+        scan_notify.clone(),
+    ));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -502,6 +512,7 @@ pub fn run() -> eframe::Result<()> {
                 riven_market,
                 settings_config,
                 config_path,
+                scan_notify,
             )))
         }),
     )
@@ -1080,6 +1091,7 @@ async fn load_and_poll(
     config: Config,
     relic_prices: LazyPriceMap,
     set_prices: LazyPriceMap,
+    scan_notify: Arc<tokio::sync::Notify>,
 ) {
     let LoadedData {
         index,
@@ -1137,6 +1149,7 @@ async fn load_and_poll(
         relic_prices,
         set_prices,
         platform: config.platform,
+        scan_notify,
     })
     .await;
 }
@@ -1156,18 +1169,35 @@ struct PollArgs {
     relic_prices: LazyPriceMap,
     set_prices: LazyPriceMap,
     platform: String,
+    /// Signaled by [`BrowseApp::spawn_scan`] once a Scan Memory run has
+    /// written fresh `owned-relics.json`/`owned-prime-parts.json`/
+    /// `rivens.json` — wakes the loop below immediately instead of leaving
+    /// the Rivens/Relics & Plan/Sell/Farm/Mastery tabs showing stale (often
+    /// empty) data for up to [`POLL_INTERVAL`] after a scan completes.
+    scan_notify: Arc<tokio::sync::Notify>,
 }
 
-/// Re-read `owned-relics.json` and re-fetch world state every [`POLL_INTERVAL`],
-/// refreshing `loaded`'s `live` field — the only two things cheap/fast-changing
-/// enough to poll, plus a fresh snapshot of `relic_prices`/`set_prices` (see
+/// Re-read `owned-relics.json` and re-fetch world state every [`POLL_INTERVAL`]
+/// (or immediately, if `scan_notify` fires sooner — see its docs), refreshing
+/// `loaded`'s `live` field — the only two things cheap/fast-changing enough
+/// to poll, plus a fresh snapshot of `relic_prices`/`set_prices` (see
 /// ADR-0012) so a lazy fetch that lands between ticks shows up without
 /// waiting on user interaction. The relic catalogue, mastery, and Farm/Ducats-
 /// tab prices stay exactly as loaded at launch; only re-running the app
 /// refreshes those.
 async fn poll(args: PollArgs) {
-    let PollArgs { loaded, index, mastery, quantities, part_market, mut prices, relic_prices, set_prices, platform } =
-        args;
+    let PollArgs {
+        loaded,
+        index,
+        mastery,
+        quantities,
+        part_market,
+        mut prices,
+        relic_prices,
+        set_prices,
+        platform,
+        scan_notify,
+    } = args;
     let client = wf_data::http_client();
     // Consecutive world-state fetch failures — backs off the poll cadence
     // instead of hammering a struggling warframestat.us at a fixed interval
@@ -1179,7 +1209,10 @@ async fn poll(args: PollArgs) {
             wf_data::poll::backoff_interval(POLL_INTERVAL, consecutive_failures, POLL_RETRY_CAP),
             POLL_JITTER,
         );
-        tokio::time::sleep(interval).await;
+        tokio::select! {
+            () = tokio::time::sleep(interval) => {}
+            () = scan_notify.notified() => {}
+        }
         let owned = wf_cache::load_blob::<wf_relic::OwnedRelics>(wf_relic::OWNED_RELICS_FILE);
         let owned_parts =
             wf_cache::load_blob::<wf_relic::OwnedPrimeParts>(wf_relic::OWNED_PRIME_PARTS_FILE)
@@ -1802,6 +1835,10 @@ struct BrowseApp {
     /// session — a fresh client per fetch would reset that budget on every
     /// tab re-render instead of throttling it session-wide.
     riven_market: wf_data::riven_market::RivenMarketClient,
+    /// Signals `load_and_poll`'s background [`poll`] loop to wake immediately
+    /// after a Scan Memory run — see [`spawn_scan`](Self::spawn_scan) and
+    /// `PollArgs::scan_notify`'s docs.
+    scan_notify: Arc<tokio::sync::Notify>,
 }
 
 impl BrowseApp {
@@ -1817,6 +1854,7 @@ impl BrowseApp {
         riven_market: wf_data::riven_market::RivenMarketClient,
         config: Config,
         config_path: PathBuf,
+        scan_notify: Arc<tokio::sync::Notify>,
     ) -> Self {
         let account_id = config.account_id.clone().unwrap_or_default();
         Self {
@@ -1857,6 +1895,7 @@ impl BrowseApp {
             polarity_icons: None,
             riven_verdicts: Arc::new(Mutex::new(HashMap::new())),
             riven_market,
+            scan_notify,
         }
     }
 
@@ -2244,9 +2283,17 @@ impl BrowseApp {
 
         let scan_status = self.scan_status.clone();
         let client = self.client.clone();
+        let scan_notify = self.scan_notify.clone();
         self.rt_handle.spawn(async move {
             let result = run_memory_scan(&client).await;
             *scan_status.lock().unwrap_or_else(|p| p.into_inner()) = Some(result);
+            // Wake the background poll loop now rather than leaving the
+            // Rivens/Relics & Plan/Sell/Farm/Mastery tabs showing whatever
+            // was on disk before this scan for up to `POLL_INTERVAL` — see
+            // `PollArgs::scan_notify`'s docs. Fired even on a partial/failed
+            // scan since a relics-only or parts-only write still landed
+            // fresher data worth picking up.
+            scan_notify.notify_one();
         });
     }
 
@@ -4000,6 +4047,7 @@ mod tests {
             wf_data::riven_market::RivenMarketClient::new(wf_data::http_client(), "pc"),
             Config::default(),
             PathBuf::from("config.toml"),
+            Arc::new(tokio::sync::Notify::new()),
         );
         app.set_wishlisted("Ember Prime Systems", true);
         let on_disk = wf_cache::load_blob::<wf_relic::Wishlist>(wf_relic::WISHLIST_FILE)
