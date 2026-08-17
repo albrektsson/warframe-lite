@@ -1601,19 +1601,20 @@ async fn load_data(config: &Config) -> LoadedData {
     // target set (see `riven_verdict_targets`/ADR-0020). The Verdict fetch
     // itself (`/v1/auctions/search`, one call per distinct owned weapon) is
     // lazy-on-view with its own rate limiter (ADR-0020), same as relic/Set
-    // prices under ADR-0012, and so isn't triggered from here. The weapon
-    // catalogue (`/v2/riven/weapons`) isn't the endpoint that rate limit
-    // scopes to, and is small (~400 entries), so it stays fetched fresh each
-    // launch rather than disk-cached, same as `active_tiers`'s worldstate
-    // fetch above.
-    let riven_weapons = wf_data::riven_market::weapon_catalogue(&client, &config.market_platform)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!("riven weapon catalogue load failed: {e:#}");
-            Vec::new()
-        });
-    let riven_slug_by_weapon: HashMap<String, String> =
-        riven_weapons.into_iter().map(|w| (w.game_ref, w.slug)).collect();
+    // prices under ADR-0012, and so isn't triggered from here.
+    //
+    // Disk-cached (weekly TTL, stale-served on failure): this endpoint can
+    // 429 on its own even though it sits outside ADR-0020's own rate
+    // limiter, and with nothing to fall back on, one rate-limited launch
+    // silently disabled every live Verdict for the whole session (see
+    // `wf_relic::riven_weapon_slugs`'s doc).
+    let riven_slug_by_weapon =
+        wf_relic::riven_weapon_slugs::load_cached(&client, &config.market_platform, CATALOGUE_TTL)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("riven weapon slug catalogue load failed: {e:#}");
+                HashMap::new()
+            });
 
     let part_market = wf_relic::part_market_info(&quantities, &item_index);
 
@@ -4071,9 +4072,10 @@ fn riven_verdict_targets(
 /// higher of its rerolled/unrolled median, mirroring the live Verdict's own
 /// Ceiling (top potential value, not a guaranteed floor): whichever state
 /// a given owned copy is actually in, this is "the best this weapon type has
-/// recently sold for." `None` when bulk stats have no confident reading in
-/// *either* state (unmatched weapon name, or both readings too thin — see
-/// [`wf_relic::RivenBulkStats::median_plat`]).
+/// recently sold for." `None` only when bulk stats have no entry at all for
+/// this weapon in *either* state (name unmatched — see
+/// [`wf_relic::RivenBulkStats::median_plat`]'s doc for why a thin sample
+/// still counts).
 fn riven_group_bulk_price(bulk: &wf_relic::RivenBulkStats, group: &RivenGroup) -> Option<u32> {
     let rerolled = bulk.median_plat(group.mod_category, &group.weapon_name, true);
     let unrolled = bulk.median_plat(group.mod_category, &group.weapon_name, false);

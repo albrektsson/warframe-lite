@@ -83,9 +83,9 @@ impl RivenBulkStats {
     /// Build a stats set directly from known `(category, weapon name,
     /// rerolled, median plat)` entries, for tests elsewhere in the workspace
     /// that need a known stats set without going through a fetch — mirrors
-    /// [`crate::riven_catalogue::RivenCatalogue::from_parts_for_test`]. Each
-    /// entry gets a sample size of exactly [`MIN_LISTINGS`], just enough to
-    /// clear [`Self::median_plat`]'s own confidence gate.
+    /// [`crate::riven_catalogue::RivenCatalogue::from_parts_for_test`]. `pop`
+    /// is fixed at [`MIN_LISTINGS`] purely as a plausible sample size — it no
+    /// longer gates anything (see [`Self::median_plat`]'s doc).
     pub fn from_entries_for_test(entries: Vec<(RivenModCategory, String, bool, u32)>) -> Self {
         Self {
             entries: entries
@@ -99,17 +99,24 @@ impl RivenBulkStats {
 
     /// The median historical sale price for `weapon_name` under
     /// `mod_category`, split by whether the copy being priced has been
-    /// rerolled at least once. `None` when unmatched (no entry for this
-    /// weapon/state at all) *or* when the matched entry's sample size is
-    /// below [`MIN_LISTINGS`] — the same confidence gate
-    /// [`crate::riven_pricing::evaluate`] applies to the live percentile
-    /// data, reused here since a `pop: 1` median carries the same "don't
-    /// trust this" caveat as a thin live-listing sample.
+    /// rerolled at least once. `None` only when unmatched (no entry for this
+    /// weapon/state at all).
+    ///
+    /// Unlike [`crate::riven_pricing::evaluate`]'s live-listing percentiles,
+    /// this carries **no** [`MIN_LISTINGS`]-style confidence gate — an
+    /// earlier version reused that exact threshold here and it was wrong:
+    /// live warframe.market listing depth and this endpoint's *historical
+    /// sale count* are not comparable quantities. Checked live 2026-08-17
+    /// against a real 63-riven owned set: 59/59 weapons matched by name, but
+    /// only 8/59 had `pop >= 5` in either state — most real entries sit at
+    /// `pop: 1`-`3`. Gating at 5 silently starved the Rivens tab's
+    /// placeholder estimate (and its Price sort / Useless filter) down to
+    /// near-uselessness. Every caller already treats this as a rough,
+    /// clearly-labeled estimate ahead of the authoritative live Verdict, not
+    /// a load-bearing number — so a thin sample is exactly the case this
+    /// exists to (imperfectly) cover, not one to hide.
     pub fn median_plat(&self, mod_category: RivenModCategory, weapon_name: &str, rerolled: bool) -> Option<u32> {
         let stat = self.entries.get(&(mod_category, weapon_name.to_string(), rerolled))?;
-        if (stat.pop as usize) < MIN_LISTINGS {
-            return None;
-        }
         Some(stat.median.round() as u32)
     }
 
@@ -210,11 +217,14 @@ mod tests {
     }
 
     #[test]
-    fn below_min_listings_reads_as_no_confident_price() {
+    fn a_single_recorded_sale_is_still_returned_not_gated_away() {
+        // Real `warframestat.us` data is thin — most weapons sit at `pop: 1`-`3`
+        // (see `median_plat`'s doc) — so a `pop: 1` entry must still resolve;
+        // an earlier version wrongly gated this to `None`.
         let stats = RivenBulkStats::new(BulkStatsData {
             entries: vec![(RivenModCategory::Melee, "Test Melee".to_string(), false, BulkRivenStat { median: 500.0, pop: 1 })],
         });
-        assert_eq!(stats.median_plat(RivenModCategory::Melee, "Test Melee", false), None);
+        assert_eq!(stats.median_plat(RivenModCategory::Melee, "Test Melee", false), Some(500));
     }
 
     #[test]

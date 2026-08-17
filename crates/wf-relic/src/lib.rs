@@ -18,6 +18,7 @@ pub mod riven_bulk_stats;
 pub mod riven_catalogue;
 pub mod riven_decode;
 pub mod riven_pricing;
+pub mod riven_weapon_slugs;
 pub mod wishlist;
 
 pub use bom::{buy_or_farm_plan, unmastered_primes, BomGap, BomPlan};
