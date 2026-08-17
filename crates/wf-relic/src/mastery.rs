@@ -11,10 +11,24 @@
 //! weapons `1000·r²/2 = 450,000`; Warframes/companions/archwing `2×` that
 //! `= 900,000`. Verified against a real high-MR profile.
 //!
-//! Sends [`wf_data::DE_USER_AGENT`] rather than this app's own honest
-//! `warframe-lite/<version>` UA (see [`wf_data::http_client`]'s default).
-//! Issue #100 (2026-08-16) originally switched this *to* the honest UA,
-//! after finding a spoofed `Mozilla/5.0` and the honest UA get
+//! [`fetch`] tries WFCD's `warframestat.us` proxy first (see
+//! [`fetch_via_wfcd`]) and only falls back to calling DE directly ([`fetch_de`])
+//! if that fails — this app's worldstate poller already depends on the same
+//! `warframestat.us` domain, so it's not a new trust boundary, and it means
+//! most installs never talk to `api.warframe.com` directly at all: DE
+//! rate-limiting or blocking one client's fingerprint doesn't take out every
+//! warframe-lite install simultaneously the way it would if all of them hit
+//! DE directly (2026-08-17, prompted by DE's endpoint going blanket-403 for
+//! every `playerId` including bogus ones, independent of User-Agent).
+//! `warframestat.us` is itself a live, uncached pass-through to the same DE
+//! endpoint (confirmed against `WFCD/warframe-status`'s `ProfileService`
+//! source) — so it can't outlast a real DE-side outage, hence the DE-direct
+//! fallback rather than relying on it alone.
+//!
+//! [`fetch_de`] sends [`wf_data::DE_USER_AGENT`] rather than this app's own
+//! honest `warframe-lite/<version>` UA (see [`wf_data::http_client`]'s
+//! default). Issue #100 (2026-08-16) originally switched this *to* the
+//! honest UA, after finding a spoofed `Mozilla/5.0` and the honest UA get
 //! byte-identical `409 Conflict` responses against a bogus `playerId` — but
 //! that only checked this one endpoint's immediate response, not whatever
 //! DE's edge does with the UA afterward. Reversed back to a spoofed UA once
@@ -30,8 +44,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::part_quantities::PartQuantities;
 
-/// PC profile endpoint (public, no auth).
+/// PC profile endpoint (public, no auth), called directly by [`fetch_de`].
 const PC_ENDPOINT: &str = "https://api.warframe.com/cdn/getProfileViewingData.php";
+
+/// WFCD's community-run proxy, tried first by [`fetch`] — see the module
+/// docs for why.
+const WFCD_XP_ENDPOINT: &str = "https://api.warframestat.us/profile";
 
 const WEAPON_CAP: u64 = 450_000;
 const FRAME_CAP: u64 = 900_000;
@@ -101,8 +119,45 @@ impl MasterySet {
     }
 }
 
-/// Fetch and build a [`MasterySet`] for `account_id` (24-hex) on PC.
+/// Fetch and build a [`MasterySet`] for `account_id` (24-hex) on PC. Tries
+/// [`fetch_via_wfcd`] first, falling back to [`fetch_de`] — see the module
+/// docs for why.
 pub async fn fetch(client: &reqwest::Client, account_id: &str) -> anyhow::Result<MasterySet> {
+    match fetch_via_wfcd(client, account_id).await {
+        Ok(set) => Ok(set),
+        Err(e) => {
+            tracing::debug!("warframestat.us xpInfo fetch failed ({e:#}); falling back to DE directly");
+            fetch_de(client, account_id).await
+        }
+    }
+}
+
+/// Fetch XP info through WFCD's `warframestat.us` proxy. Response shape is
+/// WFCD's own parsed `XpInfo[]` (`{uniqueName, xp}` per entry, source:
+/// `WFCD/profile-parser`'s `XpInfo.ts`) — distinct from [`fetch_de`]'s raw
+/// nested `Results[0].LoadOutInventory.XPInfo` shape, since WFCD's service
+/// already unwraps and flattens it server-side.
+async fn fetch_via_wfcd(client: &reqwest::Client, account_id: &str) -> anyhow::Result<MasterySet> {
+    let url = format!("{WFCD_XP_ENDPOINT}/{account_id}/xpInfo");
+    tracing::debug!("GET {url}");
+    let entries = client
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()
+        .context("warframestat.us xpInfo request failed")?
+        .json::<Vec<WfcdXpEntry>>()
+        .await
+        .context("parsing warframestat.us xpInfo JSON")?;
+    let set = MasterySet::from_xp(entries.into_iter().map(|e| (e.unique_name, e.xp)));
+    tracing::info!("mastery: {} mastered items for {account_id} (via warframestat.us)", set.len());
+    Ok(set)
+}
+
+/// Fetch and build a [`MasterySet`] for `account_id` straight from DE's own
+/// endpoint, bypassing WFCD's proxy — [`fetch`]'s fallback, and also used
+/// directly by anything that wants DE as the primary source.
+async fn fetch_de(client: &reqwest::Client, account_id: &str) -> anyhow::Result<MasterySet> {
     let url = format!("{PC_ENDPOINT}?playerId={account_id}");
     tracing::debug!("GET {url}");
     let body = client
@@ -128,7 +183,7 @@ pub async fn fetch(client: &reqwest::Client, account_id: &str) -> anyhow::Result
             .into_iter()
             .map(|e| (e.item_type, e.xp)),
     );
-    tracing::info!("mastery: {} mastered items for {account_id}", set.len());
+    tracing::info!("mastery: {} mastered items for {account_id} (via DE directly)", set.len());
     Ok(set)
 }
 
@@ -290,6 +345,16 @@ struct XpEntry {
     #[serde(rename = "ItemType")]
     item_type: String,
     #[serde(rename = "XP", default)]
+    xp: u64,
+}
+
+/// One entry of WFCD's `warframestat.us` `xpInfo` response — see
+/// [`fetch_via_wfcd`]'s docs for why this differs from [`XpEntry`].
+#[derive(Deserialize)]
+struct WfcdXpEntry {
+    #[serde(rename = "uniqueName")]
+    unique_name: String,
+    #[serde(default)]
     xp: u64,
 }
 
