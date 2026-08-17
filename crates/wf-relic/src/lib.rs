@@ -14,6 +14,7 @@ pub mod part_quantities;
 pub mod regions;
 pub mod relic_names;
 pub mod relics;
+pub mod riven_bulk_stats;
 pub mod riven_catalogue;
 pub mod riven_decode;
 pub mod riven_pricing;
@@ -43,9 +44,13 @@ pub use relics::{
     FarmPick, MasteryEntry, PartsOwnedSummary, PrimePartGroup, PrimePlan, PrimeRelicSource,
     RelicContext, RelicIndex, RelicInfo, RelicPick, RelicReward, OWNED_RELICS_FILE,
 };
+pub use riven_bulk_stats::RivenBulkStats;
 pub use riven_catalogue::{RivenCatalogue, RivenModCategory, WeaponRivenInfo};
 pub use riven_decode::{decode as decode_riven, DecodedRiven, DecodedStat, RawRiven as RivenRawRiven, RawStat as RivenRawStat};
-pub use riven_pricing::{evaluate as evaluate_riven_price, ListingInput, RivenTypeVerdict, Verdict as RivenVerdict};
+pub use riven_pricing::{
+    evaluate as evaluate_riven_price, ListingInput, RivenTypeVerdict, Verdict as RivenVerdict,
+    MIN_LISTINGS as RIVEN_MIN_LISTINGS, WORTHLESS_THRESHOLD_PLAT,
+};
 pub use wishlist::{Wishlist, WISHLIST_FILE};
 
 use std::collections::HashMap;

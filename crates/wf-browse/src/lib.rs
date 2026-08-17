@@ -135,6 +135,15 @@ const NO_OWNED_RIVENS_MSG: &str =
      once you have at least one Unveiled riven.";
 /// Relic tiers offered by the tier-filter checkboxes, in drop order.
 const TIERS: [&str; 5] = ["Lith", "Meso", "Neo", "Axi", "Requiem"];
+/// Fixed minimum width for the Rivens tab's "modifiers" grid column, set on
+/// every cell in every weapon group's own `egui::Grid` instance — since each
+/// `Grid` otherwise auto-sizes its columns from only its own rows, without
+/// this the Polarity/Mastery columns that follow would land at a different
+/// x position in every group instead of one straight vertical line down the
+/// whole scrolled list.
+const RIVEN_STATS_COL_WIDTH: f32 = 260.0;
+/// Mirrors [`RIVEN_STATS_COL_WIDTH`]'s role, for the Polarity column.
+const RIVEN_POLARITY_COL_WIDTH: f32 = 110.0;
 /// Standard Warframe mission types, offered by the fissure-filter's
 /// mission-type checkboxes. The live API's `mission_type` field is
 /// free-form text, so this is a curated (not authoritative) list — the
@@ -314,6 +323,12 @@ const MASTERED_COLOR: egui::Color32 = egui::Color32::from_rgb(120, 200, 140);
 /// Unmastered-status color: muted, not alarming — there's nothing wrong with
 /// an unmastered prime, it's just the thing being tracked.
 const UNMASTERED_COLOR: egui::Color32 = egui::Color32::from_gray(150);
+/// Negative-signal color: a Riven curse line, or (via [`verdict_color`]) a
+/// "likely dissolve" Verdict — an actionable negative, distinct from
+/// [`UNMASTERED_COLOR`]'s neutral abstain. Was previously an inline literal
+/// only `verdict_color` used; promoted to a named constant so the Rivens
+/// tab's per-stat coloring reuses the exact same red instead of drifting.
+const NEGATIVE_COLOR: egui::Color32 = egui::Color32::from_rgb(210, 100, 90);
 /// Warframe's own reward-rarity colors, reused so the Farm tab reads the same
 /// way the in-game reward screen does.
 const RARITY_COMMON_COLOR: egui::Color32 = egui::Color32::from_gray(210);
@@ -610,6 +625,52 @@ fn tier_matches(selected: &HashSet<String>, tier: &str) -> bool {
     selected.is_empty() || selected.contains(tier)
 }
 
+/// Every Riven type, in the Rivens tab's type-filter checkbox order.
+const RIVEN_MOD_CATEGORIES: [wf_relic::RivenModCategory; 7] = [
+    wf_relic::RivenModCategory::Rifle,
+    wf_relic::RivenModCategory::Shotgun,
+    wf_relic::RivenModCategory::Pistol,
+    wf_relic::RivenModCategory::Melee,
+    wf_relic::RivenModCategory::Archgun,
+    wf_relic::RivenModCategory::Kitgun,
+    wf_relic::RivenModCategory::Zaw,
+];
+
+fn riven_mod_category_label(c: wf_relic::RivenModCategory) -> &'static str {
+    match c {
+        wf_relic::RivenModCategory::Rifle => "Rifle",
+        wf_relic::RivenModCategory::Shotgun => "Shotgun",
+        wf_relic::RivenModCategory::Pistol => "Pistol",
+        wf_relic::RivenModCategory::Melee => "Melee",
+        wf_relic::RivenModCategory::Archgun => "Archgun",
+        wf_relic::RivenModCategory::Kitgun => "Kitgun",
+        wf_relic::RivenModCategory::Zaw => "Zaw",
+    }
+}
+
+/// Mirrors [`tier_filter_ui`]'s exact pattern, over [`RIVEN_MOD_CATEGORIES`]
+/// instead of [`TIERS`].
+fn riven_type_filter_ui(ui: &mut egui::Ui, selected: &mut HashSet<wf_relic::RivenModCategory>) {
+    ui.horizontal(|ui| {
+        ui.label("Type:");
+        for cat in RIVEN_MOD_CATEGORIES {
+            let mut checked = selected.contains(&cat);
+            if ui.checkbox(&mut checked, riven_mod_category_label(cat)).changed() {
+                if checked {
+                    selected.insert(cat);
+                } else {
+                    selected.remove(&cat);
+                }
+            }
+        }
+    });
+}
+
+/// Mirrors [`tier_matches`]'s exact "empty selection means no filter" rule.
+fn riven_type_matches(selected: &HashSet<wf_relic::RivenModCategory>, cat: wf_relic::RivenModCategory) -> bool {
+    selected.is_empty() || selected.contains(&cat)
+}
+
 /// Mission-type checkboxes for the fissure filter, wrapped across lines since
 /// [`MISSION_TYPES`] is too long for one row at this panel's width.
 fn mission_type_filter_ui(ui: &mut egui::Ui, selected: &mut HashSet<String>) {
@@ -810,6 +871,21 @@ enum LazyVerdict {
 /// a Verdict, so there's no snapshot-into-planning-layer step to mirror here.
 type LazyVerdictMap = Arc<Mutex<HashMap<String, LazyVerdict>>>;
 
+/// The Rivens tab's bulk historical-stats prefetch state — a single flag
+/// rather than a keyed map like [`LazyVerdictMap`], since
+/// [`wf_relic::RivenBulkStats::load_cached`] is one fetch for the whole
+/// dataset, not one per weapon. No retry-on-failure within a session
+/// (unlike [`LazyVerdict`]): a failed fetch with no stale cache falls back to
+/// [`wf_relic::RivenBulkStats::empty`] (see
+/// [`BrowseApp::ensure_riven_bulk_stats`]), and the tab stays fully usable
+/// without it — Alphabetical sort and the search/type filters don't need
+/// this data at all, only Price sort and the Useless filter do.
+enum RivenBulkStatsState {
+    NotStarted,
+    Loading,
+    Ready(Arc<wf_relic::RivenBulkStats>),
+}
+
 /// Mirrors [`needs_fetch`] exactly, over [`LazyVerdict`] instead of
 /// [`LazyPrice`] — see its doc for the decision this makes and why.
 fn needs_fetch_verdict(current: Option<&LazyVerdict>, now: Instant) -> bool {
@@ -946,6 +1022,11 @@ struct Live {
 struct RivenGroup {
     weapon_name: String,
     weapon_unique_name: String,
+    /// Every riven in a group shares one weapon, hence one Riven type — kept
+    /// here (rather than read off `rivens[0]` at every use site) since the
+    /// type filter/display need it as a plain group-level fact, the same
+    /// reasoning `weapon_name` itself already gets.
+    mod_category: wf_relic::RivenModCategory,
     rivens: Vec<DecodedRiven>,
 }
 
@@ -959,6 +1040,7 @@ fn group_owned_rivens(owned: &OwnedRivens) -> Vec<RivenGroup> {
             None => groups.push(RivenGroup {
                 weapon_name: riven.weapon_name.clone(),
                 weapon_unique_name: riven.weapon_unique_name.clone(),
+                mod_category: riven.mod_category,
                 rivens: vec![riven.clone()],
             }),
         }
@@ -1722,6 +1804,19 @@ enum FarmSort {
     Rarity,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum RivenSort {
+    Alphabetical,
+    Price,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum RivenUselessFilter {
+    All,
+    UselessOnly,
+    GoodOnly,
+}
+
 struct BrowseApp {
     tab: Tab,
     /// The Home tab's own sub-nav (see [`HomeSubTab`]).
@@ -1835,6 +1930,20 @@ struct BrowseApp {
     /// session — a fresh client per fetch would reset that budget on every
     /// tab re-render instead of throttling it session-wide.
     riven_market: wf_data::riven_market::RivenMarketClient,
+    /// The Rivens tab's bulk historical-price-stats prefetch (see
+    /// [`RivenBulkStatsState`]) — a single whole-dataset fetch, triggered
+    /// once per session on first view of the tab, unlike the per-weapon
+    /// [`LazyVerdictMap`] above. Drives the tab's Price sort and Useless
+    /// filter, plus the header's placeholder price estimate ahead of the
+    /// live Verdict resolving.
+    riven_bulk_stats: Arc<Mutex<RivenBulkStatsState>>,
+    /// The Rivens tab's sort/filter/search UI state.
+    riven_sort: RivenSort,
+    riven_useless_filter: RivenUselessFilter,
+    riven_type_filter: HashSet<wf_relic::RivenModCategory>,
+    /// Editable text buffer for the Rivens tab's search box (weapon name
+    /// only).
+    riven_filter: String,
     /// Signals `load_and_poll`'s background [`poll`] loop to wake immediately
     /// after a Scan Memory run — see [`spawn_scan`](Self::spawn_scan) and
     /// `PollArgs::scan_notify`'s docs.
@@ -1895,6 +2004,11 @@ impl BrowseApp {
             polarity_icons: None,
             riven_verdicts: Arc::new(Mutex::new(HashMap::new())),
             riven_market,
+            riven_bulk_stats: Arc::new(Mutex::new(RivenBulkStatsState::NotStarted)),
+            riven_sort: RivenSort::Alphabetical,
+            riven_useless_filter: RivenUselessFilter::All,
+            riven_type_filter: HashSet::new(),
+            riven_filter: String::new(),
             scan_notify,
         }
     }
@@ -2069,6 +2183,33 @@ impl BrowseApp {
                     LazyVerdict::Ready { verdict, resolved_at, consecutive_failures },
                 );
             }
+        });
+    }
+
+    /// Fire the Rivens tab's one-shot bulk-stats prefetch (see
+    /// [`RivenBulkStatsState`]) the first time it's called this session;
+    /// every later call is a cheap no-op lock-check. Called every frame
+    /// [`Self::rivens_tab`] renders, same unconditional-but-cheap pattern as
+    /// [`Self::ensure_riven_verdicts`]/[`Self::ensure_lazy_prices`].
+    fn ensure_riven_bulk_stats(&self) {
+        {
+            let mut guard = self.riven_bulk_stats.lock().unwrap_or_else(|p| p.into_inner());
+            if !matches!(&*guard, RivenBulkStatsState::NotStarted) {
+                return;
+            }
+            *guard = RivenBulkStatsState::Loading;
+        }
+
+        let state = self.riven_bulk_stats.clone();
+        let client = self.client.clone();
+        self.rt_handle.spawn(async move {
+            let stats = wf_relic::RivenBulkStats::load_cached(&client, CATALOGUE_TTL)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("riven bulk stats load failed: {e:#}");
+                    wf_relic::RivenBulkStats::empty()
+                });
+            *state.lock().unwrap_or_else(|p| p.into_inner()) = RivenBulkStatsState::Ready(Arc::new(stats));
         });
     }
 
@@ -3103,12 +3244,15 @@ impl BrowseApp {
     /// Unveiled riven grouped by owned weapon, one collapsing section per
     /// weapon stating Floor/Ceiling/Verdict once (a weapon-level fact, not
     /// per-copy — see §3/§4 and CONTEXT.md's Verdict entry), with each owned
-    /// copy's decoded stats nested underneath. Real production code — not
-    /// the throwaway `prototype/riven-tab-layout-99` branch's mock-data
-    /// variant switcher (issue #99), though the layout itself (Variant C,
-    /// the winning prototype) is unchanged.
+    /// copy's decoded stats nested underneath, one colored modifier per line.
+    /// Sort/filter/search all operate on whole weapon groups, not individual
+    /// copies — price, Verdict, type, and weapon name are every one of them a
+    /// group-level fact (a riven copy only differs from its siblings by
+    /// rank/rerolls/exact roll), so collapsing/hiding/reordering a group is
+    /// the natural unit here, same as the pre-existing Floor/Ceiling/Verdict
+    /// header already treated it.
     fn rivens_tab(&mut self, ui: &mut egui::Ui) {
-        let Some(RivensTabData { groups, riven_slug_by_weapon }) = self.loaded_or_placeholder(ui, |l| {
+        let Some(RivensTabData { mut groups, riven_slug_by_weapon }) = self.loaded_or_placeholder(ui, |l| {
             RivensTabData {
                 groups: l.live.riven_groups.clone(),
                 riven_slug_by_weapon: l.riven_slug_by_weapon.clone(),
@@ -3125,14 +3269,79 @@ impl BrowseApp {
         // Fire (or retry) this tab's lazy Verdict fetch every frame it
         // renders (ADR-0020, mirrors `ensure_lazy_prices` — see its doc):
         // cheap, since `ensure_riven_verdicts` only spawns a fetch for a
-        // weapon that's not already `Loading` or still on cooldown.
+        // weapon that's not already `Loading` or still on cooldown. The
+        // one-shot bulk-stats prefetch mirrors the same "cheap, call every
+        // frame" contract (see `ensure_riven_bulk_stats`'s doc).
         self.ensure_riven_verdicts(riven_verdict_targets(&groups, &riven_slug_by_weapon));
+        self.ensure_riven_bulk_stats();
+        let bulk = match &*self.riven_bulk_stats.lock().unwrap_or_else(|p| p.into_inner()) {
+            RivenBulkStatsState::Ready(stats) => Some(stats.clone()),
+            RivenBulkStatsState::NotStarted | RivenBulkStatsState::Loading => None,
+        };
+
+        ui.horizontal(|ui| {
+            ui.label("Search:");
+            ui.text_edit_singleline(&mut self.riven_filter);
+        });
+        riven_type_filter_ui(ui, &mut self.riven_type_filter);
+        ui.horizontal(|ui| {
+            ui.label("Show:");
+            ui.selectable_value(&mut self.riven_useless_filter, RivenUselessFilter::All, "All");
+            ui.selectable_value(&mut self.riven_useless_filter, RivenUselessFilter::UselessOnly, "Useless only");
+            ui.selectable_value(&mut self.riven_useless_filter, RivenUselessFilter::GoodOnly, "Good only");
+            ui.add_space(12.0);
+            ui.label("Sort:");
+            ui.selectable_value(&mut self.riven_sort, RivenSort::Alphabetical, "Alphabetical");
+            ui.selectable_value(&mut self.riven_sort, RivenSort::Price, "Price");
+        });
+        if bulk.is_none()
+            && (self.riven_sort == RivenSort::Price || self.riven_useless_filter != RivenUselessFilter::All)
+        {
+            ui.label(egui::RichText::new("loading bulk price data…").small().weak());
+        }
+        ui.add_space(4.0);
+
+        if !self.riven_filter.trim().is_empty() {
+            let needle = self.riven_filter.to_ascii_lowercase();
+            groups.retain(|g| g.weapon_name.to_ascii_lowercase().contains(&needle));
+        }
+        groups.retain(|g| riven_type_matches(&self.riven_type_filter, g.mod_category));
+        groups.retain(|g| {
+            let useless = bulk
+                .as_deref()
+                .and_then(|b| riven_group_bulk_price(b, g))
+                .map(|p| p < wf_relic::WORTHLESS_THRESHOLD_PLAT);
+            match self.riven_useless_filter {
+                RivenUselessFilter::All => true,
+                RivenUselessFilter::UselessOnly => useless == Some(true),
+                RivenUselessFilter::GoodOnly => useless == Some(false),
+            }
+        });
+
+        if groups.is_empty() {
+            ui.label("no rivens match the current filter");
+            return;
+        }
+
+        if self.riven_sort == RivenSort::Price {
+            groups.sort_by(|a, b| {
+                let pa = bulk.as_deref().and_then(|s| riven_group_bulk_price(s, a));
+                let pb = bulk.as_deref().and_then(|s| riven_group_bulk_price(s, b));
+                match (pa, pb) {
+                    (Some(x), Some(y)) => y.cmp(&x),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a.weapon_name.cmp(&b.weapon_name),
+                }
+            });
+        } // Alphabetical: `groups` is already alphabetical from `group_owned_rivens`.
 
         let icons = &*self.polarity_icons.get_or_insert_with(|| PolarityIcons::load(ui.ctx()));
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             for group in &groups {
-                let (header_text, verdict) = riven_verdict_header_text(&self.riven_verdicts, group);
+                let (header_text, verdict) =
+                    riven_group_header_text(&self.riven_verdicts, bulk.as_deref(), group);
                 let color = verdict.map(verdict_color).unwrap_or(UNMASTERED_COLOR);
 
                 egui::CollapsingHeader::new(egui::RichText::new(header_text).color(color))
@@ -3143,25 +3352,35 @@ impl BrowseApp {
                             .num_columns(3)
                             .striped(true)
                             .show(ui, |ui| {
-                                ui.strong("stats");
+                                ui.strong("modifiers");
                                 ui.strong("polarity");
                                 ui.strong("mastery / rank / rerolls");
                                 ui.end_row();
                                 for r in &group.rivens {
-                                    ui.label(stat_line(&r.stats));
-                                    match &r.polarity {
-                                        Some(p) => {
-                                            ui.horizontal(|ui| {
+                                    ui.vertical(|ui| {
+                                        ui.set_min_width(RIVEN_STATS_COL_WIDTH);
+                                        if r.stats.is_empty() {
+                                            ui.label("—");
+                                        } else {
+                                            for s in &r.stats {
+                                                ui.colored_label(stat_color(s), stat_display(s));
+                                            }
+                                        }
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.set_min_width(RIVEN_POLARITY_COL_WIDTH);
+                                        match &r.polarity {
+                                            Some(p) => {
                                                 if let Some(tex) = icons.get(p) {
                                                     ui.image((tex.id(), egui::vec2(16.0, 16.0)));
                                                 }
                                                 ui.label(p.display_name());
-                                            });
+                                            }
+                                            None => {
+                                                ui.label("—");
+                                            }
                                         }
-                                        None => {
-                                            ui.label("—");
-                                        }
-                                    }
+                                    });
                                     ui.label(format!(
                                         "{} · R{}/8 · {} rerolls",
                                         r.mastery_req.map(|v| format!("MR{v}")).unwrap_or_else(|| "—".to_string()),
@@ -3729,18 +3948,20 @@ fn verdict_label(v: RivenVerdict) -> &'static str {
 fn verdict_color(v: RivenVerdict) -> egui::Color32 {
     match v {
         RivenVerdict::LikelyKeep => MASTERED_COLOR,
-        RivenVerdict::LikelyDissolve => egui::Color32::from_rgb(210, 100, 90),
+        RivenVerdict::LikelyDissolve => NEGATIVE_COLOR,
         RivenVerdict::InsufficientData => UNMASTERED_COLOR,
     }
 }
 
-/// One riven's decoded stats as a single comma-joined display line, e.g.
-/// `"+45.7% Crit Chance, -12.3% Recoil"`.
-fn stat_line(stats: &[wf_relic::DecodedStat]) -> String {
-    if stats.is_empty() {
-        return "—".to_string();
+/// A decoded stat's display color: green for a buff, the shared
+/// [`NEGATIVE_COLOR`] red for a curse — the Rivens tab's positive/negative
+/// modifier coloring.
+fn stat_color(s: &wf_relic::DecodedStat) -> egui::Color32 {
+    if s.is_positive {
+        MASTERED_COLOR
+    } else {
+        NEGATIVE_COLOR
     }
-    stats.iter().map(stat_display).collect::<Vec<_>>().join(", ")
 }
 
 fn stat_display(s: &wf_relic::DecodedStat) -> String {
@@ -3846,6 +4067,23 @@ fn riven_verdict_targets(
         .collect()
 }
 
+/// A weapon group's representative bulk historical-price signal — the
+/// higher of its rerolled/unrolled median, mirroring the live Verdict's own
+/// Ceiling (top potential value, not a guaranteed floor): whichever state
+/// a given owned copy is actually in, this is "the best this weapon type has
+/// recently sold for." `None` when bulk stats have no confident reading in
+/// *either* state (unmatched weapon name, or both readings too thin — see
+/// [`wf_relic::RivenBulkStats::median_plat`]).
+fn riven_group_bulk_price(bulk: &wf_relic::RivenBulkStats, group: &RivenGroup) -> Option<u32> {
+    let rerolled = bulk.median_plat(group.mod_category, &group.weapon_name, true);
+    let unrolled = bulk.median_plat(group.mod_category, &group.weapon_name, false);
+    match (rerolled, unrolled) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    }
+}
+
 /// Rivens tab: header text and Verdict (for [`verdict_color`]) for one
 /// [`RivenGroup`], sourced from its lazily-fetched [`LazyVerdictMap`] entry
 /// (ADR-0020) — mirrors [`lazy_price_str`]'s three explicit states (loading,
@@ -3854,12 +4092,22 @@ fn riven_verdict_targets(
 /// rather than a `Live`-computed snapshot, for the same reason
 /// `lazy_price_str` does (see its doc): a just-landed Verdict shows the
 /// frame it lands, not up to [`POLL_INTERVAL`] later.
-fn riven_verdict_header_text(map: &LazyVerdictMap, group: &RivenGroup) -> (String, Option<RivenVerdict>) {
+///
+/// While the live Verdict is still loading (or was never triggered yet),
+/// `bulk` — if already fetched — fills in a placeholder estimate instead of
+/// a bare "loading price…", so the whole list reads with rough prices
+/// immediately rather than one group at a time as each lazily resolves.
+fn riven_group_header_text(
+    map: &LazyVerdictMap,
+    bulk: Option<&wf_relic::RivenBulkStats>,
+    group: &RivenGroup,
+) -> (String, Option<RivenVerdict>) {
     let owned = group.rivens.len();
+    let type_label = riven_mod_category_label(group.mod_category);
     match map.lock().unwrap_or_else(|p| p.into_inner()).get(&group.weapon_unique_name) {
         Some(LazyVerdict::Ready { verdict: Some(v), .. }) => (
             format!(
-                "{}  —  Floor {} · Ceiling {} · {}  ({owned} owned)",
+                "{}  ·  {type_label}  —  Floor {} · Ceiling {} · {}  ({owned} owned)",
                 group.weapon_name,
                 floor_str(v.floor),
                 ceiling_str(v.ceiling, v.ceiling_low_confidence),
@@ -3867,10 +4115,17 @@ fn riven_verdict_header_text(map: &LazyVerdictMap, group: &RivenGroup) -> (Strin
             ),
             Some(v.verdict),
         ),
-        Some(LazyVerdict::Ready { verdict: None, .. }) => {
-            (format!("{}  —  price unavailable  ({owned} owned)", group.weapon_name), None)
+        Some(LazyVerdict::Ready { verdict: None, .. }) => (
+            format!("{}  ·  {type_label}  —  price unavailable  ({owned} owned)", group.weapon_name),
+            None,
+        ),
+        _ => {
+            let price_bit = bulk
+                .and_then(|b| riven_group_bulk_price(b, group))
+                .map(|p| format!("~{p}p (est.)"))
+                .unwrap_or_else(|| "loading price…".to_string());
+            (format!("{}  ·  {type_label}  —  {price_bit}  ({owned} owned)", group.weapon_name), None)
         }
-        _ => (format!("{}  —  loading price…  ({owned} owned)", group.weapon_name), None),
     }
 }
 
@@ -4241,6 +4496,7 @@ mod tests {
         RivenGroup {
             weapon_name: weapon_name.to_string(),
             weapon_unique_name: weapon_unique_name.to_string(),
+            mod_category: wf_relic::RivenModCategory::Pistol,
             rivens: vec![test_riven(weapon_unique_name, weapon_name)],
         }
     }
@@ -4254,7 +4510,7 @@ mod tests {
     }
 
     #[test]
-    fn riven_verdict_header_text_distinguishes_loading_from_unavailable_from_resolved() {
+    fn riven_group_header_text_distinguishes_loading_from_unavailable_from_resolved() {
         let now = Instant::now();
         let verdict = RivenTypeVerdict {
             floor: Some(20),
@@ -4274,21 +4530,44 @@ mod tests {
             ("loading".to_string(), LazyVerdict::Loading),
         ])));
 
-        let (text, v) = riven_verdict_header_text(&map, &test_group("resolved", "Resolved Weapon"));
+        let (text, v) = riven_group_header_text(&map, None, &test_group("resolved", "Resolved Weapon"));
         assert!(text.contains("Floor 20p"), "{text}");
+        assert!(text.contains("Pistol"), "{text}");
         assert_eq!(v, Some(wf_relic::RivenVerdict::LikelyKeep));
 
-        let (text, v) = riven_verdict_header_text(&map, &test_group("unavailable", "Unavailable Weapon"));
+        let (text, v) = riven_group_header_text(&map, None, &test_group("unavailable", "Unavailable Weapon"));
         assert!(text.contains("price unavailable"), "{text}");
         assert_eq!(v, None);
 
-        let (text, v) = riven_verdict_header_text(&map, &test_group("loading", "Loading Weapon"));
+        let (text, v) = riven_group_header_text(&map, None, &test_group("loading", "Loading Weapon"));
         assert!(text.contains("loading price"), "{text}");
         assert_eq!(v, None);
 
         // No entry yet (never triggered) reads the same as `Loading`, not broken.
-        let (text, v) = riven_verdict_header_text(&map, &test_group("never_seen", "Never Seen Weapon"));
+        let (text, v) = riven_group_header_text(&map, None, &test_group("never_seen", "Never Seen Weapon"));
         assert!(text.contains("loading price"), "{text}");
         assert_eq!(v, None);
+    }
+
+    #[test]
+    fn riven_group_header_text_shows_a_bulk_estimate_ahead_of_the_live_verdict() {
+        let map: LazyVerdictMap = Arc::new(Mutex::new(HashMap::new()));
+        let bulk = wf_relic::RivenBulkStats::empty();
+        let group = test_group("still_loading", "Still Loading Weapon");
+        let (text, v) = riven_group_header_text(&map, Some(&bulk), &group);
+        // No entry at all for this weapon in the (empty) bulk stats either,
+        // so this still falls back to the bare "loading price…" text.
+        assert!(text.contains("loading price"), "{text}");
+        assert_eq!(v, None);
+    }
+
+    #[test]
+    fn riven_group_bulk_price_prefers_the_higher_of_rerolled_and_unrolled() {
+        let bulk = wf_relic::RivenBulkStats::from_entries_for_test(vec![
+            (wf_relic::RivenModCategory::Pistol, "Resolved Weapon".to_string(), false, 30),
+            (wf_relic::RivenModCategory::Pistol, "Resolved Weapon".to_string(), true, 90),
+        ]);
+        let group = test_group("resolved_unique", "Resolved Weapon");
+        assert_eq!(riven_group_bulk_price(&bulk, &group), Some(90));
     }
 }
