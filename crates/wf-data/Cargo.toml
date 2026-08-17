@@ -13,3 +13,7 @@ reqwest.workspace = true
 tracing.workspace = true
 time.workspace = true
 fastrand.workspace = true
+# Only `rate_limit`'s `TokenBucket::acquire` needs this (`tokio::time::sleep`,
+# ADR-0020) — every other module here is synchronous-free-function-over-
+# `reqwest` async, with no runtime dependency of its own.
+tokio.workspace = true

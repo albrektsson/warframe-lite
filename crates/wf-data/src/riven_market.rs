@@ -15,11 +15,23 @@
 //! `/orders` endpoint now 403s (see `market.rs`'s doc). The weapon catalogue
 //! (`weapon_catalogue`), by contrast, *is* v2.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use serde::Deserialize;
 use time::OffsetDateTime;
 
+use crate::rate_limit::TokenBucket;
+
 const V1_BASE: &str = "https://api.warframe.market/v1";
 const V2_BASE: &str = "https://api.warframe.market/v2";
+/// `/v1/auctions/search`'s own budget (ADR-0020) — warframe.market documents
+/// a general 3 req/s budget across the API, but a much tighter ~10-20 req/min
+/// budget specifically for this endpoint (confirmed live, 2026-08-15, per
+/// `docs/research/warframe-market-riven-pricing-api.md`). 15/min sits in the
+/// middle of that range.
+const AUCTIONS_SEARCH_RATE_CAPACITY: u32 = 15;
+const AUCTIONS_SEARCH_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 /// One entry from `/v2/riven/weapons` — the catalogue a Riven type's
 /// `weapon_url_name` slug comes from, distinct from [`crate::market`]'s
@@ -182,11 +194,20 @@ struct AuctionsResponse {
     payload: AuctionsPayload,
 }
 
-/// A warframe.market riven-auction client bound to a platform.
+/// A warframe.market riven-auction client bound to a platform. Cheap to
+/// clone (both `reqwest::Client` and the rate limiter are internally
+/// `Arc`-backed) — callers that need [`auctions_for`](Self::auctions_for)'s
+/// rate limit to actually hold across a whole session (rather than resetting
+/// every time a fresh client is built) should construct one instance and
+/// clone it, not call [`new`](Self::new) again per call site.
 #[derive(Clone)]
 pub struct RivenMarketClient {
     client: reqwest::Client,
     platform: String,
+    /// Scoped to `auctions_for` specifically (ADR-0020) — shared, `Arc`-held
+    /// state so every clone of this client throttles against the same
+    /// budget, since a fresh bucket per clone would defeat the point.
+    rate_limiter: Arc<TokenBucket>,
 }
 
 impl RivenMarketClient {
@@ -194,6 +215,10 @@ impl RivenMarketClient {
         Self {
             client,
             platform: platform.into(),
+            rate_limiter: Arc::new(TokenBucket::new(
+                AUCTIONS_SEARCH_RATE_CAPACITY,
+                AUCTIONS_SEARCH_RATE_WINDOW,
+            )),
         }
     }
 
@@ -203,7 +228,14 @@ impl RivenMarketClient {
     /// live — see the research doc §5); this returns whatever the API gives
     /// back, capping/trimming is the caller's concern (see
     /// `wf_relic::riven_pricing`).
+    ///
+    /// Blocks under `rate_limiter` (ADR-0020) before firing the request —
+    /// underneath any concurrency cap a caller applies across several
+    /// weapons at once (e.g. `wf-browse`'s `PRICE_FETCH_CONCURRENCY`-wide
+    /// `buffer_unordered`), so a burst across many distinct weapons still
+    /// can't exceed this endpoint's own tighter budget.
     pub async fn auctions_for(&self, weapon_url_name: &str) -> anyhow::Result<Vec<RivenAuction>> {
+        self.rate_limiter.acquire().await;
         let url = format!("{V1_BASE}/auctions/search");
         tracing::debug!("GET {url}?type=riven&weapon_url_name={weapon_url_name}");
         let resp = self

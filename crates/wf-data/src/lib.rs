@@ -11,6 +11,7 @@ pub mod items;
 pub mod market;
 pub mod poll;
 pub mod polarity;
+pub mod rate_limit;
 pub mod riven_market;
 pub mod worldstate;
 

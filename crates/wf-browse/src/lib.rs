@@ -77,6 +77,17 @@ const LAZY_PRICE_RETRY_COOLDOWN: Duration = Duration::from_secs(45);
 /// consecutive failure up to this cap, rather than retrying at the same
 /// fixed 45s forever.
 const LAZY_PRICE_RETRY_CAP: Duration = Duration::from_secs(600);
+/// Per-request timeout for [`fetch_riven_verdicts`], wider than
+/// [`wf_relic::PriceOpts::default`]'s 2.5s. Unlike relic/Set price fetches,
+/// `RivenMarketClient::auctions_for` now blocks under its own token-bucket
+/// rate limiter (ADR-0020, ~15 req/min) before firing each request, so a
+/// request queued behind that limiter needs headroom beyond a bare network
+/// round trip to still count as a real success rather than a spurious
+/// timeout. Not sized to cover every possible queue depth — anything still
+/// unresolved after this falls through to `fetch_riven_verdicts`'s own
+/// backed-off in-batch retry, and beyond that to
+/// [`BrowseApp::ensure_riven_verdicts`]'s per-item lazy cooldown.
+const RIVEN_VERDICT_FETCH_TIMEOUT: Duration = Duration::from_secs(6);
 /// How many relic badges the Relics & Plan tab's "relics you own that can
 /// still drop it" cell shows before collapsing the rest into a "+N more"
 /// label (mirroring [`worst_off_part_cell`]'s "+N more" pattern). A part
@@ -435,6 +446,12 @@ pub fn run() -> eframe::Result<()> {
     // fold a snapshot into `Live::compute` every tick).
     let relic_prices: LazyPriceMap = Arc::new(Mutex::new(HashMap::new()));
     let set_prices: LazyPriceMap = Arc::new(Mutex::new(HashMap::new()));
+    // The Rivens tab's own client (ADR-0020) — built once here, not per
+    // fetch, so its token-bucket rate limiter persists for the whole
+    // session (see `BrowseApp::riven_market`'s doc). `load_data` never calls
+    // `auctions_for`, so this isn't shared with `load_and_poll`.
+    let riven_market =
+        wf_data::riven_market::RivenMarketClient::new(client.clone(), market_platform.clone());
     // `load_data` (catalogue/mastery/quantity fetches, plus a price lookup per
     // owned relic) runs in the background rather than blocking the window
     // from opening at all — see the module docs and `BrowseApp`'s "Loading…"
@@ -482,6 +499,7 @@ pub fn run() -> eframe::Result<()> {
                 market_platform,
                 relic_prices,
                 set_prices,
+                riven_market,
                 settings_config,
                 config_path,
             )))
@@ -672,15 +690,6 @@ struct Prices {
     farm: HashMap<String, Option<u32>>,
     set: HashMap<String, Option<u32>>,
     ducats: HashMap<String, Option<u32>>,
-    /// The Rivens tab's per-owned-weapon Floor/Ceiling/Verdict, keyed by
-    /// `weapon_unique_name` (DE's own id — the same string
-    /// [`DecodedRiven::weapon_unique_name`] carries) rather than the
-    /// warframe.market slug, since that's what a [`RivenGroup`] already
-    /// groups by. Resolved once in [`load_data`], same "fetched at launch,
-    /// not re-fetched on poll" rule as `ducats` (a newly mem-scanned riven
-    /// of an already-priced weapon shows its Verdict immediately; a riven of
-    /// a brand-new weapon waits for the next launch).
-    riven_verdicts: HashMap<String, RivenTypeVerdict>,
 }
 
 /// The Relics EV tab's lazy, on-expand pricing state for one relic — `None`
@@ -765,6 +774,48 @@ fn snapshot_prices(map: &LazyPriceMap) -> HashMap<String, Option<u32>> {
         .collect()
 }
 
+/// The Rivens tab's lazily-fetched, auto-retrying per-weapon Verdict
+/// (ADR-0020) — mirrors [`LazyPrice`]'s exact shape and rationale (`Loading`
+/// while a fetch is in flight; `Ready`'s `verdict: None` case is a fetch that
+/// resolved with nothing to show — a failed live fetch with no stale cache
+/// to fall back on — and records when, so [`needs_fetch_verdict`] knows when
+/// the retry cooldown has elapsed; `consecutive_failures` backs that cooldown
+/// off past [`LAZY_PRICE_RETRY_COOLDOWN`] the same way `LazyPrice`'s does —
+/// see its doc for the full rationale, not repeated here). Kept as its own
+/// type rather than reusing [`LazyPrice`]: ADR-0020 scopes this work away
+/// from the Relics & Plan tab's existing lazy-price machinery, and a Verdict
+/// (a struct) isn't a `plat`-shaped `Option<u32>` anyway.
+#[derive(Clone, Copy)]
+enum LazyVerdict {
+    Loading,
+    Ready { verdict: Option<RivenTypeVerdict>, resolved_at: Instant, consecutive_failures: u32 },
+}
+
+/// Shared between the UI thread (which triggers fetches from
+/// [`BrowseApp::rivens_tab`] and reads them back every frame) and the
+/// background task each fetch is spawned onto — keyed by
+/// `weapon_unique_name`. Unlike [`LazyPriceMap`], never folded into
+/// `Live::compute`/`poll`: nothing besides the Rivens tab's own render reads
+/// a Verdict, so there's no snapshot-into-planning-layer step to mirror here.
+type LazyVerdictMap = Arc<Mutex<HashMap<String, LazyVerdict>>>;
+
+/// Mirrors [`needs_fetch`] exactly, over [`LazyVerdict`] instead of
+/// [`LazyPrice`] — see its doc for the decision this makes and why.
+fn needs_fetch_verdict(current: Option<&LazyVerdict>, now: Instant) -> bool {
+    match current {
+        None => true,
+        Some(LazyVerdict::Ready { verdict: None, resolved_at, consecutive_failures }) => {
+            let cooldown = wf_data::poll::backoff_interval(
+                LAZY_PRICE_RETRY_COOLDOWN,
+                *consecutive_failures,
+                LAZY_PRICE_RETRY_CAP,
+            );
+            now.duration_since(*resolved_at) >= cooldown
+        }
+        _ => false,
+    }
+}
+
 /// The Relics EV tab's per-row read-only lookups, bundled (mirroring
 /// [`wf_relic::RelicContext`]) so [`BrowseApp::relic_ev_row`] doesn't carry
 /// them as separate parameters.
@@ -801,6 +852,14 @@ struct RelicsTabData {
     unmastered_primes: Vec<String>,
     index: Arc<RelicIndex>,
     item_index: Arc<ItemIndex>,
+}
+
+/// The Rivens tab's per-frame snapshot from [`Loaded`] (mirrors
+/// [`RelicsTabData`]) — bundled since it needs both the owned-riven groups
+/// and the weapon → market-slug map to compute [`riven_verdict_targets`].
+struct RivensTabData {
+    groups: Vec<RivenGroup>,
+    riven_slug_by_weapon: Arc<HashMap<String, String>>,
 }
 
 /// The Relics & Plan / Sell / Farm tabs' data — refreshed periodically by
@@ -855,38 +914,33 @@ struct Live {
     /// set: it's driven by `PartQuantities`/mastery, not owned-relic
     /// evidence.
     unmastered_primes: Vec<String>,
-    /// The Rivens tab's data, grouped by owned weapon and Verdict-attached —
-    /// recomputed each poll tick against the same launch-time
-    /// `Prices::riven_verdicts` (mirrors `ducat_picks`'s same "recompute
-    /// ranking, don't refetch price" rule).
+    /// The Rivens tab's data, grouped by owned weapon — recomputed each poll
+    /// tick from the latest owned-riven scan. Each group's Verdict is *not*
+    /// carried here (ADR-0020): it's fetched lazily and read
+    /// straight from [`LazyVerdictMap`] at render time (see
+    /// [`BrowseApp::rivens_tab`]), the same reason `Live::compute`'s
+    /// snapshot of `LazyPriceMap` isn't baked into `PrimePlan`/`RelicPick`
+    /// either — reading the map directly means a just-landed Verdict shows
+    /// the frame it lands, not up to [`POLL_INTERVAL`] later.
     riven_groups: Vec<RivenGroup>,
 }
 
-/// Every Unveiled riven the player owns of one weapon, plus that weapon's
-/// Floor/Ceiling/Verdict (a group-level fact per CONTEXT.md's Verdict entry
-/// — computed once for the group, not per copy). The Rivens tab's grouped-
-/// by-type layout (`docs/specs/riven-browse-tab.md` §4) renders one of
-/// these per collapsing section.
+/// Every Unveiled riven the player owns of one weapon (a group-level fact
+/// per CONTEXT.md's Verdict entry — computed once for the group, not per
+/// copy, but the Verdict itself lives in [`LazyVerdictMap`], not here — see
+/// [`Live::riven_groups`]'s doc). The Rivens tab's grouped-by-type layout
+/// (`docs/specs/riven-browse-tab.md` §4) renders one of these per collapsing
+/// section.
 #[derive(Clone)]
 struct RivenGroup {
     weapon_name: String,
     weapon_unique_name: String,
-    /// `None` when the weapon has no cached Verdict yet — a weapon newly
-    /// mem-scanned since launch (see `Prices::riven_verdicts`'s doc), not an
-    /// "insufficient data" abstain (that's [`RivenTypeVerdict::verdict`]
-    /// being [`RivenVerdict::InsufficientData`], a distinct, already-priced
-    /// state).
-    verdict: Option<RivenTypeVerdict>,
     rivens: Vec<DecodedRiven>,
 }
 
-/// Group `owned` by [`DecodedRiven::weapon_unique_name`], attaching each
-/// group's Verdict from `verdicts` — sorted by weapon name for a stable,
-/// scan-order-independent render.
-fn group_owned_rivens(
-    owned: &OwnedRivens,
-    verdicts: &HashMap<String, RivenTypeVerdict>,
-) -> Vec<RivenGroup> {
+/// Group `owned` by [`DecodedRiven::weapon_unique_name`] — sorted by weapon
+/// name for a stable, scan-order-independent render.
+fn group_owned_rivens(owned: &OwnedRivens) -> Vec<RivenGroup> {
     let mut groups: Vec<RivenGroup> = Vec::new();
     for riven in owned {
         match groups.iter_mut().find(|g| g.weapon_unique_name == riven.weapon_unique_name) {
@@ -894,7 +948,6 @@ fn group_owned_rivens(
             None => groups.push(RivenGroup {
                 weapon_name: riven.weapon_name.clone(),
                 weapon_unique_name: riven.weapon_unique_name.clone(),
-                verdict: verdicts.get(&riven.weapon_unique_name).copied(),
                 rivens: vec![riven.clone()],
             }),
         }
@@ -925,6 +978,14 @@ struct Loaded {
     /// The item catalogue, for the Relics EV tab's on-demand ducat-value and
     /// market-slug lookups (see `BrowseApp::spawn_relic_price_fetch`).
     item_index: Arc<ItemIndex>,
+    /// warframe.market's riven-eligible weapon catalogue, `game_ref` (=
+    /// [`DecodedRiven::weapon_unique_name`]) → market slug — for the Rivens
+    /// tab's lazy Verdict fetch target set (see
+    /// [`riven_verdict_targets`]/ADR-0020). Small (~400 entries) and fetched
+    /// fresh each launch rather than disk-cached (see [`load_data`]), same as
+    /// `active_tiers`'s worldstate fetch; kept here (not re-fetched lazily
+    /// itself) since it isn't the endpoint ADR-0020 rate-limits.
+    riven_slug_by_weapon: Arc<HashMap<String, String>>,
 }
 
 /// Lock `m`, recovering the guard even if a previous holder panicked while
@@ -991,7 +1052,7 @@ impl Live {
             .map(|e| index.all().iter().filter(|r| e.contains_key(&r.display)).map(|r| r.slug()).collect())
             .unwrap_or_default();
         let unmastered_primes = wf_relic::unmastered_primes(quantities, mastery);
-        let riven_groups = group_owned_rivens(owned_rivens, &prices.riven_verdicts);
+        let riven_groups = group_owned_rivens(owned_rivens);
         Self {
             plans,
             sell_picks,
@@ -1032,11 +1093,13 @@ async fn load_and_poll(
         mut prices,
         part_market,
         item_index,
+        riven_slug_by_weapon,
     } = load_data(&config).await;
     let quantities = Arc::new(quantities);
     let part_market = Arc::new(part_market);
     let index = Arc::new(index);
     let item_index = Arc::new(item_index);
+    let riven_slug_by_weapon = Arc::new(riven_slug_by_weapon);
     let mastery_rows = wf_relic::mastery_browser(&index, &mastery);
     let static_data =
         StaticData { index: &index, mastery: &mastery, quantities: &quantities, part_market: &part_market };
@@ -1061,6 +1124,7 @@ async fn load_and_poll(
         part_market: part_market.clone(),
         index: index.clone(),
         item_index: item_index.clone(),
+        riven_slug_by_weapon,
     });
 
     poll(PollArgs {
@@ -1191,6 +1255,10 @@ struct LoadedData {
     /// pricing lookups) for the Relics EV tab's on-demand ducat/market-slug
     /// lookups.
     item_index: ItemIndex,
+    /// warframe.market's riven-eligible weapon catalogue slug map — see
+    /// [`Loaded::riven_slug_by_weapon`]'s doc for why this stays eager while
+    /// the Verdict fetch itself (ADR-0020) doesn't.
+    riven_slug_by_weapon: HashMap<String, String>,
 }
 
 /// Look up a bounded-concurrency batch of market prices, keyed by whatever
@@ -1253,59 +1321,48 @@ where
 }
 
 /// Look up a bounded-concurrency batch of riven Floor/Ceiling/Verdicts, one
-/// per distinct owned weapon — mirrors [`fetch_prices`]'s exact pattern
-/// (same concurrency cap, same cache-first/timeout-falls-back-to-stale
-/// behavior via [`wf_relic::cached_riven_verdict_status`], same backed-off
-/// in-batch retry for an item that failed with nothing to fall back on —
-/// see [`fetch_prices`]'s doc), just keyed by `weapon_unique_name` instead
-/// of a market item slug. A weapon absent from `slug_by_weapon` (not in
-/// warframe.market's riven-weapon catalogue at all) is skipped — nothing to
-/// query.
+/// per `(weapon_unique_name, weapon_url_name slug)` pair — mirrors
+/// [`fetch_prices`]'s exact pattern (same concurrency cap, same
+/// cache-first/timeout-falls-back-to-stale behavior via
+/// [`wf_relic::cached_riven_verdict_status`], same backed-off in-batch retry
+/// for an item that failed with nothing to fall back on, and — like
+/// [`fetch_prices`] — reports each item's [`wf_relic::FetchStatus`] alongside
+/// its result rather than silently dropping failures, so
+/// [`BrowseApp::ensure_riven_verdicts`] can track `consecutive_failures` the
+/// same way [`BrowseApp::ensure_lazy_prices`] does). Slugs are resolved by
+/// the caller (see [`riven_verdict_targets`]) rather than here — the lazy
+/// trigger already needs the slug map to compute its target set, so there's
+/// no reason to look it up a second time here.
 async fn fetch_riven_verdicts(
-    weapon_unique_names: Vec<String>,
-    slug_by_weapon: &HashMap<String, String>,
+    inputs: Vec<(String, String)>,
     cache: &wf_relic::RivenPriceCache,
     market: &wf_data::riven_market::RivenMarketClient,
-) -> HashMap<String, RivenTypeVerdict> {
-    // Resolved synchronously, before entering the stream — a slug lookup is
-    // cheap and borrowing `slug_by_weapon` across the stream's own futures
-    // would tie their lifetime to this call, which `tokio::spawn`'s `'static`
-    // bound (see `load_and_poll`'s caller) doesn't allow.
-    let mut pending: Vec<(String, String)> = weapon_unique_names
-        .into_iter()
-        .filter_map(|weapon_unique_name| {
-            slug_by_weapon.get(&weapon_unique_name).cloned().map(|slug| (weapon_unique_name, slug))
-        })
-        .collect();
-
-    let mut resolved: HashMap<String, RivenTypeVerdict> = HashMap::new();
+) -> HashMap<String, (Option<RivenTypeVerdict>, wf_relic::FetchStatus)> {
+    let mut pending: Vec<(String, String)> = inputs;
+    let mut resolved: HashMap<String, (Option<RivenTypeVerdict>, wf_relic::FetchStatus)> = HashMap::new();
     let mut attempt: u32 = 0;
+    // Wider than the default 2.5s (see [`RIVEN_VERDICT_FETCH_TIMEOUT`]'s doc)
+    // — `auctions_for` now queues under its own rate limiter (ADR-0020)
+    // before firing each request.
+    let opts = wf_relic::PriceOpts { fetch_timeout: RIVEN_VERDICT_FETCH_TIMEOUT, ..wf_relic::PriceOpts::default() };
     loop {
         let batch = std::mem::take(&mut pending);
         let results: Vec<(String, String, Option<RivenTypeVerdict>, wf_relic::FetchStatus)> =
             stream::iter(batch)
                 .map(|(weapon_unique_name, slug)| async move {
-                    let (verdict, status) = wf_relic::cached_riven_verdict_status(
-                        cache,
-                        market,
-                        &slug,
-                        wf_relic::PriceOpts::default(),
-                    )
-                    .await;
+                    let (verdict, status) =
+                        wf_relic::cached_riven_verdict_status(cache, market, &slug, opts).await;
                     (weapon_unique_name, slug, verdict, status)
                 })
                 .buffer_unordered(PRICE_FETCH_CONCURRENCY)
                 .collect()
                 .await;
         for (weapon_unique_name, slug, verdict, status) in results {
-            match verdict {
-                Some(v) => {
-                    resolved.insert(weapon_unique_name, v);
-                }
-                None if status == wf_relic::FetchStatus::Failed && attempt < BATCH_FETCH_RETRIES => {
-                    pending.push((weapon_unique_name, slug));
-                }
-                None => {}
+            if verdict.is_none() && status == wf_relic::FetchStatus::Failed && attempt < BATCH_FETCH_RETRIES
+            {
+                pending.push((weapon_unique_name, slug));
+            } else {
+                resolved.insert(weapon_unique_name, (verdict, status));
             }
         }
         if pending.is_empty() {
@@ -1425,11 +1482,15 @@ async fn load_data(config: &Config) -> LoadedData {
 
     cache.save();
 
-    // Rivens-tab pricing: one Floor/Ceiling/Verdict per distinct owned
-    // weapon, resolved once at launch like every other owned-driven price
-    // above. The weapon catalogue itself (`/v2/riven/weapons`) is small
-    // (~400 entries) and fetched fresh each launch rather than disk-cached,
-    // same as `active_tiers`'s worldstate fetch above.
+    // The Rivens tab's weapon → market-slug map, for its lazy Verdict fetch
+    // target set (see `riven_verdict_targets`/ADR-0020). The Verdict fetch
+    // itself (`/v1/auctions/search`, one call per distinct owned weapon) is
+    // lazy-on-view with its own rate limiter (ADR-0020), same as relic/Set
+    // prices under ADR-0012, and so isn't triggered from here. The weapon
+    // catalogue (`/v2/riven/weapons`) isn't the endpoint that rate limit
+    // scopes to, and is small (~400 entries), so it stays fetched fresh each
+    // launch rather than disk-cached, same as `active_tiers`'s worldstate
+    // fetch above.
     let riven_weapons = wf_data::riven_market::weapon_catalogue(&client, &config.market_platform)
         .await
         .unwrap_or_else(|e| {
@@ -1438,25 +1499,6 @@ async fn load_data(config: &Config) -> LoadedData {
         });
     let riven_slug_by_weapon: HashMap<String, String> =
         riven_weapons.into_iter().map(|w| (w.game_ref, w.slug)).collect();
-    let riven_market =
-        wf_data::riven_market::RivenMarketClient::new(client.clone(), config.market_platform.clone());
-    let riven_price_cache = wf_relic::riven_price_cache();
-    let distinct_owned_weapons: Vec<String> = {
-        let mut seen = HashSet::new();
-        owned_rivens
-            .iter()
-            .filter(|r| seen.insert(r.weapon_unique_name.clone()))
-            .map(|r| r.weapon_unique_name.clone())
-            .collect()
-    };
-    let riven_verdicts = fetch_riven_verdicts(
-        distinct_owned_weapons,
-        &riven_slug_by_weapon,
-        &riven_price_cache,
-        &riven_market,
-    )
-    .await;
-    riven_price_cache.save();
 
     let part_market = wf_relic::part_market_info(&quantities, &item_index);
 
@@ -1469,15 +1511,10 @@ async fn load_data(config: &Config) -> LoadedData {
         mem_scanned_parts,
         owned_rivens,
         active_tiers,
-        prices: Prices {
-            sell: HashMap::new(),
-            farm: farm_prices,
-            set: HashMap::new(),
-            ducats: ducat_prices,
-            riven_verdicts,
-        },
+        prices: Prices { sell: HashMap::new(), farm: farm_prices, set: HashMap::new(), ducats: ducat_prices },
         part_market,
         item_index,
+        riven_slug_by_weapon,
     }
 }
 
@@ -1753,6 +1790,18 @@ struct BrowseApp {
     /// first render of [`Self::rivens_tab`] — `None` until then, since
     /// loading needs an `egui::Context` that isn't available in [`Self::new`].
     polarity_icons: Option<PolarityIcons>,
+    /// The Rivens tab's lazy, auto-retrying per-weapon Verdict fetch state
+    /// (ADR-0020, mirrors `relics_plan_relic_prices`/`.set_prices` above) —
+    /// see [`LazyVerdict`]. Not shared with `load_and_poll`/`poll`: nothing
+    /// outside this tab's own render ever reads a Verdict.
+    riven_verdicts: LazyVerdictMap,
+    /// Bound to `client`/`market_platform` above, but kept as its own
+    /// long-lived client (rather than built fresh per fetch, unlike
+    /// `ensure_lazy_prices`'s `MarketClient`) because it carries its own
+    /// token-bucket rate limiter (ADR-0020) that must persist for the whole
+    /// session — a fresh client per fetch would reset that budget on every
+    /// tab re-render instead of throttling it session-wide.
+    riven_market: wf_data::riven_market::RivenMarketClient,
 }
 
 impl BrowseApp {
@@ -1765,6 +1814,7 @@ impl BrowseApp {
         market_platform: String,
         relics_plan_relic_prices: LazyPriceMap,
         relics_plan_set_prices: LazyPriceMap,
+        riven_market: wf_data::riven_market::RivenMarketClient,
         config: Config,
         config_path: PathBuf,
     ) -> Self {
@@ -1805,6 +1855,8 @@ impl BrowseApp {
             dragging_placement: false,
             drag_offset: egui::Vec2::ZERO,
             polarity_icons: None,
+            riven_verdicts: Arc::new(Mutex::new(HashMap::new())),
+            riven_market,
         }
     }
 
@@ -1923,6 +1975,60 @@ impl BrowseApp {
                     }
                 };
                 guard.insert(key, LazyPrice::Ready { plat, resolved_at, consecutive_failures });
+            }
+        });
+    }
+
+    /// Mirrors [`Self::ensure_lazy_prices`] exactly (see its doc for the full
+    /// rationale) — the Rivens tab's lazy, auto-retrying Verdict fetch
+    /// (ADR-0020), called every frame [`Self::rivens_tab`] renders. `needed`
+    /// pairs are `(weapon_unique_name, weapon_url_name slug)`, from
+    /// [`riven_verdict_targets`]. Unlike `ensure_lazy_prices`, reuses
+    /// `self.riven_market` rather than building a fresh client per call —
+    /// see [`Self::riven_market`]'s doc for why that matters here
+    /// specifically (its rate limiter must persist across calls).
+    fn ensure_riven_verdicts(&self, needed: Vec<(String, String)>) {
+        let now = Instant::now();
+        let map = &self.riven_verdicts;
+        let mut to_fetch: Vec<(String, String)> = Vec::new();
+        let mut prev_failures: HashMap<String, u32> = HashMap::new();
+        {
+            let mut guard = map.lock().unwrap_or_else(|p| p.into_inner());
+            for (weapon_unique_name, slug) in needed {
+                if needs_fetch_verdict(guard.get(&weapon_unique_name), now) {
+                    if let Some(LazyVerdict::Ready { consecutive_failures, .. }) =
+                        guard.get(&weapon_unique_name)
+                    {
+                        prev_failures.insert(weapon_unique_name.clone(), *consecutive_failures);
+                    }
+                    guard.insert(weapon_unique_name.clone(), LazyVerdict::Loading);
+                    to_fetch.push((weapon_unique_name, slug));
+                }
+            }
+        }
+        if to_fetch.is_empty() {
+            return;
+        }
+
+        let map = map.clone();
+        let market = self.riven_market.clone();
+        self.rt_handle.spawn(async move {
+            let cache = wf_relic::riven_price_cache();
+            let resolved = fetch_riven_verdicts(to_fetch, &cache, &market).await;
+            cache.save();
+            let resolved_at = Instant::now();
+            let mut guard = map.lock().unwrap_or_else(|p| p.into_inner());
+            for (weapon_unique_name, (verdict, status)) in resolved {
+                let consecutive_failures = match status {
+                    wf_relic::FetchStatus::Ok => 0,
+                    wf_relic::FetchStatus::Failed => {
+                        prev_failures.get(&weapon_unique_name).copied().unwrap_or(0) + 1
+                    }
+                };
+                guard.insert(
+                    weapon_unique_name,
+                    LazyVerdict::Ready { verdict, resolved_at, consecutive_failures },
+                );
             }
         });
     }
@@ -2955,7 +3061,12 @@ impl BrowseApp {
     /// variant switcher (issue #99), though the layout itself (Variant C,
     /// the winning prototype) is unchanged.
     fn rivens_tab(&mut self, ui: &mut egui::Ui) {
-        let Some(groups) = self.loaded_or_placeholder(ui, |l| l.live.riven_groups.clone()) else {
+        let Some(RivensTabData { groups, riven_slug_by_weapon }) = self.loaded_or_placeholder(ui, |l| {
+            RivensTabData {
+                groups: l.live.riven_groups.clone(),
+                riven_slug_by_weapon: l.riven_slug_by_weapon.clone(),
+            }
+        }) else {
             return;
         };
 
@@ -2964,26 +3075,18 @@ impl BrowseApp {
             return;
         }
 
+        // Fire (or retry) this tab's lazy Verdict fetch every frame it
+        // renders (ADR-0020, mirrors `ensure_lazy_prices` — see its doc):
+        // cheap, since `ensure_riven_verdicts` only spawns a fetch for a
+        // weapon that's not already `Loading` or still on cooldown.
+        self.ensure_riven_verdicts(riven_verdict_targets(&groups, &riven_slug_by_weapon));
+
         let icons = &*self.polarity_icons.get_or_insert_with(|| PolarityIcons::load(ui.ctx()));
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             for group in &groups {
-                let header_text = match &group.verdict {
-                    Some(v) => format!(
-                        "{}  —  Floor {} · Ceiling {} · {}  ({} owned)",
-                        group.weapon_name,
-                        floor_str(v.floor),
-                        ceiling_str(v.ceiling, v.ceiling_low_confidence),
-                        verdict_label(v.verdict),
-                        group.rivens.len()
-                    ),
-                    None => format!(
-                        "{}  —  price not yet fetched  ({} owned)",
-                        group.weapon_name,
-                        group.rivens.len()
-                    ),
-                };
-                let color = group.verdict.map(|v| verdict_color(v.verdict)).unwrap_or(UNMASTERED_COLOR);
+                let (header_text, verdict) = riven_verdict_header_text(&self.riven_verdicts, group);
+                let color = verdict.map(verdict_color).unwrap_or(UNMASTERED_COLOR);
 
                 egui::CollapsingHeader::new(egui::RichText::new(header_text).color(color))
                     .default_open(true)
@@ -3678,6 +3781,52 @@ fn set_price_targets(unmastered_primes: &[String], item_index: &ItemIndex) -> Ve
         .collect()
 }
 
+/// Every distinct owned weapon with a resolvable warframe.market slug — the
+/// [`BrowseApp::ensure_riven_verdicts`] input for the Rivens tab's lazy
+/// Verdict fetch (ADR-0020), mirroring [`set_price_targets`]'s role for Set
+/// prices. A weapon absent from `riven_slug_by_weapon` (not in
+/// warframe.market's riven-weapon catalogue at all) is skipped — nothing to
+/// query.
+fn riven_verdict_targets(
+    groups: &[RivenGroup],
+    riven_slug_by_weapon: &HashMap<String, String>,
+) -> Vec<(String, String)> {
+    groups
+        .iter()
+        .filter_map(|g| {
+            riven_slug_by_weapon.get(&g.weapon_unique_name).map(|slug| (g.weapon_unique_name.clone(), slug.clone()))
+        })
+        .collect()
+}
+
+/// Rivens tab: header text and Verdict (for [`verdict_color`]) for one
+/// [`RivenGroup`], sourced from its lazily-fetched [`LazyVerdictMap`] entry
+/// (ADR-0020) — mirrors [`lazy_price_str`]'s three explicit states (loading,
+/// genuinely-still-unresolved, resolved) rather than the old plain
+/// `Option<RivenTypeVerdict>` field this replaced. Reads `map` directly
+/// rather than a `Live`-computed snapshot, for the same reason
+/// `lazy_price_str` does (see its doc): a just-landed Verdict shows the
+/// frame it lands, not up to [`POLL_INTERVAL`] later.
+fn riven_verdict_header_text(map: &LazyVerdictMap, group: &RivenGroup) -> (String, Option<RivenVerdict>) {
+    let owned = group.rivens.len();
+    match map.lock().unwrap_or_else(|p| p.into_inner()).get(&group.weapon_unique_name) {
+        Some(LazyVerdict::Ready { verdict: Some(v), .. }) => (
+            format!(
+                "{}  —  Floor {} · Ceiling {} · {}  ({owned} owned)",
+                group.weapon_name,
+                floor_str(v.floor),
+                ceiling_str(v.ceiling, v.ceiling_low_confidence),
+                verdict_label(v.verdict),
+            ),
+            Some(v.verdict),
+        ),
+        Some(LazyVerdict::Ready { verdict: None, .. }) => {
+            (format!("{}  —  price unavailable  ({owned} owned)", group.weapon_name), None)
+        }
+        _ => (format!("{}  —  loading price…  ({owned} owned)", group.weapon_name), None),
+    }
+}
+
 /// A relic's market slug by its exact display label (e.g. `"Axi H3"`) — the
 /// key the Relics & Plan/Sell tabs' relic-level [`LazyPriceMap`] uses.
 /// Exact-match only, unlike [`RelicIndex::best_match`]'s fuzzy OCR lookup:
@@ -3848,6 +3997,7 @@ mod tests {
             "pc".to_string(),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
+            wf_data::riven_market::RivenMarketClient::new(wf_data::http_client(), "pc"),
             Config::default(),
             PathBuf::from("config.toml"),
         );
@@ -3982,5 +4132,115 @@ mod tests {
             LazyPrice::Ready { plat: Some(30), resolved_at: Instant::now(), consecutive_failures: 0 },
         )])));
         assert_eq!(lazy_price_str(&map, "axi_h3_relic"), "30p");
+    }
+
+    // ADR-0020: `needs_fetch_verdict` mirrors `needs_fetch` exactly (see the
+    // tests above for the pattern), just over `LazyVerdict`.
+
+    #[test]
+    fn needs_fetch_verdict_when_never_attempted() {
+        assert!(needs_fetch_verdict(None, Instant::now()));
+    }
+
+    #[test]
+    fn needs_fetch_verdict_is_false_while_a_fetch_is_already_in_flight() {
+        assert!(!needs_fetch_verdict(Some(&LazyVerdict::Loading), Instant::now()));
+    }
+
+    #[test]
+    fn needs_fetch_verdict_is_false_once_resolved_even_if_stale() {
+        let resolved_at = Instant::now() - LAZY_PRICE_RETRY_COOLDOWN * 10;
+        let verdict = RivenTypeVerdict {
+            floor: Some(20),
+            ceiling: Some(80),
+            ceiling_low_confidence: false,
+            verdict: wf_relic::RivenVerdict::LikelyKeep,
+        };
+        let ready = LazyVerdict::Ready { verdict: Some(verdict), resolved_at, consecutive_failures: 0 };
+        assert!(!needs_fetch_verdict(Some(&ready), Instant::now()));
+    }
+
+    #[test]
+    fn needs_fetch_verdict_retries_a_failed_fetch_once_the_cooldown_elapses() {
+        let resolved_at = Instant::now();
+        let ready = LazyVerdict::Ready { verdict: None, resolved_at, consecutive_failures: 0 };
+        assert!(!needs_fetch_verdict(Some(&ready), resolved_at + LAZY_PRICE_RETRY_COOLDOWN / 2));
+        assert!(needs_fetch_verdict(Some(&ready), resolved_at + LAZY_PRICE_RETRY_COOLDOWN));
+    }
+
+    #[test]
+    fn needs_fetch_verdict_backs_off_further_on_a_failure_streak() {
+        let resolved_at = Instant::now();
+        let ready = LazyVerdict::Ready { verdict: None, resolved_at, consecutive_failures: 3 };
+        assert!(!needs_fetch_verdict(Some(&ready), resolved_at + LAZY_PRICE_RETRY_COOLDOWN * 2));
+        assert!(needs_fetch_verdict(Some(&ready), resolved_at + Duration::from_secs(360)));
+    }
+
+    fn test_riven(weapon_unique_name: &str, weapon_name: &str) -> DecodedRiven {
+        DecodedRiven {
+            weapon_name: weapon_name.to_string(),
+            weapon_unique_name: weapon_unique_name.to_string(),
+            mod_category: wf_relic::RivenModCategory::Pistol,
+            polarity: None,
+            mastery_req: None,
+            rank: 0,
+            rerolls: 0,
+            stats: Vec::new(),
+        }
+    }
+
+    fn test_group(weapon_unique_name: &str, weapon_name: &str) -> RivenGroup {
+        RivenGroup {
+            weapon_name: weapon_name.to_string(),
+            weapon_unique_name: weapon_unique_name.to_string(),
+            rivens: vec![test_riven(weapon_unique_name, weapon_name)],
+        }
+    }
+
+    #[test]
+    fn riven_verdict_targets_skips_a_weapon_absent_from_the_slug_map() {
+        let groups = vec![test_group("known_unique", "Known"), test_group("unknown_unique", "Unknown")];
+        let slugs = HashMap::from([("known_unique".to_string(), "known_slug".to_string())]);
+        let targets = riven_verdict_targets(&groups, &slugs);
+        assert_eq!(targets, vec![("known_unique".to_string(), "known_slug".to_string())]);
+    }
+
+    #[test]
+    fn riven_verdict_header_text_distinguishes_loading_from_unavailable_from_resolved() {
+        let now = Instant::now();
+        let verdict = RivenTypeVerdict {
+            floor: Some(20),
+            ceiling: Some(80),
+            ceiling_low_confidence: false,
+            verdict: wf_relic::RivenVerdict::LikelyKeep,
+        };
+        let map: LazyVerdictMap = Arc::new(Mutex::new(HashMap::from([
+            (
+                "resolved".to_string(),
+                LazyVerdict::Ready { verdict: Some(verdict), resolved_at: now, consecutive_failures: 0 },
+            ),
+            (
+                "unavailable".to_string(),
+                LazyVerdict::Ready { verdict: None, resolved_at: now, consecutive_failures: 0 },
+            ),
+            ("loading".to_string(), LazyVerdict::Loading),
+        ])));
+
+        let (text, v) = riven_verdict_header_text(&map, &test_group("resolved", "Resolved Weapon"));
+        assert!(text.contains("Floor 20p"), "{text}");
+        assert_eq!(v, Some(wf_relic::RivenVerdict::LikelyKeep));
+
+        let (text, v) = riven_verdict_header_text(&map, &test_group("unavailable", "Unavailable Weapon"));
+        assert!(text.contains("price unavailable"), "{text}");
+        assert_eq!(v, None);
+
+        let (text, v) = riven_verdict_header_text(&map, &test_group("loading", "Loading Weapon"));
+        assert!(text.contains("loading price"), "{text}");
+        assert_eq!(v, None);
+
+        // No entry yet (never triggered) reads the same as `Loading`, not broken.
+        let (text, v) = riven_verdict_header_text(&map, &test_group("never_seen", "Never Seen Weapon"));
+        assert!(text.contains("loading price"), "{text}");
+        assert_eq!(v, None);
     }
 }
