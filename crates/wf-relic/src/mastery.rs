@@ -159,9 +159,26 @@ pub async fn fetch_display_name(
     Ok(name)
 }
 
+/// Base cooldown before retrying a failed profile fetch, doubling per
+/// consecutive failure via [`wf_data::poll::backoff_interval`] (the same
+/// helper `eaef86e` gave the worldstate/riven-price polling loops) and
+/// capped at [`MASTERY_RETRY_CAP`].
+const MASTERY_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// Ceiling on [`MASTERY_RETRY_BASE`]'s backoff — long enough to stop
+/// hammering a blocked/down endpoint, short enough to notice it come back
+/// within a session.
+const MASTERY_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
 /// Load the mastered set from a disk cache when fresh (younger than `ttl`),
-/// otherwise refetch. Falls back to a stale cache on network failure, and to an
-/// empty set if there is nothing cached and the fetch fails.
+/// otherwise refetch. Falls back to a stale cache on network failure (or an
+/// empty set if there is nothing cached), same as before — but a failed
+/// fetch now also persists a retry-backoff marker (see
+/// [`retry_cooldown_remaining`]) to disk, so a *process restart* within the
+/// cooldown window skips the network call instead of re-attempting it: this
+/// function is called fresh on every CLI subcommand invocation and every
+/// tray relaunch, so without persisting the backoff to disk, a user
+/// restarting every few minutes during a DE-side outage would silently
+/// re-hit a blocked endpoint every single time.
 pub async fn load_cached(
     client: &reqwest::Client,
     account_id: &str,
@@ -176,31 +193,75 @@ pub async fn load_cached(
     // under the old bug doesn't keep hiding a mastered sentinel weapon
     // between 450k-900k XP (issue #65).
     let file = format!("mastery-v5-{account_id}.json");
-    if let Some(cached) = wf_cache::load_blob::<MasterySet>(&file) {
+    let cached = wf_cache::load_blob::<MasterySet>(&file);
+    if let Some(cached) = &cached {
         if cached.age() < ttl {
             tracing::info!("mastery from cache ({} items)", cached.value.len());
-            return cached.value;
-        }
-        match fetch(client, account_id).await {
-            Ok(set) => {
-                let _ = wf_cache::save_blob(&file, &set);
-                return set;
-            }
-            Err(e) => {
-                tracing::warn!("mastery refresh failed ({e:#}); using stale cache");
-                return cached.value;
-            }
+            return cached.value.clone();
         }
     }
+
+    if let Some(wait) = retry_cooldown_remaining(account_id) {
+        tracing::info!("mastery refresh skipped (retrying in {wait:?}); using stale cache");
+        return cached.map(|c| c.value).unwrap_or_default();
+    }
+
     match fetch(client, account_id).await {
         Ok(set) => {
             let _ = wf_cache::save_blob(&file, &set);
+            clear_retry_state(account_id);
             set
         }
         Err(e) => {
-            tracing::warn!("mastery fetch failed: {e:#}");
-            MasterySet::default()
+            let failures = record_retry_failure(account_id);
+            tracing::warn!("mastery refresh failed (failure #{failures}: {e:#}); using stale cache");
+            cached.map(|c| c.value).unwrap_or_default()
         }
+    }
+}
+
+/// `<cache_dir>/mastery-fail-<account_id>.json`'s name: a persisted
+/// consecutive-failure counter for `account_id`'s profile fetch, stamped
+/// with when it was last written (via [`wf_cache::save_blob`]'s
+/// [`wf_cache::Stamped`] wrapper) — that timestamp doubles as "when did the
+/// most recent failure happen," which is all [`retry_cooldown_remaining`]
+/// needs.
+fn retry_file(account_id: &str) -> String {
+    format!("mastery-fail-{account_id}.json")
+}
+
+/// How much longer to wait before retrying a failed profile fetch, if a
+/// previous failure's backoff cooldown hasn't elapsed yet. `None` means
+/// either there's no recorded failure, or its cooldown has already passed —
+/// either way, safe to attempt a fetch now.
+fn retry_cooldown_remaining(account_id: &str) -> Option<std::time::Duration> {
+    let stamped = wf_cache::load_blob::<u32>(&retry_file(account_id))?;
+    // `failures - 1` so the *first* failure gets `MASTERY_RETRY_BASE`
+    // (not `2×`) — `backoff_interval` treats `0` as "no failures yet."
+    let cooldown = wf_data::poll::backoff_interval(
+        MASTERY_RETRY_BASE,
+        stamped.value.saturating_sub(1),
+        MASTERY_RETRY_CAP,
+    );
+    let elapsed = stamped.age();
+    (elapsed < cooldown).then(|| cooldown - elapsed)
+}
+
+/// Bump and persist `account_id`'s consecutive-failure count, returning the
+/// new count.
+fn record_retry_failure(account_id: &str) -> u32 {
+    let file = retry_file(account_id);
+    let failures = wf_cache::load_blob::<u32>(&file).map(|s| s.value).unwrap_or(0) + 1;
+    let _ = wf_cache::save_blob(&file, &failures);
+    failures
+}
+
+/// Clear `account_id`'s retry-backoff state after a successful fetch, so the
+/// next failure (whenever it happens) starts its backoff from scratch
+/// instead of picking up where a since-resolved outage left off.
+fn clear_retry_state(account_id: &str) {
+    if let Ok(dir) = wf_cache::cache_dir() {
+        let _ = std::fs::remove_file(dir.join(retry_file(account_id)));
     }
 }
 
@@ -765,5 +826,52 @@ mod tests {
             100_000, // below the weapon cap — not mastered
         )]);
         assert!(!set.is_mastered_by_path("/Lotus/Weapons/Tenno/LongGuns/BratonPrime"));
+    }
+
+    /// Unique per test (and cleaned up after) since these tests hit the real
+    /// on-disk cache dir, same isolation approach as `wf_cache`'s own tests.
+    fn test_account_id(case: &str) -> String {
+        format!("test-{}-{case}", std::process::id())
+    }
+
+    fn cleanup_retry_state(account_id: &str) {
+        clear_retry_state(account_id);
+    }
+
+    #[test]
+    fn retry_cooldown_is_none_with_no_recorded_failure() {
+        let id = test_account_id("no-failure");
+        assert!(retry_cooldown_remaining(&id).is_none());
+    }
+
+    #[test]
+    fn a_recorded_failure_starts_a_cooldown_of_roughly_the_base_interval() {
+        let id = test_account_id("one-failure");
+        assert_eq!(record_retry_failure(&id), 1);
+        let wait = retry_cooldown_remaining(&id).expect("cooldown active right after a failure");
+        // Freshly recorded, so almost the full base interval should remain.
+        assert!(wait > MASTERY_RETRY_BASE - std::time::Duration::from_secs(2));
+        assert!(wait <= MASTERY_RETRY_BASE);
+        cleanup_retry_state(&id);
+    }
+
+    #[test]
+    fn consecutive_failures_double_the_cooldown() {
+        let id = test_account_id("two-failures");
+        record_retry_failure(&id);
+        assert_eq!(record_retry_failure(&id), 2);
+        let wait = retry_cooldown_remaining(&id).expect("cooldown active after a second failure");
+        assert!(wait > MASTERY_RETRY_BASE);
+        assert!(wait <= MASTERY_RETRY_BASE * 2);
+        cleanup_retry_state(&id);
+    }
+
+    #[test]
+    fn clearing_retry_state_lifts_the_cooldown() {
+        let id = test_account_id("cleared");
+        record_retry_failure(&id);
+        assert!(retry_cooldown_remaining(&id).is_some());
+        clear_retry_state(&id);
+        assert!(retry_cooldown_remaining(&id).is_none());
     }
 }
