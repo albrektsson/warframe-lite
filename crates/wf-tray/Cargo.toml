@@ -13,7 +13,13 @@ wf-capture.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-tokio.workspace = true
+# "signal" (SIGTERM/SIGINT handling, see `run`'s cleanup task) on top of the
+# workspace-wide feature set.
+tokio = { workspace = true, features = ["signal"] }
+# PR_SET_PDEATHSIG (see `spawn_self`) so the supervised `overlay` child dies
+# with the tray even if the tray itself never runs any cleanup code (SIGKILL,
+# a crash, etc).
+libc.workspace = true
 # StatusNotifierItem tray via DBus (KDE Plasma). ksni 0.3 is pure-Rust (zbus),
 # so it adds no system dbus/link dependency.
 ksni = "0.3"

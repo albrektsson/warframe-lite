@@ -4185,6 +4185,7 @@ dependencies = [
  "anyhow",
  "image",
  "ksni",
+ "libc",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use ksni::TrayMethods;
+use tokio::signal::unix::{signal, SignalKind};
 
 const POLL: Duration = Duration::from_secs(2);
 /// Consecutive failed presence polls required before treating the game as
@@ -103,6 +104,43 @@ pub async fn run() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("registering tray icon (is a StatusNotifier host running?): {e}"))?;
     tracing::info!("warframe-lite tray running; waiting for the game");
+
+    // The menu's "Quit" item is the only place that calls `stop_overlay()`
+    // (see its `activate` handler below) — but plenty of ways to end this
+    // process skip that click entirely: `kill`/`pkill`, session logout, the
+    // desktop launcher's own "stop app" action. Without a signal handler
+    // those all leave the supervised `overlay` child (a plain
+    // `Command::spawn()`, not double-forked) orphaned to run forever. Catch
+    // SIGTERM/SIGINT here so any of those still stop it before we exit.
+    // `spawn_self`'s `PR_SET_PDEATHSIG` covers the remaining case this can't
+    // (SIGKILL, or a hard crash) by having the kernel signal the child
+    // directly.
+    {
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("failed to install SIGTERM handler: {e}");
+                    return;
+                }
+            };
+            let mut sigint = match signal(SignalKind::interrupt()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("failed to install SIGINT handler: {e}");
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = sigterm.recv() => {}
+                _ = sigint.recv() => {}
+            }
+            tracing::info!("received termination signal; stopping overlay before exit");
+            handle.update(|t: &mut WfTray| t.stop_overlay()).await;
+            std::process::exit(0);
+        });
+    }
 
     // Poll for the game window and drive auto start/stop through the tray state.
     loop {
@@ -393,8 +431,37 @@ fn self_binary() -> PathBuf {
 }
 
 /// Spawn `<self> <args>` and return the child (kept for the supervised overlay).
+///
+/// Arms `PR_SET_PDEATHSIG` in the child so the kernel sends it `SIGTERM`
+/// itself if this (tray) process ever dies without running any cleanup code
+/// — `SIGKILL`, an OOM kill, a hard crash. The tray's own `SIGTERM`/`SIGINT`
+/// handler in [`run`] covers the cases where it gets a chance to run
+/// `stop_overlay()` first; this covers the ones where it doesn't. Belt and
+/// suspenders — either alone would otherwise leave this plain
+/// `Command::spawn()` child (not double-forked) orphaned indefinitely.
 fn spawn_self(args: &[&str]) -> std::io::Result<Child> {
-    std::process::Command::new(self_binary()).args(args).spawn()
+    use std::os::unix::process::CommandExt;
+
+    let parent_pid = std::process::id() as libc::pid_t;
+    let mut cmd = std::process::Command::new(self_binary());
+    cmd.args(args);
+    // SAFETY: the closure only calls async-signal-safe functions (`prctl`,
+    // `getppid`, `raise`) between fork and exec, as required for `pre_exec`.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The parent may have already died between fork() and the
+            // prctl() call above, in which case the death signal was armed
+            // too late to ever fire on its own — catch that race here.
+            if libc::getppid() != parent_pid {
+                libc::raise(libc::SIGTERM);
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn()
 }
 
 /// Fire-and-forget a short `<self> <args>` command, reaping it on a detached
