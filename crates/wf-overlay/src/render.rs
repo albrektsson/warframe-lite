@@ -384,7 +384,7 @@ mod tests {
         assert_eq!(canvas.width, WIDTH);
         assert!(canvas.height > 0);
         // The background alone should make many pixels non-transparent.
-        let opaque = canvas.buf.chunks_exact(4).filter(|p| p[3] > 0).count();
+        let opaque = canvas.buf.as_chunks::<4>().0.iter().filter(|p| p[3] > 0).count();
         assert!(opaque > 100, "expected a visible panel background");
     }
 
@@ -435,7 +435,7 @@ mod tests {
         let font = load_font().expect("a system monospace font");
         let canvas = render_relic_scanning_panel(ScanProgress { seen: 3, confirmed: 1 }, &font);
         assert_eq!(canvas.width, WIDTH);
-        let opaque = canvas.buf.chunks_exact(4).filter(|p| p[3] > 0).count();
+        let opaque = canvas.buf.as_chunks::<4>().0.iter().filter(|p| p[3] > 0).count();
         assert!(opaque > 100, "expected a visible panel background");
     }
 

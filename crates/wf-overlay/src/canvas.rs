@@ -209,7 +209,7 @@ impl Canvas {
             return;
         }
         let f = factor.clamp(0.0, 1.0);
-        for px in self.buf.chunks_exact_mut(4) {
+        for px in self.buf.as_chunks_mut::<4>().0 {
             px[3] = (px[3] as f32 * f).round() as u8;
         }
     }
@@ -217,7 +217,7 @@ impl Canvas {
     /// Pack into premultiplied ARGB8888 (native-endian `0xAARRGGBB`) for wl_shm.
     pub fn to_argb_premul(&self) -> Vec<u8> {
         let mut out = vec![0u8; self.buf.len()];
-        for (i, px) in self.buf.chunks_exact(4).enumerate() {
+        for (i, px) in self.buf.as_chunks::<4>().0.iter().enumerate() {
             let a = px[3] as u32;
             let pm = |ch: u8| ((ch as u32 * a) / 255) as u8;
             let (r, g, b) = (pm(px[0]), pm(px[1]), pm(px[2]));
@@ -306,7 +306,7 @@ mod tests {
         c.draw_mastery_mark(0, 0, w, h, Color::rgb(130, 200, 140));
         let opaque = |x: u32, y: u32| c.buf[((y * w + x) * 4 + 3) as usize] > 0;
         // The wreath draws a meaningful number of pixels…
-        let total = c.buf.chunks_exact(4).filter(|p| p[3] > 0).count();
+        let total = c.buf.as_chunks::<4>().0.iter().filter(|p| p[3] > 0).count();
         assert!(total > 60, "wreath should cover many pixels, got {total}");
         // …and it is left/right symmetric (branches mirror around the centre).
         let left = (0..h).flat_map(|y| (0..w / 2).map(move |x| (x, y))).filter(|&(x, y)| opaque(x, y)).count();
@@ -320,7 +320,7 @@ mod tests {
         let mut c = Canvas::new(w, h);
         c.draw_star_mark(0, 0, w, h, Color::rgb(230, 200, 90));
         let opaque = |x: u32, y: u32| c.buf[((y * w + x) * 4 + 3) as usize] > 0;
-        let total = c.buf.chunks_exact(4).filter(|p| p[3] > 0).count();
+        let total = c.buf.as_chunks::<4>().0.iter().filter(|p| p[3] > 0).count();
         assert!(total > 30, "star should cover a meaningful number of pixels, got {total}");
         let left = (0..h).flat_map(|y| (0..w / 2).map(move |x| (x, y))).filter(|&(x, y)| opaque(x, y)).count();
         let right = (0..h).flat_map(|y| (w / 2..w).map(move |x| (x, y))).filter(|&(x, y)| opaque(x, y)).count();
