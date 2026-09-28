@@ -70,7 +70,7 @@ fn app_icon() -> Vec<ksni::Icon> {
                 let (width, height) = (img.width() as i32, img.height() as i32);
                 let mut data = img.into_vec();
                 // ksni wants ARGB32 in network byte order; `image` gives RGBA.
-                for px in data.chunks_exact_mut(4) {
+                for px in data.as_chunks_mut::<4>().0 {
                     px.rotate_right(1);
                 }
                 Some(ksni::Icon { width, height, data })
