@@ -21,13 +21,20 @@ const TITLE: Color = Color::rgb(120, 200, 255);
 const TEXT: Color = Color::rgb(220, 224, 230);
 const DIM: Color = Color::rgb(150, 156, 166);
 
-/// Candidate monospace fonts, first existing wins.
+/// Candidate monospace fonts, first existing wins. Each family is listed
+/// under its Fedora path, then its Arch one (Arch-based distros like CachyOS
+/// use per-family directories without the `-fonts` suffix, plus a shared
+/// `TTF/`).
 const FONT_CANDIDATES: &[&str] = &[
     "/usr/share/fonts/liberation-mono-fonts/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
     "/usr/share/fonts/google-noto/NotoSansMono-Regular.ttf",
+    "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
     "/usr/share/fonts/adwaita-mono-fonts/AdwaitaMono-Regular.ttf",
+    "/usr/share/fonts/Adwaita/AdwaitaMono-Regular.ttf",
     "/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
 ];
 
 /// Load a monospace font from the first available candidate path.
