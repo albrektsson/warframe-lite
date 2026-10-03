@@ -241,9 +241,17 @@ struct RawItem {
     components: Vec<RawComponent>,
 }
 
+/// WFCD moved each component's own fields (`name`, `tradable`, …) out of the
+/// per-category files into a shared `Components.json`, leaving only
+/// `uniqueName` + `itemCount` inline. The older fully-inline shape is still
+/// accepted: an inline `name` wins, otherwise `unique_name` is looked up in
+/// [`ComponentDefs`].
 #[derive(Debug, Deserialize)]
 struct RawComponent {
-    name: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default, rename = "uniqueName")]
+    unique_name: Option<String>,
     #[serde(default, rename = "itemCount")]
     item_count: u32,
     /// True for an actual relic-sourced Prime Part (Barrel, Blueprint, …),
@@ -257,28 +265,63 @@ struct RawComponent {
     tradable: bool,
 }
 
+/// One `Components.json` record — just the fields [`RawComponent`] used to
+/// carry inline.
+#[derive(Debug, Deserialize)]
+struct RawComponentDef {
+    #[serde(rename = "uniqueName")]
+    unique_name: String,
+    name: String,
+    #[serde(default)]
+    tradable: bool,
+}
+
+/// `Components.json`, keyed by `uniqueName` → (`name`, `tradable`). Plain
+/// crafting resources (Orokin Cell and the like) aren't in that file at all,
+/// so an unresolved component is dropped the same way a non-tradable one is.
+type ComponentDefs = HashMap<String, (String, bool)>;
+
+fn parse_component_defs(body: &str) -> anyhow::Result<ComponentDefs> {
+    let defs: Vec<RawComponentDef> = serde_json::from_str(body)?;
+    Ok(defs.into_iter().map(|d| (d.unique_name, (d.name, d.tradable))).collect())
+}
+
 /// Every Prime item's component quantities in one category file's JSON,
 /// tagged with that file's [`EquipmentCategory`] (see [`category_for_file`]).
 /// Non-tradable components (plain crafting resources like Orokin Cell) are
 /// dropped — they're real Foundry ingredients but never a relic-sourced Prime
 /// Part, so they don't belong in a relic-farming BOM.
-fn parse_category(body: &str, category: EquipmentCategory) -> anyhow::Result<Vec<Entry>> {
+fn parse_category(
+    body: &str,
+    category: EquipmentCategory,
+    defs: &ComponentDefs,
+) -> anyhow::Result<Vec<Entry>> {
     let items: Vec<RawItem> = serde_json::from_str(body)?;
     Ok(items
         .into_iter()
         .filter(|i| i.is_prime)
         .flat_map(|i| {
-            i.components
-                .into_iter()
-                .filter(|c| c.tradable)
-                .map(move |c| Entry {
+            i.components.into_iter().filter_map(move |c| {
+                let (part, tradable) = match c.name {
+                    Some(name) => (name, c.tradable),
+                    None => defs.get(c.unique_name.as_deref()?).cloned()?,
+                };
+                tradable.then(|| Entry {
                     prime: i.name.clone(),
-                    part: c.name,
+                    part,
                     quantity: c.item_count,
                     category,
                 })
+            })
         })
         .collect())
+}
+
+/// GET one `warframe-items` data file's body.
+async fn get_file(client: &reqwest::Client, file: &str) -> anyhow::Result<String> {
+    let url = format!("{BASE}/{file}.json");
+    tracing::debug!("GET {url}");
+    Ok(client.get(&url).send().await?.error_for_status()?.text().await?)
 }
 
 /// Fetch every Prime item's component quantities across the per-category
@@ -286,25 +329,19 @@ fn parse_category(body: &str, category: EquipmentCategory) -> anyhow::Result<Vec
 /// logged and skipped rather than failing the whole load — partial quantity
 /// data (shown only where known, see [`PartQuantities::get`]) beats none.
 async fn fetch(client: &reqwest::Client) -> anyhow::Result<Vec<Entry>> {
+    // Without the shared component definitions no category file can name its
+    // parts, so this one is fatal rather than skipped.
+    let defs = parse_component_defs(&get_file(client, "Components").await?)?;
     let mut entries = Vec::new();
     for category in CATEGORIES {
-        let url = format!("{BASE}/{category}.json");
-        tracing::debug!("GET {url}");
-        let resp = match client.get(&url).send().await.and_then(|r| r.error_for_status()) {
-            Ok(resp) => resp,
+        let body = match get_file(client, category).await {
+            Ok(body) => body,
             Err(e) => {
                 tracing::warn!("part quantities: fetching {category} failed: {e}");
                 continue;
             }
         };
-        let body = match resp.text().await {
-            Ok(body) => body,
-            Err(e) => {
-                tracing::warn!("part quantities: reading {category} failed: {e}");
-                continue;
-            }
-        };
-        match parse_category(&body, category_for_file(category)) {
+        match parse_category(&body, category_for_file(category), &defs) {
             Ok(mut parsed) => entries.append(&mut parsed),
             Err(e) => tracing::warn!("part quantities: parsing {category} failed: {e}"),
         }
@@ -336,7 +373,7 @@ mod tests {
                 "components": [{"name": "Blueprint", "itemCount": 1, "tradable": true}]
             }
         ]"#;
-        let entries = parse_category(body, EquipmentCategory::Warframe).unwrap();
+        let entries = parse_category(body, EquipmentCategory::Warframe, &ComponentDefs::new()).unwrap();
         assert_eq!(entries.len(), 2);
         assert!(entries.contains(&Entry {
             prime: "Ash Prime".to_string(),
@@ -361,7 +398,7 @@ mod tests {
                 ]
             }
         ]"#;
-        let entries = parse_category(body, EquipmentCategory::Primary).unwrap();
+        let entries = parse_category(body, EquipmentCategory::Primary, &ComponentDefs::new()).unwrap();
         let quantities = PartQuantities::new(entries);
         assert_eq!(
             quantities.get(&PrimePart { prime: "Afuris Prime".to_string(), part: "Barrel".to_string() }),
@@ -389,9 +426,38 @@ mod tests {
                 ]
             }
         ]"#;
-        let entries = parse_category(body, EquipmentCategory::Primary).unwrap();
+        let entries = parse_category(body, EquipmentCategory::Primary, &ComponentDefs::new()).unwrap();
         assert!(!entries.iter().any(|e| e.part == "Orokin Cell"));
         assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn parse_category_resolves_components_through_components_json() {
+        // WFCD's current shape: components carry only `uniqueName` +
+        // `itemCount`; name/tradable live in `Components.json`, which has no
+        // entry at all for plain resources like Orokin Cell.
+        let defs = parse_component_defs(
+            r#"[
+                {"uniqueName": "/Lotus/Types/Recipes/WarframeRecipes/AshPrimeBlueprint", "name": "Blueprint", "tradable": true},
+                {"uniqueName": "/Lotus/Types/Recipes/WarframeRecipes/AshPrimeChassisComponent", "name": "Chassis", "tradable": true}
+            ]"#,
+        )
+        .unwrap();
+        let body = r#"[
+            {
+                "name": "Ash Prime",
+                "isPrime": true,
+                "components": [
+                    {"uniqueName": "/Lotus/Types/Recipes/WarframeRecipes/AshPrimeBlueprint", "itemCount": 1},
+                    {"uniqueName": "/Lotus/Types/Recipes/WarframeRecipes/AshPrimeChassisComponent", "itemCount": 1},
+                    {"uniqueName": "/Lotus/Types/Items/MiscItems/OrokinCell", "itemCount": 1}
+                ]
+            }
+        ]"#;
+        let entries = parse_category(body, EquipmentCategory::Warframe, &defs).unwrap();
+        let mut parts: Vec<&str> = entries.iter().map(|e| e.part.as_str()).collect();
+        parts.sort_unstable();
+        assert_eq!(parts, vec!["Blueprint", "Chassis"]);
     }
 
     #[test]
@@ -442,7 +508,7 @@ mod tests {
         // Items without a `components` field (resources, mods, …) default to
         // empty rather than failing the whole file's parse.
         let body = r#"[{"name": "Loki Prime", "isPrime": true}]"#;
-        let entries = parse_category(body, EquipmentCategory::Warframe).unwrap();
+        let entries = parse_category(body, EquipmentCategory::Warframe, &ComponentDefs::new()).unwrap();
         assert!(entries.is_empty());
     }
 

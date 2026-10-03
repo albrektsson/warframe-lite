@@ -1522,6 +1522,24 @@ fn text_has_login(text: &str) -> bool {
         .any(|l| matches!(wf_log::event_from_line(l), Some(wf_log::Event::LoggedIn(_))))
 }
 
+/// Replay [`mission_state_step`] over `text` (an `EE.log`'s current
+/// contents), returning the `(pending, in_mission)` it ends on — used to seed
+/// [`mission_watch_loop`] at startup. An overlay launched or restarted in the
+/// middle of a mission would otherwise sit at `in_mission = false` until the
+/// next level load, showing the fissures panel over the mission.
+fn mission_state_from_text(text: &str) -> (bool, bool) {
+    let mut pending = false;
+    let mut in_mission = false;
+    for ev in text.lines().filter_map(wf_log::event_from_line) {
+        let (new_pending, new_state) = mission_state_step(pending, &ev);
+        pending = new_pending;
+        if let Some(state) = new_state {
+            in_mission = state;
+        }
+    }
+    (pending, in_mission)
+}
+
 /// Watches the EE.log for the player's login and mission-start/mission-end
 /// transitions (issue #89's design), publishing to `logged_in` and
 /// `in_mission`, both read by `make_frame` to gate the fissures panel — it
@@ -1547,26 +1565,34 @@ async fn mission_watch_loop(
     // before this session had logged in at all.
     const STALE_THRESHOLD: Duration = Duration::from_secs(30);
 
-    // Catches a player already logged in before this task started (the
-    // overlay was launched or restarted mid-session) — live tailing below
-    // handles a login that happens after this point. Gated on freshness
-    // (see `STALE_THRESHOLD`'s docs) so a stale file from the last session
-    // doesn't get misread as "already logged in" this time around.
+    // Created before the seeding read below, so a line written in between
+    // is replayed by the tailer rather than lost — harmless, since replaying
+    // a transition the seed already covered lands on the same state.
+    let mut tailer = wf_log::LogTailer::from_end(&ee_log);
+    let mut pending = false;
+
+    // Catches a player already logged in — and possibly already in a mission
+    // — before this task started (the overlay was launched or restarted
+    // mid-session); live tailing below handles everything after this point.
+    // Gated on freshness (see `STALE_THRESHOLD`'s docs) so a stale file from
+    // the last session doesn't get misread as describing this one.
     let fresh = std::fs::metadata(&ee_log)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|m| m.elapsed().ok())
         .is_some_and(|age| age < STALE_THRESHOLD);
     if fresh {
-        if let Ok(text) = std::fs::read_to_string(&ee_log) {
+        // Lossy: a stray non-UTF-8 byte mid-log mustn't void the whole seed.
+        if let Ok(bytes) = std::fs::read(&ee_log) {
+            let text = String::from_utf8_lossy(&bytes);
             if text_has_login(&text) {
                 logged_in.store(true, Ordering::Relaxed);
             }
+            let (seed_pending, seed_in_mission) = mission_state_from_text(&text);
+            pending = seed_pending;
+            in_mission.store(seed_in_mission, Ordering::Relaxed);
         }
     }
-
-    let mut tailer = wf_log::LogTailer::from_end(&ee_log);
-    let mut pending = false;
 
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -2127,6 +2153,25 @@ mod mission_state_tests {
     #[test]
     fn level_connected_without_pending_publishes_hub_bound() {
         assert_eq!(mission_state_step(false, &Event::LevelConnected), (false, Some(false)));
+    }
+
+    #[test]
+    fn seeding_from_text_lands_in_mission_when_the_log_ends_inside_one() {
+        let text = "\
+1664.6 Sys [Info]: ===[ Game successfully connected to: /Lotus/Levels/Proc/TheNewWar/PartTwo/TNWDrifterCampMain/BoC8ACA.lp ]===
+3933.9 Sys [Info]: Client loaded {\"name\":\"SolNode232_ActiveMission\"} with MissionInfo:
+3938.0 Sys [Info]: ===[ Game successfully connected to: /Lotus/Levels/Proc/Zariman/ZarimanDirectionalSurvival/L.lp ]===";
+        assert_eq!(super::mission_state_from_text(text), (false, true));
+    }
+
+    #[test]
+    fn seeding_from_text_lands_out_of_mission_after_returning_to_a_hub() {
+        let text = "\
+3933.9 Sys [Info]: Client loaded {\"name\":\"SolNode232_ActiveMission\"} with MissionInfo:
+3938.0 Sys [Info]: ===[ Game successfully connected to: /Lotus/Levels/Proc/Zariman/ZarimanDirectionalSurvival/L.lp ]===
+4700.0 Sys [Info]: ===[ Game successfully connected to: /Lotus/Levels/Proc/TheNewWar/PartTwo/TNWDrifterCampMain/BoC8ACA.lp ]===";
+        assert_eq!(super::mission_state_from_text(text), (false, false));
+        assert_eq!(super::mission_state_from_text(""), (false, false));
     }
 
     #[test]
