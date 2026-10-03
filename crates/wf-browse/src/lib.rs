@@ -405,6 +405,12 @@ fn load_polarity_icon(ctx: &egui::Context, name: &str, bytes: &[u8]) -> egui::Te
     ctx.load_texture(format!("polarity-{name}"), color_image, egui::TextureOptions::LINEAR)
 }
 
+/// `path`'s modification time, `None` if it doesn't exist (yet) or can't be
+/// read — see [`BrowseApp::sync_external_account_id`].
+fn config_modified(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
 /// Open the browse window and run its event loop until closed.
 pub fn run() -> eframe::Result<()> {
     let config_path = Config::default_path().unwrap_or_else(|_| PathBuf::from("config.toml"));
@@ -1886,6 +1892,11 @@ struct BrowseApp {
     /// doubles as the Home tab's "account set?" readout (#72), same as
     /// `SettingsApp::account_id`.
     account_id: String,
+    /// `config_path`'s modification time as of the last
+    /// [`Self::sync_external_account_id`] check — a change means something
+    /// outside this window (`wf-lite set-account`/`detect-account`, the
+    /// tray's "Detect account id") rewrote the config.
+    config_mtime: Option<std::time::SystemTime>,
     /// The Settings section's own status line (Save/Detect/Copy feedback) —
     /// named distinctly from `scan_status` (the Home tab's Scan Memory
     /// result) so the two are never confused.
@@ -1967,6 +1978,7 @@ impl BrowseApp {
         scan_notify: Arc<tokio::sync::Notify>,
     ) -> Self {
         let account_id = config.account_id.clone().unwrap_or_default();
+        let config_mtime = config_modified(&config_path);
         Self {
             tab: Tab::Home,
             home_sub_tab: HomeSubTab::Overview,
@@ -1995,6 +2007,7 @@ impl BrowseApp {
             config,
             config_path,
             account_id,
+            config_mtime,
             settings_status: String::new(),
             scanning: false,
             scan_status: Arc::new(Mutex::new(None)),
@@ -2243,7 +2256,7 @@ impl BrowseApp {
     }
 
     /// The Home tab's Overview page (see [`HomeSubTab`]): account-id status,
-    /// the Scan Memory action, Mastery account id (with "Detect from log"),
+    /// the Scan Memory action, Mastery account id (with "Detect"),
     /// hotkey-bind help, UI text size, and Save.
     ///
     /// A deliberate Scan Memory click is the map's required consent (see this
@@ -2305,7 +2318,11 @@ impl BrowseApp {
                     .hint_text("24-hex account id")
                     .desired_width(240.0),
             );
-            if ui.button("Detect from log").clicked() {
+            if ui
+                .button("Detect")
+                .on_hover_text("From EE.log, falling back to the running game's memory")
+                .clicked()
+            {
                 self.detect_account();
             }
         });
@@ -3683,6 +3700,31 @@ impl BrowseApp {
         }
     }
 
+    /// Pick up an account id written to the config file by something other
+    /// than this window, so Home's readout and the Settings field don't keep
+    /// showing a launch-time value until restart. Only the account id is
+    /// synced — every other field here is this window's own to edit — and
+    /// only when the file's mtime moved, so an id still being typed isn't
+    /// clobbered. This window's own saves change the mtime too, but leave the
+    /// on-disk id equal to `self.config`'s, so they're a no-op here.
+    ///
+    /// The mastered set itself is still loaded once at launch (see
+    /// [`POLL_INTERVAL`]'s docs), hence the restart hint.
+    fn sync_external_account_id(&mut self) {
+        let mtime = config_modified(&self.config_path);
+        if mtime == self.config_mtime {
+            return;
+        }
+        self.config_mtime = mtime;
+        let Ok(on_disk) = Config::load(&self.config_path) else { return };
+        if on_disk.account_id != self.config.account_id {
+            self.config.account_id = on_disk.account_id;
+            self.account_id = self.config.account_id.clone().unwrap_or_default();
+            self.settings_status =
+                "Account id updated from config — restart to reload mastery".to_string();
+        }
+    }
+
     /// Run `<self> detect-account` (re-execing this process's own binary),
     /// then reload `self.config` so the detected id appears in the field —
     /// the same re-exec-and-reload pattern `wf-settings`'
@@ -4195,6 +4237,7 @@ impl eframe::App for BrowseApp {
         ui.ctx().request_repaint_after(if still_loading { LOADING_REPAINT } else { POLL_INTERVAL });
 
         self.sync_demo_mode(ui.ctx());
+        self.sync_external_account_id();
 
         egui::CentralPanel::default().show(ui, |ui| {
             let current_group = Group::of(self.tab);

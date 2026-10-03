@@ -45,8 +45,11 @@ wf-lite detect-account
 ```
 
 The id only appears in the log after some activity (a relic crack in a
-squad, a Duviri race); if detection can't find it, set it manually — find it
-at `warframe.com/api/user-data`:
+squad, a Duviri race). When the log doesn't have it yet, `detect-account`
+falls back to reading it from the running game's memory (a local read only —
+nothing is sent to DE's inventory endpoint; see [mem-scan.md](mem-scan.md)
+for the permission it needs) and verifies it the same way. If neither finds
+it, set it manually — find it at `warframe.com/api/user-data`:
 
 ```
 wf-lite set-account <id>

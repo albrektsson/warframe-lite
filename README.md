@@ -89,7 +89,7 @@ wf-lite copy               # copy the current best-pick reward (name + plat) to 
 wf-lite capture [out.png]  # capture the Warframe window to a PNG
 wf-lite relic [names…]     # evaluate reward names → matched item + plat
 wf-lite relic-scan         # capture the reward screen, OCR the names, rank them — see docs/ocr.md
-wf-lite detect-account     # auto-detect your account id from EE.log (verified)
+wf-lite detect-account     # auto-detect your account id from EE.log, else game memory (verified)
 wf-lite set-account <id>   # save your account id for mastery lookup
 wf-lite mastery [id]       # report your mastered-item count
 wf-lite logstats           # parse whole EE.log history, report coverage/events

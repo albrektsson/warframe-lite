@@ -170,7 +170,7 @@ RELICS & MASTERY
     relics <codes…>       Owned-relic guide: unmastered rewards + prices
     mastery-plan          Unmastered primes + which of your relics drop them
     mastery [id]          Report how many items you've mastered
-    detect-account        Auto-detect your account id from EE.log
+    detect-account        Auto-detect your account id (EE.log, else game memory)
     set-account <id>      Save your account id for mastery lookup
 
 FISSURES & PRICES
@@ -1024,6 +1024,12 @@ fn run_browse() -> Result<()> {
 /// candidate is verified against the public profile API — only an id whose
 /// `DisplayName` matches the logged-in name is accepted, so a squadmate's id can
 /// never be saved by mistake.
+///
+/// The log only carries the id after certain activity (cracking a relic in a
+/// squad, a Duviri race), so when it yields no verified id this falls back to
+/// reading it from the running game's memory (`wf_mem::scan_account_id` — a
+/// local read only, nothing is sent to DE's inventory endpoint). That id goes
+/// through the same profile verification before it's saved.
 async fn detect_account_cmd(config: &Config, config_path: &std::path::Path) -> Result<()> {
     let log_path = config.resolve_ee_log()?;
     println!("\n== Detect account id ==\n  scanning {}", log_path.display());
@@ -1035,35 +1041,68 @@ async fn detect_account_cmd(config: &Config, config_path: &std::path::Path) -> R
         "no `Logged in <name>` line in EE.log — log in to Warframe once, then retry",
     )?;
     println!("  logged-in player: {name}");
-    if scan.candidates.is_empty() {
-        anyhow::bail!(
-            "no account id found in this log. It only appears after certain activity \
-             (cracking a relic in a squad, a Duviri race). Play a bit and retry, or set it \
-             manually with `wf-lite set-account <id>`."
-        );
-    }
 
     let client = http_client();
     for id in &scan.candidates {
-        match wf_relic::mastery::fetch_display_name(&client, id).await {
-            Ok(Some(profile_name)) if profile_name.eq_ignore_ascii_case(&name) => {
-                let mut cfg = Config::load(config_path)?;
-                cfg.account_id = Some(id.clone());
-                cfg.save(config_path)?;
-                println!("  verified {id} → {profile_name}");
-                println!("  saved account_id to {}", config_path.display());
-                return Ok(());
-            }
-            Ok(Some(other)) => tracing::debug!("candidate {id} is {other}, not {name}"),
-            Ok(None) => tracing::debug!("candidate {id} has no profile"),
-            Err(e) => tracing::warn!("verifying {id} failed: {e:#}"),
+        if account_is(&client, id, &name).await {
+            return save_detected_account(config_path, id);
         }
     }
+    let log_outcome = if scan.candidates.is_empty() {
+        "no account id in EE.log yet".to_string()
+    } else {
+        format!("{} candidate id(s) in EE.log but none verified as {name}", scan.candidates.len())
+    };
+
+    #[cfg(feature = "mem-scan")]
+    let log_outcome = {
+        println!("  {log_outcome} — reading it from the running game's memory instead");
+        let mem_outcome = match wf_mem::scan_account_id() {
+            Ok(id) if account_is(&client, &id, &name).await => {
+                return save_detected_account(config_path, &id);
+            }
+            Ok(id) => format!("the id in game memory ({id}) didn't verify as {name}"),
+            Err(e) => format!("{e:#}"),
+        };
+        format!("{log_outcome}, and the memory fallback failed: {mem_outcome}")
+    };
+
     anyhow::bail!(
-        "found {} candidate id(s) but none verified as {name} \
-         (network issue, or the id isn't in this log yet). Try again, or use `set-account`.",
-        scan.candidates.len()
+        "{log_outcome}. The log only carries the id after certain activity (cracking a relic \
+         in a squad, a Duviri race) — play a bit and retry, or set it manually with \
+         `wf-lite set-account <id>`."
     )
+}
+
+/// Whether the public profile for `id` carries `name` as its `DisplayName` —
+/// the check every `detect-account` candidate must pass before it's saved.
+async fn account_is(client: &reqwest::Client, id: &str, name: &str) -> bool {
+    match wf_relic::mastery::fetch_display_name(client, id).await {
+        Ok(Some(profile_name)) if profile_name.eq_ignore_ascii_case(name) => {
+            println!("  verified {id} → {profile_name}");
+            true
+        }
+        Ok(Some(other)) => {
+            tracing::debug!("candidate {id} is {other}, not {name}");
+            false
+        }
+        Ok(None) => {
+            tracing::debug!("candidate {id} has no profile");
+            false
+        }
+        Err(e) => {
+            tracing::warn!("verifying {id} failed: {e:#}");
+            false
+        }
+    }
+}
+
+fn save_detected_account(config_path: &std::path::Path, id: &str) -> Result<()> {
+    let mut cfg = Config::load(config_path)?;
+    cfg.account_id = Some(id.to_string());
+    cfg.save(config_path)?;
+    println!("  saved account_id to {}", config_path.display());
+    Ok(())
 }
 
 /// Fetch and report the player's mastered set. `wf-lite mastery [account_id]`

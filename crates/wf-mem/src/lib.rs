@@ -107,6 +107,22 @@ pub async fn scan_and_fetch(client: &reqwest::Client) -> Result<String> {
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no candidate process yielded a session marker")))
 }
 
+/// Find the running game and read just the local account id out of its
+/// session marker — `wf-lite detect-account`'s fallback for an `EE.log` that
+/// doesn't carry the id yet. Purely local: the nonce is dropped and nothing
+/// is sent to DE, so this neither checks nor arms [`SCAN_COOLDOWN`].
+pub fn scan_account_id() -> Result<String> {
+    let pids = process::find_pids()?;
+    let mut last_err: Option<anyhow::Error> = None;
+    for pid in pids {
+        match process::scan_authz(pid) {
+            Ok(authz) => return Ok(authz.account_id),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no candidate process yielded a session marker")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

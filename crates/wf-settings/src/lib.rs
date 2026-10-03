@@ -204,7 +204,11 @@ impl eframe::App for SettingsApp {
                         .hint_text("24-hex account id")
                         .desired_width(240.0),
                 );
-                if ui.button("Detect from log").clicked() {
+                if ui
+                    .button("Detect")
+                    .on_hover_text("From EE.log, falling back to the running game's memory")
+                    .clicked()
+                {
                     self.detect_account();
                 }
             });
@@ -250,7 +254,7 @@ impl eframe::App for SettingsApp {
 /// subcommand is simply whichever executable is currently running.
 ///
 /// Standalone `wf-settings` (kept for dev/embedding) doesn't understand
-/// subcommands itself, so "Detect from log" only fully works when `run` is
+/// subcommands itself, so "Detect" only fully works when `run` is
 /// running inside `wf-lite`.
 fn self_binary() -> PathBuf {
     std::env::current_exe().unwrap_or_else(|_| PathBuf::from("wf-lite"))
