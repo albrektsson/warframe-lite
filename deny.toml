@@ -11,6 +11,12 @@ ignore = [
     # Transitive via `fontdue` (font rasterization). An unmaintained-crate
     # notice, not a vulnerability, and not something we can upgrade from here.
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained; transitive via fontdue, no vulnerability" },
+    # Transitive via `ksni` -> `zbus` 5 (wf-tray). zvariant/zbus_names were
+    # merged into zbus 6, but ksni (latest 0.3.7) still requires zbus ^5.
+    # Unmaintained notices, not vulnerabilities; drop once ksni moves to zbus 6.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant unmaintained; transitive via ksni/zbus 5, no vulnerability" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names unmaintained; transitive via ksni/zbus 5, no vulnerability" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive unmaintained; transitive via ksni/zbus 5, no vulnerability" },
 ]
 
 [licenses]
